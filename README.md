@@ -9,7 +9,7 @@ Tine is a local-first execution engine where notebooks branch like code. Run wor
 </p>
 
 <p align="center">
-  Demo GIF coming soon.
+  <img src="docs/assets/tine-demo.gif" alt="Tine branching workflow demo" width="920" />
 </p>
 
 Tine gives AI agents a safe place to explore multiple paths in parallel while you keep the browser view over the same local state, logs, and results.
