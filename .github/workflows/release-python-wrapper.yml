@@ -104,7 +104,7 @@ jobs:
           import tarfile
           import zipfile
           from pathlib import Path
-            binary = Path("target/${{ matrix.rust_target }}/release/${{ matrix.binary_name }}")
+          binary = Path("target/${{ matrix.rust_target }}/release/${{ matrix.binary_name }}")
           archive = Path("release-artifacts/${ARCHIVE}")
           if archive.name.endswith(".zip"):
               with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
