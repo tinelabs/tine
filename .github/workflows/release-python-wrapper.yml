@@ -1,0 +1,248 @@
+name: Release Python Wrapper
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the Python wrapper to PyPI after all gates pass
+        required: false
+        default: "false"
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  version-alignment:
+    name: Verify version alignment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build local binary for version check
+        run: cargo build -p tine-cli
+
+      - name: Verify Python, Rust workspace, and binary versions align
+        run: python scripts/release/verify_version_alignment.py --repo-root . --binary target/debug/tine
+
+  build-rust-binaries:
+    name: Build Rust binary (${{ matrix.label }})
+    needs: version-alignment
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            archive_ext: .tar.gz
+            binary_name: tine
+          - label: linux-arm64
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            archive_ext: .tar.gz
+            binary_name: tine
+          - label: macos-x86_64
+            runner: macos-13
+            rust_target: x86_64-apple-darwin
+            archive_ext: .tar.gz
+            binary_name: tine
+          - label: macos-arm64
+            runner: macos-14
+            rust_target: aarch64-apple-darwin
+            archive_ext: .tar.gz
+            binary_name: tine
+          - label: windows-x86_64
+            runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            archive_ext: .zip
+            binary_name: tine.exe
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build release binary
+        run: cargo build --release -p tine-cli
+
+      - name: Package binary and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(python - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path('packaging/python/pyproject.toml').read_text()
+          print(re.search(r'(?m)^\[project\]\s*(?:.*\n)*?version = "([^"]+)"', text).group(1))
+          PY
+          )"
+          mkdir -p release-artifacts
+          ARCHIVE="tine-${VERSION}-${{ matrix.rust_target }}${{ matrix.archive_ext }}"
+          python - <<PY
+          import hashlib
+          import tarfile
+          import zipfile
+          from pathlib import Path
+          binary = Path("target/release/${{ matrix.binary_name }}")
+          archive = Path("release-artifacts/${ARCHIVE}")
+          if archive.name.endswith(".zip"):
+              with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                  zf.write(binary, arcname="${{ matrix.binary_name }}")
+          else:
+              with tarfile.open(archive, "w:gz") as tf:
+                  tf.add(binary, arcname="${{ matrix.binary_name }}")
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          archive.with_suffix(archive.suffix + ".sha256").write_text(f"{digest}  {archive.name}\n")
+          PY
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-binary-${{ matrix.label }}
+          path: release-artifacts/*
+
+      - name: Upload Rust release assets
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/*
+
+  verify-release-artifacts:
+    name: Verify artifact matrix
+    needs: build-rust-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download all Rust binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Resolve package version
+        id: version
+        shell: bash
+        run: |
+          VERSION="$(python - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path('packaging/python/pyproject.toml').read_text()
+          print(re.search(r'(?m)^\[project\]\s*(?:.*\n)*?version = "([^"]+)"', text).group(1))
+          PY
+          )"
+          echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify expected archives and checksums exist
+        run: python scripts/release/verify_release_artifacts.py --repo-root . --artifact-dir release-artifacts --version "${{ steps.version.outputs.value }}"
+
+  smoke-wrapper:
+    name: Smoke wrapper (${{ matrix.label }})
+    needs: build-rust-binaries
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runner: ubuntu-latest
+          - label: linux-arm64
+            runner: ubuntu-24.04-arm
+          - label: macos-x86_64
+            runner: macos-13
+          - label: macos-arm64
+            runner: macos-14
+          - label: windows-x86_64
+            runner: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download packaged binary
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-binary-${{ matrix.label }}
+          path: release-artifacts
+
+      - name: Run wrapper smoke checks through release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/release/smoke_wrapper.py --repo-root . --release-artifact-dir release-artifacts
+
+  build-python-package:
+    name: Build Python package
+    needs:
+      - verify-release-artifacts
+      - smoke-wrapper
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python packaging tools
+        run: python -m pip install --upgrade pip build
+
+      - name: Build wrapper wheel and sdist
+        run: python -m build packaging/python --outdir python-dist
+
+      - name: Upload Python package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wrapper-dist
+          path: python-dist/*
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build-python-package
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    if: github.event_name == 'release'
+    environment:
+      name: pypi
+    steps:
+      - name: Download Python package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-wrapper-dist
+          path: python-dist
+
+      - name: Publish package to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python-dist
