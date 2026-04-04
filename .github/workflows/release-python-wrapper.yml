@@ -54,7 +54,7 @@ jobs:
             archive_ext: .tar.gz
             binary_name: tine
           - label: macos-x86_64
-            runner: macos-13
+            runner: macos-14
             rust_target: x86_64-apple-darwin
             archive_ext: .tar.gz
             binary_name: tine
@@ -74,6 +74,8 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -81,7 +83,8 @@ jobs:
           python-version: "3.11"
 
       - name: Build release binary
-        run: cargo build --release -p tine-cli
+        shell: bash
+        run: cargo build --release --target "${{ matrix.rust_target }}" -p tine-cli
 
       - name: Package binary and checksum
         shell: bash
@@ -101,7 +104,7 @@ jobs:
           import tarfile
           import zipfile
           from pathlib import Path
-          binary = Path("target/release/${{ matrix.binary_name }}")
+            binary = Path("target/${{ matrix.rust_target }}/release/${{ matrix.binary_name }}")
           archive = Path("release-artifacts/${ARCHIVE}")
           if archive.name.endswith(".zip"):
               with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -173,7 +176,7 @@ jobs:
           - label: linux-arm64
             runner: ubuntu-24.04-arm
           - label: macos-x86_64
-            runner: macos-13
+            runner: macos-14
           - label: macos-arm64
             runner: macos-14
           - label: windows-x86_64
