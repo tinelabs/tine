@@ -1,0 +1,22 @@
+[package]
+name = "tine-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tine-core.workspace = true
+tine-graph.workspace = true
+tine-kernel.workspace = true
+tine-catalog.workspace = true
+tine-env.workspace = true
+tokio.workspace = true
+dashmap.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+metrics.workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "tine-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tine-core.workspace = true
+tokio.workspace = true
+dashmap.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+bytes.workspace = true
+libc.workspace = true
+runtimelib.workspace = true
+jupyter-protocol.workspace = true
+metrics.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+serial_test = "3"
+tine-env.workspace = true

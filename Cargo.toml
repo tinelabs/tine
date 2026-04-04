@@ -1,0 +1,101 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tine-core",
+    "crates/tine-graph",
+    "crates/tine-kernel",
+    "crates/tine-catalog",
+    "crates/tine-env",
+    "crates/tine-scheduler",
+    "crates/tine-api",
+    "crates/tine-server",
+    "crates/tine-observe",
+    "crates/tine-cli",
+    "crates/tine-app",
+    "packaging/python",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/tine-project/tine"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Identity
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Hashing
+blake3 = "1"
+hex = "0.4"
+
+# System
+libc = "0.2"
+
+# Error handling
+thiserror = "2"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Bytes
+bytes = "1"
+
+# DAG
+petgraph = "0.7"
+
+# Concurrent data structures
+dashmap = "6"
+
+# Jupyter
+runtimelib = { version = "1.5", features = ["tokio-runtime"] }
+jupyter-protocol = "1.4"
+
+# Arrow
+arrow-ipc = "53"
+arrow-schema = "53"
+memmap2 = "0.9"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+# Web
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+reqwest = { version = "0.12", features = ["json"] }
+
+# gRPC
+tonic = "0.12"
+prost = "0.13"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# File watching
+notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
+
+# Internal crates
+tine-core = { path = "crates/tine-core" }
+tine-graph = { path = "crates/tine-graph" }
+tine-kernel = { path = "crates/tine-kernel" }
+tine-catalog = { path = "crates/tine-catalog" }
+tine-env = { path = "crates/tine-env" }
+tine-scheduler = { path = "crates/tine-scheduler" }
+tine-api = { path = "crates/tine-api" }
+tine-server = { path = "crates/tine-server" }
+tine-observe = { path = "crates/tine-observe" }

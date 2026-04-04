@@ -1,0 +1,43 @@
+/target
+.tine/
+*.db
+*.db-shm
+*.db-wal
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.venv-mcp/
+
+# OS / editor-local state
+.DS_Store
+.claude/
+
+# Local scratch outputs / one-off generated workspaces
+/new-project-*/
+/classification-project-*/
+/house-pricing-*/
+/mcp-demo-project/
+/mcp-demo-project-direct/
+/mcp-smoke-project-*/
+/tine-mcp-demo-project-*/
+/wizai/
+/my_plot.png
+/{}
+
+# Common local runtime noise
+*.log
+*.tmp
+*.swp
+
+# Generated packaging outputs
+/packaging/python/build/
+/packaging/python/python/*.egg-info/
+
+# Optional desktop shell while web-first path is primary
+/crates/tine-app/
+
+# Ignore markdown docs except README files
+*.md
+!README.md
+!README*.md

@@ -1,0 +1,13 @@
+[package]
+name = "tine-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tine-core.workspace = true
+petgraph.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true

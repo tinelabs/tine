@@ -1,0 +1,30 @@
+[package]
+name = "tine-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "_tine"
+crate-type = ["cdylib"]
+
+[build-dependencies]
+pyo3-build-config = "0.23"
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+blake3 = { workspace = true }
+async-trait = { workspace = true }
+
+tine-core = { workspace = true }
+tine-graph = { workspace = true }
+tine-kernel = { workspace = true }
+tine-catalog = { workspace = true }
+tine-env = { workspace = true }
+tine-scheduler = { workspace = true }
+tine-api = { workspace = true }

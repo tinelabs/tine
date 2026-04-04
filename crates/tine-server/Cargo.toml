@@ -1,0 +1,32 @@
+[package]
+name = "tine-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tine-core.workspace = true
+tine-api.workspace = true
+tine-observe.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+metrics-exporter-prometheus.workspace = true
+tonic.workspace = true
+prost.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+notify.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tower = { workspace = true, features = ["util"] }
+tempfile = "3"
+dashmap.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+serial_test = "3"
