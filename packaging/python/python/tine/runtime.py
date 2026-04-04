@@ -68,7 +68,7 @@ def release_base_url(version: str | None = None) -> str:
     configured = os.environ.get("TINE_RELEASE_BASE_URL")
     if configured:
         return configured.rstrip("/") + "/"
-    return f"https://github.com/tine-project/tine/releases/download/v{resolved_version}/"
+    return f"https://github.com/tinelabs/tine/releases/download/v{resolved_version}/"
 
 
 def cache_root() -> Path:
