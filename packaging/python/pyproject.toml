@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Python wrapper and MCP package for the Tine runtime"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
+keywords = ["mcp", "agents", "notebooks", "jupyter", "rust"]
 classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
@@ -17,6 +18,12 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/tinelabs/tine"
+Repository = "https://github.com/tinelabs/tine"
+Issues = "https://github.com/tinelabs/tine/issues"
+Releases = "https://github.com/tinelabs/tine/releases"
 
 [project.scripts]
 tine = "tine.cli:main"
