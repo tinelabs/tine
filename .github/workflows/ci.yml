@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  version-alignment:
+    name: Verify version alignment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build local binary for version check
+        run: cargo build -p tine-cli
+
+      - name: Verify Python, Rust workspace, and binary versions align
+        run: python scripts/release/verify_version_alignment.py --repo-root . --binary target/debug/tine
+
+  python-wrapper-tests:
+    name: Python wrapper tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python wrapper in editable mode
+        run: python -m pip install --upgrade pip && python -m pip install -e packaging/python
+
+      - name: Run Python wrapper test suite
+        run: python -m unittest discover -s packaging/python/tests
+
+  build-python-package:
+    name: Build Python package
+    needs:
+      - version-alignment
+      - python-wrapper-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python packaging tools
+        run: python -m pip install --upgrade pip build
+
+      - name: Build wrapper wheel and sdist
+        run: python -m build packaging/python --outdir python-dist
+
+      - name: Upload Python package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wrapper-dist
+          path: python-dist/*
+
+  build-release-binary:
+    name: Build Linux release binary
+    needs:
+      - version-alignment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release -p tine-cli
