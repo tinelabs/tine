@@ -50,6 +50,8 @@ The release-oriented install path is:
 pip install tine
 ```
 
+Tine requires Python 3.10 or newer. If your system `python` points to an older interpreter, install with a newer one explicitly, for example `python3.11 -m pip install tine`.
+
 Then start the local server for your workspace:
 
 ```bash

@@ -6,14 +6,20 @@ entrypoints and the MCP adapter around the canonical Rust runtime.
 
 from __future__ import annotations
 
+import os
 from importlib import metadata
 
 from .runtime import expected_release_artifacts, supported_target
 
-try:
-    __version__ = metadata.version("tine")
-except metadata.PackageNotFoundError:  # pragma: no cover - local source checkout
-    __version__ = "0.1.2-dev"
+_overridden_version = os.environ.get("TINE_PACKAGE_VERSION")
+
+if _overridden_version:
+    __version__ = _overridden_version
+else:
+    try:
+        __version__ = metadata.version("tine")
+    except metadata.PackageNotFoundError:  # pragma: no cover - local source checkout
+        __version__ = "0.1.2-dev"
 
 __all__ = ["__version__", "expected_release_artifacts", "supported_target"]
 

@@ -43,10 +43,13 @@ def supported_release_targets() -> list[SupportedTarget]:
 
 
 def package_version() -> str:
+    overridden = os.environ.get("TINE_PACKAGE_VERSION")
+    if overridden:
+        return overridden
     try:
         return metadata.version("tine")
     except metadata.PackageNotFoundError:  # pragma: no cover - local source checkout
-        return os.environ.get("TINE_PACKAGE_VERSION", "0.1.2-dev")
+        return "0.1.2-dev"
 
 
 def supported_target() -> SupportedTarget:
