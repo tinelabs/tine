@@ -56,6 +56,25 @@ class WrapperTests(unittest.TestCase):
             self.assertIsNone(exit_code)
             execv.assert_called_once_with(str(binary), [str(binary), "version"])
 
+    def test_wrapper_sets_tine_ui_dir_when_packaged_ui_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            binary = Path(tmpdir) / "tine"
+            binary.write_text("#!/bin/sh\necho 'tine 0.1.0'\n")
+            binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+            ui_dir = Path(tmpdir) / "ui"
+            ui_dir.mkdir()
+            (ui_dir / "index.html").write_text("<html></html>\n")
+
+            with mock.patch.dict(os.environ, {"TINE_BIN": str(binary), "TINE_PACKAGE_VERSION": "0.1.0"}, clear=True):
+                with mock.patch("tine.cli.package_ui_dir", return_value=ui_dir):
+                    with mock.patch("os.execv") as execv:
+                        exit_code = cli.main(["version"])
+
+                self.assertEqual(os.environ["TINE_UI_DIR"], str(ui_dir))
+
+            self.assertIsNone(exit_code)
+            execv.assert_called_once_with(str(binary), [str(binary), "version"])
+
     def test_fetches_binary_from_release_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as release_dir, tempfile.TemporaryDirectory() as cache_dir:
             release_root = Path(release_dir)

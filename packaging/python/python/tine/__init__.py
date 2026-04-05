@@ -13,7 +13,7 @@ from .runtime import expected_release_artifacts, supported_target
 try:
     __version__ = metadata.version("tine")
 except metadata.PackageNotFoundError:  # pragma: no cover - local source checkout
-    __version__ = "0.1.1-dev"
+    __version__ = "0.1.2-dev"
 
 __all__ = ["__version__", "expected_release_artifacts", "supported_target"]
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tine"
-version = "0.1.1"
+version = "0.1.2"
 description = "Python wrapper and MCP package for the Tine runtime"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -40,4 +40,4 @@ include-package-data = true
 where = ["python"]
 
 [tool.setuptools.package-data]
-tine = ["bin/**/*"]
+tine = ["bin/**/*", "ui/**/*"]

@@ -1025,7 +1025,15 @@ fn parse_picker_output(
 pub fn resolve_ui_dir(
     workspace_dir: &std::path::Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let mut candidates = vec![workspace_dir.join("ui")];
+    let mut candidates = Vec::new();
+
+    if let Ok(configured) = std::env::var("TINE_UI_DIR") {
+        if !configured.trim().is_empty() {
+            candidates.push(PathBuf::from(configured));
+        }
+    }
+
+    candidates.push(workspace_dir.join("ui"));
 
     if let Ok(current_dir) = std::env::current_dir() {
         candidates.push(current_dir.join("ui"));
@@ -2767,5 +2775,21 @@ mod tests {
         )
         .await;
         assert_ne!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[test]
+    fn resolve_ui_dir_uses_tine_ui_dir_env_var() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_dir = tmp.path().join("workspace");
+        let packaged_ui = tmp.path().join("packaged-ui");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        std::fs::create_dir_all(&packaged_ui).expect("packaged ui dir");
+        std::fs::write(packaged_ui.join("index.html"), "<html></html>").expect("index.html");
+
+        std::env::set_var("TINE_UI_DIR", &packaged_ui);
+        let resolved = resolve_ui_dir(&workspace_dir).expect("resolve ui dir");
+        std::env::remove_var("TINE_UI_DIR");
+
+        assert_eq!(resolved, packaged_ui);
     }
 }

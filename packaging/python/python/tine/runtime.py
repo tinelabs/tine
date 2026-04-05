@@ -46,7 +46,7 @@ def package_version() -> str:
     try:
         return metadata.version("tine")
     except metadata.PackageNotFoundError:  # pragma: no cover - local source checkout
-        return os.environ.get("TINE_PACKAGE_VERSION", "0.1.1-dev")
+        return os.environ.get("TINE_PACKAGE_VERSION", "0.1.2-dev")
 
 
 def supported_target() -> SupportedTarget:
@@ -105,14 +105,25 @@ def binary_candidates() -> list[Path]:
     if env_bin_dir:
         candidates.append(Path(env_bin_dir) / binary_name())
 
-    package_root = resources.files("tine")
+    package_root = package_root_path()
     target = supported_target().rust_target
-    candidates.append(Path(str(package_root / "bin" / target / binary_name())))
-    candidates.append(Path(str(package_root / "bin" / binary_name())))
+    candidates.append(package_root / "bin" / target / binary_name())
+    candidates.append(package_root / "bin" / binary_name())
     candidates.extend(source_checkout_binary_candidates())
     candidates.append(cached_binary_path())
 
     return candidates
+
+
+def package_root_path() -> Path:
+    return Path(str(resources.files("tine")))
+
+
+def package_ui_dir() -> Path | None:
+    candidate = package_root_path() / "ui"
+    if (candidate / "index.html").is_file():
+        return candidate
+    return None
 
 
 def source_checkout_binary_candidates(module_file: Path | None = None) -> list[Path]:

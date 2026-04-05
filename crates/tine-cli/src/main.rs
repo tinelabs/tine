@@ -343,6 +343,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Serve { bind, open } => {
             let metrics_handle = init_metrics();
+            ensure_workspace_bootstrap(&config.workspace_dir)?;
             let ws = open_workspace(&config).await?;
             let listener = tokio::net::TcpListener::bind(&bind).await?;
             let local_addr = listener.local_addr()?;
@@ -383,14 +384,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::Internal { command } => match command {
             InternalCommands::Init => {
-                std::fs::create_dir_all(".tine")?;
-                // Create default config
-                let default_config = r#"# tine workspace configuration
-workspace_dir = "."
-bind = "127.0.0.1:9473"
-log_json = false
-"#;
-                std::fs::write(".tine/config.toml", default_config)?;
+                ensure_workspace_bootstrap(std::path::Path::new("."))?;
                 println!("Initialized tine workspace in .tine/");
             }
 
@@ -875,6 +869,7 @@ fn open_browser(url: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_doctor(config: &TineConfig) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_workspace_bootstrap(&config.workspace_dir)?;
     let mut failed = false;
 
     print_doctor_check(
@@ -925,11 +920,34 @@ fn print_doctor_check(name: &str, ok: bool, detail: String) {
 }
 
 async fn open_workspace(config: &TineConfig) -> Result<Workspace, Box<dyn std::error::Error>> {
+    ensure_workspace_bootstrap(&config.workspace_dir)?;
     let store = Arc::new(LocalArtifactStore::new(
         config.workspace_dir.join(".tine/artifacts"),
     ));
     let ws = Workspace::open(config.workspace_dir.clone(), store, 8).await?;
     Ok(ws)
+}
+
+fn default_workspace_config() -> &'static str {
+    r#"# tine workspace configuration
+workspace_dir = "."
+bind = "127.0.0.1:9473"
+log_json = false
+"#
+}
+
+fn ensure_workspace_bootstrap(workspace_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(workspace_dir)?;
+
+    let tine_dir = workspace_dir.join(".tine");
+    std::fs::create_dir_all(&tine_dir)?;
+
+    let config_path = tine_dir.join("config.toml");
+    if !config_path.is_file() {
+        std::fs::write(config_path, default_workspace_config())?;
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1026,7 @@ impl ArtifactStore for LocalArtifactStore {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn top_level_help_shows_narrow_public_surface() {
@@ -1035,6 +1054,26 @@ mod tests {
             Commands::Serve { .. } => {}
             _ => panic!("expected serve command"),
         }
+    }
+
+    #[test]
+    fn ensure_workspace_bootstrap_creates_state_dir_and_config() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let workspace_dir = std::env::temp_dir().join(format!("tine-bootstrap-test-{unique}"));
+
+        if workspace_dir.exists() {
+            std::fs::remove_dir_all(&workspace_dir).expect("clear existing temp workspace");
+        }
+
+        ensure_workspace_bootstrap(&workspace_dir).expect("bootstrap workspace");
+
+        assert!(workspace_dir.join(".tine").is_dir());
+        assert!(workspace_dir.join(".tine/config.toml").is_file());
+
+        std::fs::remove_dir_all(&workspace_dir).expect("cleanup temp workspace");
     }
 
 }

@@ -6,7 +6,7 @@ import os
 import sys
 
 from . import mcp
-from .runtime import ensure_compatible_binary
+from .runtime import ensure_compatible_binary, package_ui_dir
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -16,6 +16,9 @@ def main(argv: list[str] | None = None) -> int:
             return _run_mcp(args[1:])
 
         binary_path = ensure_compatible_binary()
+        ui_dir = package_ui_dir()
+        if ui_dir is not None:
+            os.environ.setdefault("TINE_UI_DIR", str(ui_dir))
         os.execv(str(binary_path), [str(binary_path), *args])
     except Exception as exc:
         print(str(exc), file=sys.stderr)
