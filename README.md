@@ -1,5 +1,11 @@
 # Tine
 
+[![PyPI version](https://img.shields.io/pypi/v/tine?label=PyPI)](https://pypi.org/project/tine/)
+[![CI](https://img.shields.io/github/actions/workflow/status/tinelabs/tine/ci.yml?branch=main&label=CI)](https://github.com/tinelabs/tine/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/tinelabs/tine)](https://github.com/tinelabs/tine/blob/main/LICENSE)
+[![Python](https://img.shields.io/pypi/pyversions/tine)](https://pypi.org/project/tine/)
+[![GitHub release](https://img.shields.io/github/v/release/tinelabs/tine?label=Release)](https://github.com/tinelabs/tine/releases)
+
 A branching notebook runtime for AI and humans.
 
 Tine is a local-first execution engine where notebooks branch like code. Run work in the browser, connect an agent through MCP, and keep both attached to the same fast local runtime.
@@ -200,24 +206,6 @@ That gives you:
 - the **web UI** talking to the local API
 - the **MCP adapter** talking to the same local API
 - one local Rust backend shared by both
-
-## Deployment model
-
-Tine is optimized for a deployment model that is:
-
-- **local-first**
-- **web-first**
-- **OS-agnostic**
-- **agent-friendly**
-
-That means:
-
-- no hosted service is required for the core product
-- the browser UI works across platforms
-- MCP exposes the same capabilities to AI tools
-- deployment can focus on shipping a local server binary plus web UI
-
-For v1, the main product promise is a local server with a browser UI and MCP on top of the same backend. The goal is not to promise multiple independent runtimes or a broad public SDK surface too early.
 
 ## Development from source
 
