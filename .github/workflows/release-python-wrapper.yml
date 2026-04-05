@@ -175,8 +175,6 @@ jobs:
             runner: ubuntu-latest
           - label: linux-arm64
             runner: ubuntu-24.04-arm
-          - label: macos-x86_64
-            runner: macos-14
           - label: macos-arm64
             runner: macos-14
           - label: windows-x86_64
