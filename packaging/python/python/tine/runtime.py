@@ -46,7 +46,7 @@ def package_version() -> str:
     try:
         return metadata.version("tine")
     except metadata.PackageNotFoundError:  # pragma: no cover - local source checkout
-        return os.environ.get("TINE_PACKAGE_VERSION", "0.1.0-dev")
+        return os.environ.get("TINE_PACKAGE_VERSION", "0.1.1-dev")
 
 
 def supported_target() -> SupportedTarget:
