@@ -215,6 +215,12 @@ If you are navigating the repo, these are the most relevant top-level areas:
 - `crates/tine-cli/` for the local launcher and operator commands
 - `packaging/python/` for the Python wrapper, packaging, and MCP entrypoints
 
+## Contributing
+
+Contributions from both humans and AI agents are welcome.
+
+For contribution rules, issue focus areas, validation guidance, and the current priority list, see the repository-level [CONTRIBUTING.md](../CONTRIBUTING.md).
+
 ## Acknowledgements
 
 Tine is grateful to the `ipykernel` and Jupyter communities. Their work helped establish the notebook and kernel patterns that make interactive computing and tool-driven workflows possible.
