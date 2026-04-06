@@ -15,7 +15,7 @@ use tine_core::{
 };
 use tine_env::{EnvironmentManager, TreeEnvironmentDescriptor};
 use tine_graph::ExecutableTreeGraph;
-use tine_kernel::{KernelExecutionResult, KernelManager};
+use tine_kernel::{KernelExecutionResult, KernelManager, DEFAULT_EXECUTION_TIMEOUT_SECS};
 
 // Metric name constants (matching tine-observe)
 const M_NODES_EXECUTED: &str = "tine_nodes_executed_total";
@@ -815,7 +815,7 @@ async fn execute_cell(
 
     // Execute the node's code (with per-node timeout if set)
     // On communication failure, attempt one kernel restart and retry.
-    let timeout_secs = cell.timeout_secs.unwrap_or(600);
+    let timeout_secs = cell.timeout_secs.unwrap_or(DEFAULT_EXECUTION_TIMEOUT_SECS);
     let stream_tx = event_tx.clone();
     let stream_execution_id = execution_id.clone();
     let stream_node_id = Scheduler::node_id_for_cell(cell);

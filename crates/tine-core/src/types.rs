@@ -329,7 +329,7 @@ pub struct NodeDef {
     /// Max concurrent workers for map execution.
     #[serde(default)]
     pub map_concurrency: Option<usize>,
-    /// Per-node execution timeout in seconds.  Overrides the global 600s default.
+    /// Per-node execution timeout in seconds.  Overrides the global 7200s default.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     /// Optional tags for filtering / labeling.

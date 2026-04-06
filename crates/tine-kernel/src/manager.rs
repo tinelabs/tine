@@ -28,9 +28,11 @@ use tine_core::{
 };
 
 /// Maximum number of consecutive 30s IOPub read timeouts before giving up
-/// (in addition to the 600s overall timeout).  Prevents infinite retry loops
+/// (in addition to the 7200s overall timeout).  Prevents infinite retry loops
 /// when a kernel is stuck but technically alive.
 const MAX_IOPUB_TIMEOUTS: u32 = 10;
+
+pub const DEFAULT_EXECUTION_TIMEOUT_SECS: u64 = 7200;
 
 /// Default idle timeout for kernels (seconds).  Kernels that have not executed
 /// code within this window are eligible for LRU eviction.
@@ -736,7 +738,11 @@ impl KernelManager {
         worker_id: &str,
         code: &str,
     ) -> TineResult<KernelExecutionResult> {
-        self.execute_owned_code_with_timeout(&Self::owner_id_for_worker(worker_id), code, 600)
+        self.execute_owned_code_with_timeout(
+            &Self::owner_id_for_worker(worker_id),
+            code,
+            DEFAULT_EXECUTION_TIMEOUT_SECS,
+        )
             .await
     }
 
@@ -746,7 +752,11 @@ impl KernelManager {
         tree_id: &ExperimentTreeId,
         code: &str,
     ) -> TineResult<KernelExecutionResult> {
-        self.execute_owned_code_with_timeout(&Self::owner_id_for_tree(tree_id), code, 600)
+        self.execute_owned_code_with_timeout(
+            &Self::owner_id_for_tree(tree_id),
+            code,
+            DEFAULT_EXECUTION_TIMEOUT_SECS,
+        )
             .await
     }
 
@@ -1571,7 +1581,11 @@ def _pf_context():
         debug!(owner = %owner_id, "sending setup code to kernel");
 
         let result = self
-            .execute_owned_code_with_timeout(owner_id, setup_code, 600)
+            .execute_owned_code_with_timeout(
+                owner_id,
+                setup_code,
+                DEFAULT_EXECUTION_TIMEOUT_SECS,
+            )
             .await?;
         if let Some(ref err) = result.error {
             warn!(
