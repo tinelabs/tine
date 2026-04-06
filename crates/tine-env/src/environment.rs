@@ -1,5 +1,7 @@
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
@@ -169,6 +171,88 @@ impl EnvironmentManager {
         Ok(())
     }
 
+    /// Verify that uv can resolve the requested Python version.
+    pub async fn ensure_python_version_available(
+        &self,
+        python_version: &str,
+    ) -> TineResult<String> {
+        let output = Command::new(&self.uv_path)
+            .args(["python", "find", python_version])
+            .current_dir(&self.workspace_root)
+            .output()
+            .await
+            .map_err(|e| {
+                TineError::Config(format!(
+                    "failed to query Python {} via uv at '{}': {}",
+                    python_version,
+                    self.uv_path.display(),
+                    e
+                ))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if !stderr.is_empty() { stderr } else { stdout };
+            return Err(TineError::Config(format!(
+                "Python {} is not available via uv: {}",
+                python_version, detail
+            )));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Build a temporary kernel runtime and verify the Jupyter entrypoint can start.
+    pub async fn doctor_runtime_check(&self) -> TineResult<String> {
+        self.ensure_uv().await?;
+        self.ensure_python_version_available(DEFAULT_PYTHON_VERSION)
+            .await?;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let venv_dir = self
+            .workspace_root
+            .join(".tine")
+            .join("doctor")
+            .join(format!("runtime-check-{unique}"));
+        let runtime_id = format!("doctor-runtime-{unique}");
+        let mut logs = Vec::new();
+
+        let result = async {
+            self.create_venv(&runtime_id, &venv_dir, &mut logs).await?;
+            let required_packages = TINE_REQUIRED_PACKAGES
+                .iter()
+                .map(|pkg| (*pkg).to_string())
+                .collect::<Vec<_>>();
+            self.sync_packages(&runtime_id, &venv_dir, &required_packages, &mut logs)
+                .await?;
+            let python_path = self.python_path(&venv_dir);
+            self.preflight_kernel_runtime(&runtime_id, &python_path, &venv_dir, &mut logs)
+                .await?;
+            Ok::<(), TineError>(())
+        }
+        .await;
+
+        match tokio::fs::remove_dir_all(&venv_dir).await {
+            Ok(()) => logs.push(format!(
+                "Removed doctor runtime at {}",
+                venv_dir.display()
+            )),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => logs.push(format!(
+                "Failed to remove doctor runtime at {}: {}",
+                venv_dir.display(),
+                error
+            )),
+        }
+
+        result?;
+        Ok(logs.join("\n\n"))
+    }
+
     fn venv_dir_for_project(&self, project_id: Option<&ProjectId>) -> PathBuf {
         match project_id {
             Some(project_id) => self
@@ -187,6 +271,14 @@ impl EnvironmentManager {
 
     fn effective_requirements_path(&self, venv_dir: &Path) -> PathBuf {
         venv_dir.join("requirements.txt")
+    }
+
+    fn venv_config_path(&self, venv_dir: &Path) -> PathBuf {
+        venv_dir.join("pyvenv.cfg")
+    }
+
+    fn venv_looks_valid(&self, venv_dir: &Path) -> bool {
+        self.venv_config_path(venv_dir).is_file() && self.python_path(venv_dir).is_file()
     }
 
     fn normalize_venv_dir(&self, venv_dir: &Path) -> PathBuf {
@@ -231,6 +323,10 @@ impl EnvironmentManager {
         let venv_dir = self.normalize_venv_dir(venv_dir);
         let mut logs = Vec::new();
 
+        self.ensure_uv().await?;
+        self.ensure_python_version_available(DEFAULT_PYTHON_VERSION)
+            .await?;
+
         info!(
             owner = runtime_id,
             venv = %venv_dir.display(),
@@ -238,58 +334,26 @@ impl EnvironmentManager {
             "ensuring environment"
         );
 
-        // Create venv if it doesn't exist
-        if !venv_dir.exists() {
-            eprintln!("[tine-env] creating venv at {}", venv_dir.display());
-            debug!(venv = %venv_dir.display(), "creating venv");
-            logs.push(format!("Creating venv at {}", venv_dir.display()));
-            tokio::fs::create_dir_all(&venv_dir).await.map_err(|e| {
+        if venv_dir.exists() && !self.venv_looks_valid(&venv_dir) {
+            eprintln!(
+                "[tine-env] removing broken venv at {}",
+                venv_dir.display()
+            );
+            logs.push(format!(
+                "Removing broken venv at {} before recreation",
+                venv_dir.display()
+            ));
+            tokio::fs::remove_dir_all(&venv_dir).await.map_err(|e| {
                 TineError::EnvironmentFailed {
                     runtime_id: runtime_id.to_string(),
-                    message: format!("failed to create venv dir: {}", e),
+                    message: format!("failed to remove broken venv dir: {}", e),
                 }
             })?;
-            let output = Command::new(&self.uv_path)
-                .args(["venv", &venv_dir.display().to_string()])
-                .args(["--python", DEFAULT_PYTHON_VERSION])
-                .current_dir(&self.workspace_root)
-                .output()
-                .await
-                .map_err(|e| TineError::EnvironmentFailed {
-                    runtime_id: runtime_id.to_string(),
-                    message: e.to_string(),
-                })?;
+        }
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !output.stdout.is_empty() {
-                    logs.push(String::from_utf8_lossy(&output.stdout).trim().to_string());
-                }
-                if !stderr.trim().is_empty() {
-                    logs.push(stderr.trim().to_string());
-                }
-                eprintln!("[tine-env] venv creation failed: {}", stderr);
-                return Err(TineError::EnvironmentFailed {
-                    runtime_id: runtime_id.to_string(),
-                    message: stderr.to_string(),
-                });
-            }
-            if !output.stdout.is_empty() {
-                logs.push(String::from_utf8_lossy(&output.stdout).trim().to_string());
-            }
-            let python_path = self.python_path(&venv_dir);
-            if !python_path.exists() {
-                return Err(TineError::EnvironmentFailed {
-                    runtime_id: runtime_id.to_string(),
-                    message: format!(
-                        "venv created at '{}' but python executable was not found at '{}'",
-                        venv_dir.display(),
-                        python_path.display()
-                    ),
-                });
-            }
-            eprintln!("[tine-env] venv created successfully");
-            logs.push("Venv created successfully".to_string());
+        // Create venv if it doesn't exist
+        if !venv_dir.exists() {
+            self.create_venv(runtime_id, &venv_dir, &mut logs).await?;
         } else {
             eprintln!("[tine-env] venv already exists at {}", venv_dir.display());
             logs.push(format!("Using existing venv at {}", venv_dir.display()));
@@ -297,81 +361,8 @@ impl EnvironmentManager {
 
         // Sync all packages: required + defaults + user deps
         let all_packages = resolve_packages(&spec.dependencies);
-        let requirements_path = self.effective_requirements_path(&venv_dir);
-        let requirements_contents = if all_packages.is_empty() {
-            String::new()
-        } else {
-            format!("{}\n", all_packages.join("\n"))
-        };
-        tokio::fs::write(&requirements_path, requirements_contents)
-            .await
-            .map_err(|e| TineError::EnvironmentFailed {
-                runtime_id: runtime_id.to_string(),
-                message: format!("failed to write effective requirements: {}", e),
-            })?;
-        if !all_packages.is_empty() {
-            eprintln!(
-                "[tine-env] syncing {} packages (required + defaults + user)",
-                all_packages.len()
-            );
-            logs.push(format!(
-                "Installing {} packages from {}",
-                all_packages.len(),
-                requirements_path.display()
-            ));
-            let python_path = self.python_path(&venv_dir);
-            if !python_path.exists() {
-                return Err(TineError::EnvironmentFailed {
-                    runtime_id: runtime_id.to_string(),
-                    message: format!(
-                        "python executable was not found at '{}' before syncing packages",
-                        python_path.display()
-                    ),
-                });
-            }
-            let mut cmd = Command::new(&self.uv_path);
-            cmd.arg("pip")
-                .arg("install")
-                .arg("--python")
-                .arg(&python_path)
-                .arg("-r")
-                .arg(&requirements_path)
-                .env("VIRTUAL_ENV", &venv_dir)
-                .current_dir(&self.workspace_root);
-
-            let output = cmd
-                .output()
-                .await
-                .map_err(|e| TineError::EnvironmentFailed {
-                    runtime_id: runtime_id.to_string(),
-                    message: e.to_string(),
-                })?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !output.stdout.is_empty() {
-                    logs.push(String::from_utf8_lossy(&output.stdout).trim().to_string());
-                }
-                if !stderr.trim().is_empty() {
-                    logs.push(stderr.trim().to_string());
-                }
-                eprintln!("[tine-env] package sync failed: {}", stderr);
-                return Err(TineError::DependencyResolution(stderr.to_string()));
-            }
-            if !output.stdout.is_empty() {
-                logs.push(String::from_utf8_lossy(&output.stdout).trim().to_string());
-            }
-            if !output.stderr.is_empty() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !stderr.trim().is_empty() {
-                    logs.push(stderr.trim().to_string());
-                }
-            }
-            eprintln!("[tine-env] environment synced successfully");
-            logs.push("Environment is ready".to_string());
-        } else {
-            logs.push("No additional packages required".to_string());
-        }
+        self.sync_packages(runtime_id, &venv_dir, &all_packages, &mut logs)
+            .await?;
 
         let python_path = self.python_path(&venv_dir);
         self.preflight_kernel_runtime(runtime_id, &python_path, &venv_dir, &mut logs)
@@ -442,6 +433,166 @@ impl EnvironmentManager {
         Ok(())
     }
 
+    async fn create_venv(
+        &self,
+        runtime_id: &str,
+        venv_dir: &Path,
+        logs: &mut Vec<String>,
+    ) -> TineResult<()> {
+        eprintln!("[tine-env] creating venv at {}", venv_dir.display());
+        debug!(venv = %venv_dir.display(), "creating venv");
+        logs.push(format!("Creating venv at {}", venv_dir.display()));
+        let venv_parent = venv_dir.parent().unwrap_or(&self.workspace_root);
+        tokio::fs::create_dir_all(venv_parent).await.map_err(|e| {
+            TineError::EnvironmentFailed {
+                runtime_id: runtime_id.to_string(),
+                message: format!("failed to create venv parent dir: {}", e),
+            }
+        })?;
+        let output = Command::new(&self.uv_path)
+            .args(["venv", &venv_dir.display().to_string()])
+            .args(["--python", DEFAULT_PYTHON_VERSION])
+            .current_dir(&self.workspace_root)
+            .output()
+            .await
+            .map_err(|e| TineError::EnvironmentFailed {
+                runtime_id: runtime_id.to_string(),
+                message: e.to_string(),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !output.stdout.is_empty() {
+                logs.push(String::from_utf8_lossy(&output.stdout).trim().to_string());
+            }
+            if !stderr.trim().is_empty() {
+                logs.push(stderr.trim().to_string());
+            }
+            eprintln!("[tine-env] venv creation failed: {}", stderr);
+            if venv_dir.exists() && !self.venv_looks_valid(&venv_dir) {
+                match tokio::fs::remove_dir_all(&venv_dir).await {
+                    Ok(()) => logs.push(format!(
+                        "Removed partial venv at {} after failed creation",
+                        venv_dir.display()
+                    )),
+                    Err(remove_error) if remove_error.kind() == ErrorKind::NotFound => {}
+                    Err(remove_error) => logs.push(format!(
+                        "Failed to remove partial venv at {}: {}",
+                        venv_dir.display(),
+                        remove_error
+                    )),
+                }
+            }
+            return Err(TineError::EnvironmentFailed {
+                runtime_id: runtime_id.to_string(),
+                message: stderr.to_string(),
+            });
+        }
+        if !output.stdout.is_empty() {
+            logs.push(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        }
+        let python_path = self.python_path(venv_dir);
+        if !python_path.exists() {
+            return Err(TineError::EnvironmentFailed {
+                runtime_id: runtime_id.to_string(),
+                message: format!(
+                    "venv created at '{}' but python executable was not found at '{}'",
+                    venv_dir.display(),
+                    python_path.display()
+                ),
+            });
+        }
+        eprintln!("[tine-env] venv created successfully");
+        logs.push("Venv created successfully".to_string());
+        Ok(())
+    }
+
+    async fn sync_packages(
+        &self,
+        runtime_id: &str,
+        venv_dir: &Path,
+        packages: &[String],
+        logs: &mut Vec<String>,
+    ) -> TineResult<()> {
+        let requirements_path = self.effective_requirements_path(venv_dir);
+        let requirements_contents = if packages.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", packages.join("\n"))
+        };
+        tokio::fs::write(&requirements_path, requirements_contents)
+            .await
+            .map_err(|e| TineError::EnvironmentFailed {
+                runtime_id: runtime_id.to_string(),
+                message: format!("failed to write effective requirements: {}", e),
+            })?;
+        if packages.is_empty() {
+            logs.push("No additional packages required".to_string());
+            return Ok(());
+        }
+
+        eprintln!(
+            "[tine-env] syncing {} packages (required + defaults + user)",
+            packages.len()
+        );
+        logs.push(format!(
+            "Installing {} packages from {}",
+            packages.len(),
+            requirements_path.display()
+        ));
+        let python_path = self.python_path(venv_dir);
+        if !python_path.exists() {
+            return Err(TineError::EnvironmentFailed {
+                runtime_id: runtime_id.to_string(),
+                message: format!(
+                    "python executable was not found at '{}' before syncing packages",
+                    python_path.display()
+                ),
+            });
+        }
+        let mut cmd = Command::new(&self.uv_path);
+        cmd.arg("pip")
+            .arg("install")
+            .arg("--python")
+            .arg(&python_path)
+            .arg("-r")
+            .arg(&requirements_path)
+            .env("VIRTUAL_ENV", venv_dir)
+            .current_dir(&self.workspace_root);
+
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| TineError::EnvironmentFailed {
+                runtime_id: runtime_id.to_string(),
+                message: e.to_string(),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !output.stdout.is_empty() {
+                logs.push(String::from_utf8_lossy(&output.stdout).trim().to_string());
+            }
+            if !stderr.trim().is_empty() {
+                logs.push(stderr.trim().to_string());
+            }
+            eprintln!("[tine-env] package sync failed: {}", stderr);
+            return Err(TineError::DependencyResolution(stderr.to_string()));
+        }
+        if !output.stdout.is_empty() {
+            logs.push(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        }
+        if !output.stderr.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.trim().is_empty() {
+                logs.push(stderr.trim().to_string());
+            }
+        }
+        eprintln!("[tine-env] environment synced successfully");
+        logs.push("Environment is ready".to_string());
+        Ok(())
+    }
+
     /// Compute blake3 hash of the lockfile for cache key computation.
     pub async fn lockfile_hash_for_tree(
         &self,
@@ -480,7 +631,7 @@ fn normalize_workspace_root(workspace_root: PathBuf) -> PathBuf {
     }
 }
 
-const DEFAULT_PYTHON_VERSION: &str = "3.11";
+pub const DEFAULT_PYTHON_VERSION: &str = "3.11";
 
 #[cfg(test)]
 mod tests {
@@ -556,6 +707,22 @@ mod tests {
 
         assert!(manager.workspace_root.is_absolute());
         assert!(manager.workspace_root.ends_with(relative));
+    }
+
+    #[test]
+    fn venv_is_only_valid_when_config_and_python_exist() {
+        let temp = tempdir().unwrap();
+        let manager = EnvironmentManager::new(temp.path().join("workspace"));
+        let venv_dir = temp.path().join("venv");
+        fs::create_dir_all(venv_dir.join("bin")).unwrap();
+
+        assert!(!manager.venv_looks_valid(&venv_dir));
+
+        fs::write(venv_dir.join("pyvenv.cfg"), "home = /tmp/python\n").unwrap();
+        assert!(!manager.venv_looks_valid(&venv_dir));
+
+        fs::write(venv_dir.join("bin").join("python"), "#!/bin/sh\n").unwrap();
+        assert!(manager.venv_looks_valid(&venv_dir));
     }
 
     #[tokio::test]

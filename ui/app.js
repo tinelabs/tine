@@ -1409,10 +1409,11 @@ async function pollExecution(execId, runtimeId, nodeIds) {
       const executionTarget = store.get().executionTargets?.[execId] || null;
       const treeId = st.tree_id || executionTarget?.treeId || null;
       const branchId = st.branch_id || executionTarget?.branchId || null;
+      const wsConnected = store.get().wsConnected;
       const liveNodes = targetNodes.length
         ? targetNodes
         : Object.keys(st.node_statuses || {});
-      if (liveNodes.length) {
+      if (liveNodes.length && !wsConnected) {
         store.set((s) => {
           const cellStatuses = { ...s.cellStatuses };
           for (const nid of liveNodes) {
@@ -1452,9 +1453,11 @@ async function pollExecution(execId, runtimeId, nodeIds) {
               cellStatuses: {
                 ...s.cellStatuses,
                 [cellKey]:
-                  deriveStatusFromLogs(l) === "idle"
-                    ? s.cellStatuses[cellKey] || "idle"
-                    : deriveStatusFromLogs(l),
+                  !s.wsConnected || ["idle", "queued", "running", "timeout"].includes(s.cellStatuses[cellKey] || "idle")
+                    ? (deriveStatusFromLogs(l) === "idle"
+                        ? s.cellStatuses[cellKey] || "idle"
+                        : deriveStatusFromLogs(l))
+                    : s.cellStatuses[cellKey],
               },
             }));
           } catch {}
@@ -1471,7 +1474,8 @@ async function pollExecution(execId, runtimeId, nodeIds) {
       termLog(`Execution ${execId} poll error: ${err}`, "error");
     }
   }
-  if (targetNodes.length) {
+  const wsConnected = store.get().wsConnected;
+  if (targetNodes.length && !wsConnected) {
     const executionTarget = store.get().executionTargets?.[execId] || null;
     for (const nid of targetNodes) {
       const k = runtimeCellKey({
@@ -1499,9 +1503,19 @@ async function pollExecution(execId, runtimeId, nodeIds) {
         },
       }));
     }
+  } else if (targetNodes.length) {
+    termLog(
+      `Execution ${execId} polling window ended; waiting for WebSocket updates`,
+      "info",
+    );
   }
   finishTrackedExecution(execId);
-  termLog(`Execution ${execId} polling timed out`, "error");
+  termLog(
+    wsConnected
+      ? `Execution ${execId} poll window ended`
+      : `Execution ${execId} polling timed out`,
+    wsConnected ? "info" : "error",
+  );
 }
 
 async function cancelExecutionById(execId) {

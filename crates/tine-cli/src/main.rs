@@ -13,6 +13,7 @@ use figment::{
 };
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+use tine_env::{EnvironmentManager, DEFAULT_PYTHON_VERSION};
 
 use tine_api::{export_branch_as_ipynb, export_branch_as_python, Workspace};
 use tine_core::{
@@ -375,7 +376,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Doctor => {
-            run_doctor(&config)?;
+            run_doctor(&config).await?;
         }
 
         Commands::Version => {
@@ -868,7 +869,7 @@ fn open_browser(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn run_doctor(config: &TineConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_doctor(config: &TineConfig) -> Result<(), Box<dyn std::error::Error>> {
     ensure_workspace_bootstrap(&config.workspace_dir)?;
     let mut failed = false;
 
@@ -904,6 +905,65 @@ fn run_doctor(config: &TineConfig) -> Result<(), Box<dyn std::error::Error>> {
             print_doctor_check("web UI assets", false, error.to_string());
             failed = true;
         }
+    }
+
+    let env_manager = EnvironmentManager::new(config.workspace_dir.clone());
+    let uv_ok = match env_manager.ensure_uv().await {
+        Ok(()) => {
+            print_doctor_check("uv", true, "available".to_string());
+            true
+        }
+        Err(error) => {
+            print_doctor_check("uv", false, error.to_string());
+            failed = true;
+            false
+        }
+    };
+
+    if uv_ok {
+        match env_manager
+            .ensure_python_version_available(DEFAULT_PYTHON_VERSION)
+            .await
+        {
+            Ok(path) => print_doctor_check(
+                &format!("python {} via uv", DEFAULT_PYTHON_VERSION),
+                true,
+                path,
+            ),
+            Err(error) => {
+                print_doctor_check(
+                    &format!("python {} via uv", DEFAULT_PYTHON_VERSION),
+                    false,
+                    error.to_string(),
+                );
+                failed = true;
+            }
+        }
+
+        if !failed {
+            match env_manager.doctor_runtime_check().await {
+                Ok(_) => print_doctor_check(
+                    "runtime preflight",
+                    true,
+                    "temporary kernel environment created successfully".to_string(),
+                ),
+                Err(error) => {
+                    print_doctor_check("runtime preflight", false, error.to_string());
+                    failed = true;
+                }
+            }
+        }
+    } else {
+        print_doctor_check(
+            &format!("python {} via uv", DEFAULT_PYTHON_VERSION),
+            false,
+            "uv unavailable".to_string(),
+        );
+        print_doctor_check(
+            "runtime preflight",
+            false,
+            "uv unavailable".to_string(),
+        );
     }
 
     if failed {
