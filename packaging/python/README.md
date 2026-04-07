@@ -101,6 +101,35 @@ tine mcp serve --api-url http://127.0.0.1:9473
 
 `tine-mcp --api-url http://127.0.0.1:9473` is also supported, but `tine mcp serve` is the preferred public form.
 
+### Host path caveat
+
+Some GUI hosts do not inherit the same `PATH` as your interactive shell.
+
+On macOS this matters most for Claude Desktop. A config that uses:
+
+```json
+{
+  "command": "tine",
+  "args": ["mcp", "serve", "--api-url", "http://127.0.0.1:9473"]
+}
+```
+
+is only valid if the Claude process can resolve `tine` from its own environment.
+
+With `pip install --user` on macOS, that often means using an absolute command from `~/Library/Python/<python-version>/bin/`.
+
+If your host cannot resolve `tine`, register an explicit command path instead:
+
+```bash
+tine mcp register --host claude --api-url http://127.0.0.1:9473 --command "$(command -v tine-mcp)"
+```
+
+You can do the same with `print-config` if you want to manage the file manually:
+
+```bash
+tine mcp print-config --host claude --api-url http://127.0.0.1:9473 --command "$(command -v tine-mcp)"
+```
+
 ### MCP config generation
 
 Generate an MCP config document for a supported host:
@@ -149,6 +178,19 @@ Example Claude Desktop config output:
 }
 ```
 
+For GUI hosts such as Claude Desktop on macOS, you may prefer an absolute command path instead:
+
+```json
+{
+  "mcpServers": {
+    "tine": {
+      "command": "/absolute/path/to/tine-mcp",
+      "args": ["--api-url", "http://127.0.0.1:9473"]
+    }
+  }
+}
+```
+
 ### MCP config registration
 
 To write the generated config directly into the standard host config location:
@@ -162,6 +204,7 @@ Equivalent examples:
 ```bash
 tine mcp register --host cursor --api-url http://127.0.0.1:9473
 tine mcp register --host claude --api-url http://127.0.0.1:9473
+tine mcp register --host claude --api-url http://127.0.0.1:9473 --command "$(command -v tine-mcp)"
 ```
 
 Default config targets are resolved per OS:
