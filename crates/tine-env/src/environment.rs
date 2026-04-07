@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -87,7 +88,30 @@ fn package_name(spec: &str) -> String {
     name.to_lowercase()
 }
 
-/// Manages Python environments via the `uv` binary.
+#[derive(Debug, Clone)]
+struct PythonCommand {
+    program: PathBuf,
+    args: Vec<String>,
+    display: String,
+}
+
+impl PythonCommand {
+    fn new(program: impl Into<PathBuf>, args: Vec<String>) -> Self {
+        let program = program.into();
+        let display = if args.is_empty() {
+            program.display().to_string()
+        } else {
+            format!("{} {}", program.display(), args.join(" "))
+        };
+        Self {
+            program,
+            args,
+            display,
+        }
+    }
+}
+
+/// Manages Python environments for experiment kernels.
 pub struct EnvironmentManager {
     /// Path to the uv binary.
     uv_path: PathBuf,
@@ -171,43 +195,19 @@ impl EnvironmentManager {
         Ok(())
     }
 
-    /// Verify that uv can resolve the requested Python version.
+    /// Verify that a compatible Python interpreter is available.
     pub async fn ensure_python_version_available(
         &self,
         python_version: &str,
     ) -> TineResult<String> {
-        let output = Command::new(&self.uv_path)
-            .args(["python", "find", python_version])
-            .current_dir(&self.workspace_root)
-            .output()
+        self.resolve_python_command(python_version)
             .await
-            .map_err(|e| {
-                TineError::Config(format!(
-                    "failed to query Python {} via uv at '{}': {}",
-                    python_version,
-                    self.uv_path.display(),
-                    e
-                ))
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let detail = if !stderr.is_empty() { stderr } else { stdout };
-            return Err(TineError::Config(format!(
-                "Python {} is not available via uv: {}",
-                python_version, detail
-            )));
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .map(|command| command.display)
     }
 
     /// Build a temporary kernel runtime and verify the Jupyter entrypoint can start.
     pub async fn doctor_runtime_check(&self) -> TineResult<String> {
-        self.ensure_uv().await?;
-        self.ensure_python_version_available(DEFAULT_PYTHON_VERSION)
-            .await?;
+        let python_command = self.resolve_python_command(DEFAULT_PYTHON_VERSION).await?;
 
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -222,7 +222,8 @@ impl EnvironmentManager {
         let mut logs = Vec::new();
 
         let result = async {
-            self.create_venv(&runtime_id, &venv_dir, &mut logs).await?;
+            self.create_venv(&runtime_id, &python_command, &venv_dir, &mut logs)
+                .await?;
             let required_packages = TINE_REQUIRED_PACKAGES
                 .iter()
                 .map(|pkg| (*pkg).to_string())
@@ -237,10 +238,7 @@ impl EnvironmentManager {
         .await;
 
         match tokio::fs::remove_dir_all(&venv_dir).await {
-            Ok(()) => logs.push(format!(
-                "Removed doctor runtime at {}",
-                venv_dir.display()
-            )),
+            Ok(()) => logs.push(format!("Removed doctor runtime at {}", venv_dir.display())),
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => logs.push(format!(
                 "Failed to remove doctor runtime at {}: {}",
@@ -322,10 +320,7 @@ impl EnvironmentManager {
         let _env_guard = self.env_lock.lock().await;
         let venv_dir = self.normalize_venv_dir(venv_dir);
         let mut logs = Vec::new();
-
-        self.ensure_uv().await?;
-        self.ensure_python_version_available(DEFAULT_PYTHON_VERSION)
-            .await?;
+        let python_command = self.resolve_python_command(DEFAULT_PYTHON_VERSION).await?;
 
         info!(
             owner = runtime_id,
@@ -335,10 +330,7 @@ impl EnvironmentManager {
         );
 
         if venv_dir.exists() && !self.venv_looks_valid(&venv_dir) {
-            eprintln!(
-                "[tine-env] removing broken venv at {}",
-                venv_dir.display()
-            );
+            eprintln!("[tine-env] removing broken venv at {}", venv_dir.display());
             logs.push(format!(
                 "Removing broken venv at {} before recreation",
                 venv_dir.display()
@@ -353,11 +345,15 @@ impl EnvironmentManager {
 
         // Create venv if it doesn't exist
         if !venv_dir.exists() {
-            self.create_venv(runtime_id, &venv_dir, &mut logs).await?;
+            self.create_venv(runtime_id, &python_command, &venv_dir, &mut logs)
+                .await?;
         } else {
             eprintln!("[tine-env] venv already exists at {}", venv_dir.display());
             logs.push(format!("Using existing venv at {}", venv_dir.display()));
         }
+
+        self.ensure_pip_available(runtime_id, &venv_dir, &mut logs)
+            .await?;
 
         // Sync all packages: required + defaults + user deps
         let all_packages = resolve_packages(&spec.dependencies);
@@ -392,14 +388,13 @@ impl EnvironmentManager {
             "Preflighting kernel runtime via {}",
             python_path.display()
         ));
-        let output = Command::new(python_path)
+        let mut command = Command::new(python_path);
+        command
             .arg("-c")
             .arg("import ipykernel_launcher")
-            .env("VIRTUAL_ENV", venv_dir)
-            .current_dir(&self.workspace_root)
-            .output()
-            .await
-            .map_err(|e| TineError::EnvironmentFailed {
+            .current_dir(&self.workspace_root);
+        self.apply_venv_env(&mut command, venv_dir);
+        let output = command.output().await.map_err(|e| TineError::EnvironmentFailed {
                 runtime_id: runtime_id.to_string(),
                 message: format!(
                     "kernel runtime preflight failed for '{}': {}. The environment was created at '{}', but the kernel entrypoint could not be started.",
@@ -436,23 +431,32 @@ impl EnvironmentManager {
     async fn create_venv(
         &self,
         runtime_id: &str,
+        python_command: &PythonCommand,
         venv_dir: &Path,
         logs: &mut Vec<String>,
     ) -> TineResult<()> {
         eprintln!("[tine-env] creating venv at {}", venv_dir.display());
         debug!(venv = %venv_dir.display(), "creating venv");
         logs.push(format!("Creating venv at {}", venv_dir.display()));
+        logs.push(format!(
+            "Using Python interpreter {}",
+            python_command.display
+        ));
         let venv_parent = venv_dir.parent().unwrap_or(&self.workspace_root);
-        tokio::fs::create_dir_all(venv_parent).await.map_err(|e| {
-            TineError::EnvironmentFailed {
+        tokio::fs::create_dir_all(venv_parent)
+            .await
+            .map_err(|e| TineError::EnvironmentFailed {
                 runtime_id: runtime_id.to_string(),
                 message: format!("failed to create venv parent dir: {}", e),
-            }
-        })?;
-        let output = Command::new(&self.uv_path)
-            .args(["venv", &venv_dir.display().to_string()])
-            .args(["--python", DEFAULT_PYTHON_VERSION])
-            .current_dir(&self.workspace_root)
+            })?;
+        let mut command = Command::new(&python_command.program);
+        command
+            .args(&python_command.args)
+            .arg("-m")
+            .arg("venv")
+            .arg(venv_dir)
+            .current_dir(&self.workspace_root);
+        let output = command
             .output()
             .await
             .map_err(|e| TineError::EnvironmentFailed {
@@ -502,8 +506,96 @@ impl EnvironmentManager {
                 ),
             });
         }
+        self.ensure_pip_available(runtime_id, venv_dir, logs)
+            .await?;
         eprintln!("[tine-env] venv created successfully");
         logs.push("Venv created successfully".to_string());
+        Ok(())
+    }
+
+    async fn ensure_pip_available(
+        &self,
+        runtime_id: &str,
+        venv_dir: &Path,
+        logs: &mut Vec<String>,
+    ) -> TineResult<()> {
+        let python_path = self.python_path(venv_dir);
+        if !python_path.exists() {
+            return Err(TineError::EnvironmentFailed {
+                runtime_id: runtime_id.to_string(),
+                message: format!(
+                    "python executable was not found at '{}' before ensuring pip",
+                    python_path.display()
+                ),
+            });
+        }
+
+        let mut pip_check = Command::new(&python_path);
+        pip_check.arg("-m").arg("pip").arg("--version");
+        self.apply_venv_env(&mut pip_check, venv_dir);
+        let pip_ready = pip_check
+            .output()
+            .await
+            .map(|output| output.status.success());
+        if matches!(pip_ready, Ok(true)) {
+            logs.push("pip is available in the environment".to_string());
+            return Ok(());
+        }
+
+        logs.push("Bootstrapping pip with ensurepip".to_string());
+        let mut ensurepip = Command::new(&python_path);
+        ensurepip.arg("-m").arg("ensurepip").arg("--upgrade");
+        self.apply_venv_env(&mut ensurepip, venv_dir);
+        let output = ensurepip
+            .output()
+            .await
+            .map_err(|e| TineError::EnvironmentFailed {
+                runtime_id: runtime_id.to_string(),
+                message: format!("failed to bootstrap pip with ensurepip: {}", e),
+            })?;
+
+        if !output.stdout.is_empty() {
+            logs.push(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        }
+        if !output.stderr.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.trim().is_empty() {
+                logs.push(stderr.trim().to_string());
+            }
+        }
+        if !output.status.success() {
+            return Err(TineError::EnvironmentFailed {
+                runtime_id: runtime_id.to_string(),
+                message: format!(
+                    "failed to bootstrap pip in '{}': {}",
+                    venv_dir.display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+
+        let mut verify_pip = Command::new(&python_path);
+        verify_pip.arg("-m").arg("pip").arg("--version");
+        self.apply_venv_env(&mut verify_pip, venv_dir);
+        let verify_output =
+            verify_pip
+                .output()
+                .await
+                .map_err(|e| TineError::EnvironmentFailed {
+                    runtime_id: runtime_id.to_string(),
+                    message: format!("failed to verify pip after ensurepip: {}", e),
+                })?;
+        if !verify_output.status.success() {
+            return Err(TineError::EnvironmentFailed {
+                runtime_id: runtime_id.to_string(),
+                message: format!(
+                    "pip remained unavailable in '{}' after ensurepip",
+                    venv_dir.display()
+                ),
+            });
+        }
+
+        logs.push("pip is available in the environment".to_string());
         Ok(())
     }
 
@@ -550,15 +642,14 @@ impl EnvironmentManager {
                 ),
             });
         }
-        let mut cmd = Command::new(&self.uv_path);
-        cmd.arg("pip")
+        let mut cmd = Command::new(&python_path);
+        cmd.arg("-m")
+            .arg("pip")
             .arg("install")
-            .arg("--python")
-            .arg(&python_path)
             .arg("-r")
             .arg(&requirements_path)
-            .env("VIRTUAL_ENV", venv_dir)
             .current_dir(&self.workspace_root);
+        self.apply_venv_env(&mut cmd, venv_dir);
 
         let output = cmd
             .output()
@@ -618,6 +709,143 @@ impl EnvironmentManager {
         } else {
             venv_dir.join("bin").join("python")
         }
+    }
+
+    fn venv_bin_dir(&self, venv_dir: &Path) -> PathBuf {
+        if cfg!(windows) {
+            venv_dir.join("Scripts")
+        } else {
+            venv_dir.join("bin")
+        }
+    }
+
+    fn apply_venv_env<'a>(&self, command: &'a mut Command, venv_dir: &Path) -> &'a mut Command {
+        command
+            .env("VIRTUAL_ENV", venv_dir)
+            .env("PATH", self.path_with_venv_bin(venv_dir))
+    }
+
+    fn path_with_venv_bin(&self, venv_dir: &Path) -> OsString {
+        let venv_bin = self.venv_bin_dir(venv_dir);
+        let mut paths = vec![venv_bin];
+        if let Some(existing) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        std::env::join_paths(paths).unwrap_or_else(|_| {
+            let mut fallback = OsString::from(self.venv_bin_dir(venv_dir));
+            if let Some(existing) = std::env::var_os("PATH") {
+                fallback.push(if cfg!(windows) { ";" } else { ":" });
+                fallback.push(existing);
+            }
+            fallback
+        })
+    }
+
+    async fn resolve_python_command(&self, python_version: &str) -> TineResult<PythonCommand> {
+        if let Some(command) = self.resolve_python_via_uv(python_version).await {
+            return Ok(command);
+        }
+
+        let mut attempted = Vec::new();
+        for command in self.python_command_candidates(python_version) {
+            attempted.push(command.display.clone());
+            match self
+                .python_command_matches_version(&command, python_version)
+                .await
+            {
+                Ok(true) => return Ok(command),
+                Ok(false) => {}
+                Err(_) => {}
+            }
+        }
+
+        Err(TineError::Config(format!(
+            "Python {} is not available. Tried {}",
+            python_version,
+            attempted.join(", ")
+        )))
+    }
+
+    async fn resolve_python_via_uv(&self, python_version: &str) -> Option<PythonCommand> {
+        let output = Command::new(&self.uv_path)
+            .args(["python", "find", python_version])
+            .current_dir(&self.workspace_root)
+            .output()
+            .await
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if resolved.is_empty() {
+            return None;
+        }
+
+        Some(PythonCommand::new(PathBuf::from(resolved), Vec::new()))
+    }
+
+    fn python_command_candidates(&self, python_version: &str) -> Vec<PythonCommand> {
+        let major = python_version
+            .split('.')
+            .next()
+            .unwrap_or(python_version)
+            .to_string();
+
+        let mut candidates = Vec::new();
+
+        if cfg!(windows) {
+            candidates.push(PythonCommand::new(
+                PathBuf::from("py"),
+                vec![format!("-{}", python_version)],
+            ));
+            candidates.push(PythonCommand::new(
+                PathBuf::from("py"),
+                vec![format!("-{}", major)],
+            ));
+            candidates.push(PythonCommand::new(
+                PathBuf::from(format!("python{}", python_version)),
+                Vec::new(),
+            ));
+            candidates.push(PythonCommand::new(PathBuf::from("python"), Vec::new()));
+        } else {
+            candidates.push(PythonCommand::new(
+                PathBuf::from(format!("python{}", python_version)),
+                Vec::new(),
+            ));
+            candidates.push(PythonCommand::new(
+                PathBuf::from(format!("python{}", major)),
+                Vec::new(),
+            ));
+            candidates.push(PythonCommand::new(PathBuf::from("python3"), Vec::new()));
+            candidates.push(PythonCommand::new(PathBuf::from("python"), Vec::new()));
+        }
+
+        candidates
+    }
+
+    async fn python_command_matches_version(
+        &self,
+        command: &PythonCommand,
+        python_version: &str,
+    ) -> TineResult<bool> {
+        let mut probe = Command::new(&command.program);
+        probe
+            .args(&command.args)
+            .arg("-c")
+            .arg("import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')")
+            .current_dir(&self.workspace_root);
+        let output = probe
+            .output()
+            .await
+            .map_err(|e| TineError::Config(format!("failed to run {}: {}", command.display, e)))?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+
+        let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(actual == python_version)
     }
 }
 

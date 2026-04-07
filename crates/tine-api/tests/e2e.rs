@@ -532,8 +532,9 @@ fn slow_single_cell_tree() -> ExperimentTreeDef {
             branch_id: branch_id.clone(),
             name: "slow-step".to_string(),
             code: NodeCode {
-                source: "import time\ntime.sleep(1.5)\nstep1 = 1\nprint('slow root done', flush=True)"
-                    .to_string(),
+                source:
+                    "import time\ntime.sleep(1.5)\nstep1 = 1\nprint('slow root done', flush=True)"
+                        .to_string(),
                 language: "python".to_string(),
             },
             upstream_cell_ids: vec![],
@@ -638,6 +639,93 @@ async fn test_status_nonexistent_execution() {
 // ---------------------------------------------------------------------------
 // 8. Full execution with real kernel (requires ipykernel)
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+#[ignore]
+async fn test_notebook_bang_pip_install_uses_tree_environment() {
+    let (tmp, ws) = open_temp_workspace().await;
+
+    let package_root = tmp.path().join("demo_pkg");
+    let package_module_dir = package_root.join("demo_pkg");
+    fs::create_dir_all(&package_module_dir).unwrap();
+    fs::write(
+        package_root.join("setup.py"),
+        "from setuptools import setup\nsetup(name='demo-pkg', version='0.1.0', packages=['demo_pkg'])\n",
+    )
+    .unwrap();
+    fs::write(
+        package_module_dir.join("__init__.py"),
+        "def meaning():\n    return 123\n",
+    )
+    .unwrap();
+
+    let tree_id = ExperimentTreeId::new("pip-install-tree");
+    let branch_id = BranchId::new("main");
+    let cell_id = CellId::new("install_pkg");
+    let tree = ExperimentTreeDef {
+        id: tree_id.clone(),
+        name: "pip-install-tree".to_string(),
+        project_id: None,
+        root_branch_id: branch_id.clone(),
+        branches: vec![BranchDef {
+            id: branch_id.clone(),
+            name: "main".to_string(),
+            parent_branch_id: None,
+            branch_point_cell_id: None,
+            cell_order: vec![cell_id.clone()],
+            display: HashMap::new(),
+        }],
+        cells: vec![CellDef {
+            id: cell_id.clone(),
+            tree_id: tree_id.clone(),
+            branch_id: branch_id.clone(),
+            name: "install package".to_string(),
+            code: NodeCode {
+                source: "!pip install ./demo_pkg\nfrom demo_pkg import meaning\nstep1 = meaning()\nprint(f'pip-result:{step1}', flush=True)\n"
+                    .to_string(),
+                language: "python".to_string(),
+            },
+            upstream_cell_ids: vec![],
+            declared_outputs: vec![SlotName::new("step1")],
+            cache: false,
+            map_over: None,
+            map_concurrency: None,
+            timeout_secs: None,
+            tags: HashMap::new(),
+            revision_id: None,
+            state: CellRuntimeState::Clean,
+        }],
+        environment: Default::default(),
+        execution_mode: ExecutionMode::Parallel,
+        budget: None,
+        created_at: chrono::Utc::now(),
+    };
+
+    let saved_tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+    let exec_id = ws
+        .execute_branch_in_experiment_tree(&saved_tree_id, &branch_id)
+        .await
+        .unwrap();
+    let status = wait_for_execution_finished(&ws, &exec_id).await;
+
+    assert_eq!(status.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(
+        status.node_statuses.get(&NodeId::new("install_pkg")),
+        Some(&NodeStatus::Completed)
+    );
+
+    let logs = ws
+        .logs_for_tree_cell(&saved_tree_id, &branch_id, &cell_id)
+        .await
+        .unwrap();
+    assert!(
+        logs.stdout.contains("pip-result:123"),
+        "expected !pip install cell to import the installed local package, got stdout={:?} stderr={:?}",
+        logs.stdout,
+        logs.stderr
+    );
+}
 
 #[tokio::test]
 #[serial]
@@ -777,8 +865,12 @@ async fn test_execute_all_branches_exposes_queued_lifecycle_status() {
         .await
         .unwrap();
     assert_eq!(executions.len(), 3);
-    assert!(executions.iter().any(|(branch_id, _)| branch_id == &branch_a));
-    assert!(executions.iter().any(|(branch_id, _)| branch_id == &branch_b));
+    assert!(executions
+        .iter()
+        .any(|(branch_id, _)| branch_id == &branch_a));
+    assert!(executions
+        .iter()
+        .any(|(branch_id, _)| branch_id == &branch_b));
 
     let mut saw_queued = false;
     for _ in 0..40 {
@@ -797,7 +889,10 @@ async fn test_execute_all_branches_exposes_queued_lifecycle_status() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(saw_queued, "expected execute-all to expose queued executions");
+    assert!(
+        saw_queued,
+        "expected execute-all to expose queued executions"
+    );
 
     for (_, exec_id) in &executions {
         let status = wait_for_execution_finished(&ws, exec_id).await;
@@ -1054,58 +1149,59 @@ async fn test_namespace_guarded_queued_run_all_avoids_contamination_fallback() {
         assert_eq!(status.status, ExecutionLifecycleStatus::Completed);
     }
 
-    let (saw_attempted, saw_success, saw_contamination, saw_fallback) = timeout(Duration::from_secs(5), async {
-        let mut saw_attempted = HashSet::new();
-        let mut saw_success = HashSet::new();
-        let mut saw_contamination = false;
-        let mut saw_fallback = false;
-        loop {
-            match timeout(Duration::from_millis(250), rx.recv()).await {
-                Err(_) => break,
-                Ok(Ok(ExecutionEvent::IsolationAttempted {
-                    tree_id: evt_tree,
-                    branch_id,
-                    ..
-                })) if evt_tree == tree_id => {
-                    saw_attempted.insert(branch_id);
-                }
-                Ok(Ok(ExecutionEvent::IsolationSucceeded {
-                    tree_id: evt_tree,
-                    branch_id,
-                    ..
-                })) if evt_tree == tree_id => {
-                    saw_success.insert(branch_id);
-                }
-                Ok(Ok(ExecutionEvent::ContaminationDetected {
-                    tree_id: evt_tree,
-                    signals,
-                    ..
-                })) if evt_tree == tree_id => {
-                    saw_contamination |= !signals.is_empty();
-                }
-                Ok(Ok(ExecutionEvent::FallbackRestartTriggered {
-                    tree_id: evt_tree,
-                    reason,
-                    ..
-                })) if evt_tree == tree_id => {
-                    saw_fallback |= reason == "contamination_detected";
-                }
-                Ok(Ok(_)) => {}
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
-                    panic!(
+    let (saw_attempted, saw_success, saw_contamination, saw_fallback) =
+        timeout(Duration::from_secs(5), async {
+            let mut saw_attempted = HashSet::new();
+            let mut saw_success = HashSet::new();
+            let mut saw_contamination = false;
+            let mut saw_fallback = false;
+            loop {
+                match timeout(Duration::from_millis(250), rx.recv()).await {
+                    Err(_) => break,
+                    Ok(Ok(ExecutionEvent::IsolationAttempted {
+                        tree_id: evt_tree,
+                        branch_id,
+                        ..
+                    })) if evt_tree == tree_id => {
+                        saw_attempted.insert(branch_id);
+                    }
+                    Ok(Ok(ExecutionEvent::IsolationSucceeded {
+                        tree_id: evt_tree,
+                        branch_id,
+                        ..
+                    })) if evt_tree == tree_id => {
+                        saw_success.insert(branch_id);
+                    }
+                    Ok(Ok(ExecutionEvent::ContaminationDetected {
+                        tree_id: evt_tree,
+                        signals,
+                        ..
+                    })) if evt_tree == tree_id => {
+                        saw_contamination |= !signals.is_empty();
+                    }
+                    Ok(Ok(ExecutionEvent::FallbackRestartTriggered {
+                        tree_id: evt_tree,
+                        reason,
+                        ..
+                    })) if evt_tree == tree_id => {
+                        saw_fallback |= reason == "contamination_detected";
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                        panic!(
                         "lagged while waiting for guarded contamination events, skipped {skipped}"
                     );
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                    panic!("event channel closed before guarded contamination signals arrived");
+                    }
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                        panic!("event channel closed before guarded contamination signals arrived");
+                    }
                 }
             }
-        }
 
-        (saw_attempted, saw_success, saw_contamination, saw_fallback)
-    })
-    .await
-    .expect("timed out waiting for guarded isolation events");
+            (saw_attempted, saw_success, saw_contamination, saw_fallback)
+        })
+        .await
+        .expect("timed out waiting for guarded isolation events");
 
     assert!(
         saw_attempted.contains(&root_branch_id) && saw_attempted.contains(&branch_id),
@@ -1117,8 +1213,14 @@ async fn test_namespace_guarded_queued_run_all_avoids_contamination_fallback() {
         "expected guarded isolation success for both branches, got {:?}",
         saw_success
     );
-    assert!(!saw_contamination, "did not expect contamination under queued run-all");
-    assert!(!saw_fallback, "did not expect fallback restart under queued run-all");
+    assert!(
+        !saw_contamination,
+        "did not expect contamination under queued run-all"
+    );
+    assert!(
+        !saw_fallback,
+        "did not expect fallback restart under queued run-all"
+    );
 
     let runtime_state = ws.get_tree_runtime_state(&tree_id).await.unwrap();
     let isolation_result = runtime_state
@@ -2534,16 +2636,17 @@ async fn test_workspace_cancel_interrupts_running_branch_and_preserves_partial_l
 
     let requested_status = ws.status(&execution_id).await.unwrap();
     assert_eq!(requested_status.status, ExecutionLifecycleStatus::Running);
-    assert_eq!(requested_status.phase, tine_core::ExecutionPhase::CancellationRequested);
+    assert_eq!(
+        requested_status.phase,
+        tine_core::ExecutionPhase::CancellationRequested
+    );
     assert!(requested_status.cancellation_requested_at.is_some());
 
     ws.cancel(&execution_id).await.unwrap();
 
     let final_status = loop {
         let status = ws.status(&execution_id).await.unwrap();
-        if status.finished_at.is_some()
-            && status.status == ExecutionLifecycleStatus::Cancelled
-        {
+        if status.finished_at.is_some() && status.status == ExecutionLifecycleStatus::Cancelled {
             break status;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

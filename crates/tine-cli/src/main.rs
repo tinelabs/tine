@@ -12,8 +12,8 @@ use figment::{
     Figment,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
 use tine_env::{EnvironmentManager, DEFAULT_PYTHON_VERSION};
+use tracing::{info, warn};
 
 use tine_api::{export_branch_as_ipynb, export_branch_as_python, Workspace};
 use tine_core::{
@@ -838,7 +838,6 @@ fn local_server_url(addr: SocketAddr) -> String {
     }
 }
 
-
 fn open_browser(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     let mut command = {
@@ -908,62 +907,48 @@ async fn run_doctor(config: &TineConfig) -> Result<(), Box<dyn std::error::Error
     }
 
     let env_manager = EnvironmentManager::new(config.workspace_dir.clone());
-    let uv_ok = match env_manager.ensure_uv().await {
+    let uv_available = match env_manager.ensure_uv().await {
         Ok(()) => {
-            print_doctor_check("uv", true, "available".to_string());
+            print_doctor_check("uv (optional)", true, "available".to_string());
             true
         }
         Err(error) => {
-            print_doctor_check("uv", false, error.to_string());
-            failed = true;
+            print_doctor_check(
+                "uv (optional)",
+                true,
+                format!("not installed; using stdlib venv/pip ({error})"),
+            );
             false
         }
     };
 
-    if uv_ok {
-        match env_manager
-            .ensure_python_version_available(DEFAULT_PYTHON_VERSION)
-            .await
-        {
-            Ok(path) => print_doctor_check(
-                &format!("python {} via uv", DEFAULT_PYTHON_VERSION),
+    match env_manager
+        .ensure_python_version_available(DEFAULT_PYTHON_VERSION)
+        .await
+    {
+        Ok(path) => print_doctor_check(&format!("python {}", DEFAULT_PYTHON_VERSION), true, path),
+        Err(error) => {
+            print_doctor_check(
+                &format!("python {}", DEFAULT_PYTHON_VERSION),
+                false,
+                error.to_string(),
+            );
+            failed = true;
+        }
+    }
+
+    if !failed {
+        match env_manager.doctor_runtime_check().await {
+            Ok(_) => print_doctor_check(
+                "runtime preflight",
                 true,
-                path,
+                "temporary kernel environment created successfully".to_string(),
             ),
             Err(error) => {
-                print_doctor_check(
-                    &format!("python {} via uv", DEFAULT_PYTHON_VERSION),
-                    false,
-                    error.to_string(),
-                );
+                print_doctor_check("runtime preflight", false, error.to_string());
                 failed = true;
             }
         }
-
-        if !failed {
-            match env_manager.doctor_runtime_check().await {
-                Ok(_) => print_doctor_check(
-                    "runtime preflight",
-                    true,
-                    "temporary kernel environment created successfully".to_string(),
-                ),
-                Err(error) => {
-                    print_doctor_check("runtime preflight", false, error.to_string());
-                    failed = true;
-                }
-            }
-        }
-    } else {
-        print_doctor_check(
-            &format!("python {} via uv", DEFAULT_PYTHON_VERSION),
-            false,
-            "uv unavailable".to_string(),
-        );
-        print_doctor_check(
-            "runtime preflight",
-            false,
-            "uv unavailable".to_string(),
-        );
     }
 
     if failed {
@@ -996,7 +981,9 @@ log_json = false
 "#
 }
 
-fn ensure_workspace_bootstrap(workspace_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+fn ensure_workspace_bootstrap(
+    workspace_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(workspace_dir)?;
 
     let tine_dir = workspace_dir.join(".tine");
@@ -1135,5 +1122,4 @@ mod tests {
 
         std::fs::remove_dir_all(&workspace_dir).expect("cleanup temp workspace");
     }
-
 }

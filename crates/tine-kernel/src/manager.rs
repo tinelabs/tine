@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -204,6 +205,29 @@ impl KernelManager {
         };
 
         std::fs::canonicalize(&candidate).unwrap_or(candidate)
+    }
+
+    fn venv_bin_dir(venv_dir: &Path) -> PathBuf {
+        if cfg!(windows) {
+            venv_dir.join("Scripts")
+        } else {
+            venv_dir.join("bin")
+        }
+    }
+
+    fn path_with_venv_bin(venv_dir: &Path) -> OsString {
+        let mut paths = vec![Self::venv_bin_dir(venv_dir)];
+        if let Some(existing) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        std::env::join_paths(paths).unwrap_or_else(|_| {
+            let mut fallback = OsString::from(Self::venv_bin_dir(venv_dir));
+            if let Some(existing) = std::env::var_os("PATH") {
+                fallback.push(if cfg!(windows) { ";" } else { ":" });
+                fallback.push(existing);
+            }
+            fallback
+        })
     }
 
     fn global_startup_gate() -> &'static Semaphore {
@@ -467,6 +491,8 @@ impl KernelManager {
                 "-f",
                 &conn_path.display().to_string(),
             ])
+            .env("VIRTUAL_ENV", venv_dir)
+            .env("PATH", Self::path_with_venv_bin(venv_dir))
             .current_dir(working_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -759,7 +785,7 @@ impl KernelManager {
             code,
             DEFAULT_EXECUTION_TIMEOUT_SECS,
         )
-            .await
+        .await
     }
 
     /// Execute code in the tree-owned kernel and return stdout/stderr + outputs.
@@ -773,7 +799,7 @@ impl KernelManager {
             code,
             DEFAULT_EXECUTION_TIMEOUT_SECS,
         )
-            .await
+        .await
     }
 
     /// Execute code in an ephemeral map-worker kernel with a custom timeout.
@@ -873,8 +899,7 @@ impl KernelManager {
             let remaining = timeout.saturating_sub(elapsed);
             let read_timeout = remaining.min(Duration::from_secs(30));
 
-            let msg = match tokio::time::timeout(read_timeout, kernel.iopub.read()).await
-            {
+            let msg = match tokio::time::timeout(read_timeout, kernel.iopub.read()).await {
                 Ok(Ok(msg)) => {
                     consecutive_timeouts = 0; // reset on success
                     kernel.touch();
@@ -1599,11 +1624,7 @@ def _pf_context():
         debug!(owner = %owner_id, "sending setup code to kernel");
 
         let result = self
-            .execute_owned_code_with_timeout(
-                owner_id,
-                setup_code,
-                DEFAULT_EXECUTION_TIMEOUT_SECS,
-            )
+            .execute_owned_code_with_timeout(owner_id, setup_code, DEFAULT_EXECUTION_TIMEOUT_SECS)
             .await?;
         if let Some(ref err) = result.error {
             warn!(
@@ -1877,5 +1898,21 @@ mod tests {
             kernel_mgr.work_dir,
             expected_root.join(".tine").join("kernels")
         );
+    }
+
+    #[test]
+    fn kernel_manager_prepends_venv_bin_to_path() {
+        let venv_dir = if cfg!(windows) {
+            PathBuf::from("C:/tmp/tine-venv")
+        } else {
+            PathBuf::from("/tmp/tine-venv")
+        };
+
+        let path = KernelManager::path_with_venv_bin(&venv_dir);
+        let first = std::env::split_paths(&path)
+            .next()
+            .expect("expected venv bin in PATH");
+
+        assert_eq!(first, KernelManager::venv_bin_dir(&venv_dir));
     }
 }
