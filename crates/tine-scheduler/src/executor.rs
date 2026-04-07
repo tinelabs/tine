@@ -55,6 +55,23 @@ struct SchedulerExecutionTarget {
 }
 
 impl Scheduler {
+    fn node_error_from_tine_error(error: &TineError) -> NodeError {
+        match error {
+            TineError::ExecutionTimedOut { .. } => NodeError {
+                ename: "ExecutionTimedOut".to_string(),
+                evalue: error.to_string(),
+                traceback: Vec::new(),
+                hints: Vec::new(),
+            },
+            _ => NodeError {
+                ename: "ExecutionError".to_string(),
+                evalue: error.to_string(),
+                traceback: Vec::new(),
+                hints: Vec::new(),
+            },
+        }
+    }
+
     pub fn new(
         kernel_mgr: Arc<KernelManager>,
         env_mgr: Arc<EnvironmentManager>,
@@ -141,6 +158,14 @@ impl Scheduler {
     ) -> TineResult<ExecutionOutcome> {
         self.execute_branch_for_target(execution_id, branch, target, cache, pool, working_dir)
             .await
+    }
+
+    pub async fn shutdown_tree_kernel(&self, tree_id: &ExperimentTreeId) -> TineResult<()> {
+        self.kernel_mgr.shutdown_tree(tree_id).await
+    }
+
+    pub async fn interrupt_tree_kernel(&self, tree_id: &ExperimentTreeId) -> TineResult<()> {
+        self.kernel_mgr.interrupt_tree(tree_id).await
     }
 
     pub async fn execute_single_cell_for_target(
@@ -544,6 +569,7 @@ impl Scheduler {
                     Ok(Err(e)) => {
                         error!(node = %node_id, error = %e, "node execution failed");
                         metrics::counter!(M_NODES_FAILED).increment(1);
+                        let node_error = Self::node_error_from_tine_error(&e);
                         self.emit(ExecutionEvent::NodeFailed {
                             execution_id: execution_id.clone(),
                             node_id: node_id.clone(),
@@ -551,12 +577,7 @@ impl Scheduler {
                             branch_id: runtime_target.branch_id.clone(),
                             target_kind: Some(runtime_target.target_kind.clone()),
                             target: Some(runtime_target.target.clone()),
-                            error: NodeError {
-                                ename: "ExecutionError".to_string(),
-                                evalue: e.to_string(),
-                                traceback: Vec::new(),
-                                hints: Vec::new(),
-                            },
+                            error: node_error.clone(),
                         });
                         node_statuses.insert(node_id.clone(), NodeStatus::Failed);
                         node_logs.insert(
@@ -565,12 +586,7 @@ impl Scheduler {
                                 stdout: String::new(),
                                 stderr: e.to_string(),
                                 outputs: Vec::new(),
-                                error: Some(NodeError {
-                                    ename: "ExecutionError".to_string(),
-                                    evalue: e.to_string(),
-                                    traceback: Vec::new(),
-                                    hints: Vec::new(),
-                                }),
+                                error: Some(node_error),
                                 duration_ms: None,
                                 metrics: HashMap::new(),
                             },
@@ -848,6 +864,9 @@ async fn execute_cell(
         .await
     {
         Ok(r) => r,
+        Err(TineError::ExecutionTimedOut { timeout_secs }) => {
+            return Err(TineError::ExecutionTimedOut { timeout_secs });
+        }
         Err(tine_core::TineError::KernelComm(_)) => {
             warn!(
                 node = %Scheduler::node_id_for_cell(cell),
@@ -1047,12 +1066,11 @@ async fn introspect_error_context(
 
 #[cfg(test)]
 mod tests {
-    use tine_core::{
-        BranchId, ExecutableTreeBranch, ExecutionTargetKind, ExecutionTargetRef, ExperimentTreeId,
-        SlotName,
-    };
-
     use super::Scheduler;
+    use tine_core::{
+        BranchId, ExecutableTreeBranch, ExecutionTargetKind, ExecutionTargetRef,
+        ExperimentTreeId, SlotName,
+    };
 
     #[test]
     fn branch_target_preserves_tree_and_branch_identity() {

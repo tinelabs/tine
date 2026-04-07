@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
 use sqlx::sqlite::SqlitePool;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{error, info, warn};
 
 use crate::branch_projection::{branch_lineage, plan_branch_transition, BranchProjection};
@@ -13,10 +13,11 @@ use tine_catalog::DataCatalog;
 use tine_core::{
     ArtifactKey, ArtifactStore, BranchDef, BranchId, BranchIsolationMode,
     BranchTargetInspection, CellDef, CellId, CellRuntimeState, ExecutableTreeBranch,
-    ExecutableTreeCell, ExecutionEvent, ExecutionId, ExecutionStatus, ExecutionTargetKind,
+    ExecutableTreeCell, ExecutionAccepted, ExecutionEvent, ExecutionId,
+    ExecutionLifecycleStatus, ExecutionPhase, ExecutionStatus, ExecutionTargetKind,
     ExecutionTargetRef, ExperimentTreeDef, ExperimentTreeId, IsolationResult, NodeCacheKey,
-    NodeCode, NodeId, NodeLogs, NodeStatus, PreparedContext, ProjectDef, ProjectId, SlotName,
-    TineError, TineResult, TreeKernelState, TreeRuntimeState, WorkspaceApi,
+    NodeCode, NodeError, NodeId, NodeLogs, NodeStatus, PreparedContext, ProjectDef, ProjectId,
+    SlotName, TineError, TineResult, TreeKernelState, TreeRuntimeState, WorkspaceApi,
 };
 use tine_env::{EnvironmentManager, TreeEnvironmentDescriptor};
 use tine_kernel::{KernelIsolationOutcome, KernelLifecycleEvent, KernelManager};
@@ -46,6 +47,19 @@ struct TreeBranchExecutionPlan {
     target: ExecutionTargetRef,
 }
 
+#[derive(Debug, Clone)]
+struct TreeCellExecutionPlan {
+    executable_branch: ExecutableTreeBranch,
+    executable_cell: ExecutableTreeCell,
+    target: ExecutionTargetRef,
+}
+
+#[derive(Debug, Default)]
+struct ExecutionQueueState {
+    pending: VecDeque<ExecutionId>,
+    active: HashSet<ExecutionId>,
+}
+
 // ---------------------------------------------------------------------------
 // Workspace — the main WorkspaceApi implementation
 // ---------------------------------------------------------------------------
@@ -71,6 +85,10 @@ pub struct Workspace {
     #[allow(dead_code)]
     workspace_root: PathBuf,
     tree_runtime_states: Arc<RwLock<HashMap<ExperimentTreeId, TreeRuntimeState>>>,
+    execution_queue_state: Arc<Mutex<ExecutionQueueState>>,
+    execution_queue_notify: Arc<Notify>,
+    max_concurrent_executions: usize,
+    max_queue_depth: usize,
     kernel_monitor_handle: tokio::task::JoinHandle<()>,
     kernel_lifecycle_handle: tokio::task::JoinHandle<()>,
     execution_event_bridge_handle: tokio::task::JoinHandle<()>,
@@ -85,6 +103,10 @@ impl Drop for Workspace {
 }
 
 impl Workspace {
+    fn default_max_queue_depth(max_concurrent_executions: usize) -> usize {
+        std::cmp::max(8, max_concurrent_executions.saturating_mul(4))
+    }
+
     fn default_tree_runtime_state(
         tree_id: &ExperimentTreeId,
         branch_id: &BranchId,
@@ -113,6 +135,158 @@ impl Workspace {
 
     fn branch_row_id(tree_id: &ExperimentTreeId, branch_id: &BranchId) -> String {
         format!("{}::{}", tree_id.as_str(), branch_id.as_str())
+    }
+
+    async fn sync_pending_queue_positions(
+        pool: &SqlitePool,
+        pending: &[ExecutionId],
+    ) -> TineResult<()> {
+        for (index, execution_id) in pending.iter().enumerate() {
+            Self::update_execution_status_record(pool, execution_id, |status| {
+                status.queue_position = Some((index + 1) as u64);
+                if matches!(status.status, ExecutionLifecycleStatus::Queued) {
+                    Self::apply_execution_phase(status, ExecutionPhase::Queued);
+                }
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn enqueue_execution_with(
+        pool: &SqlitePool,
+        execution_queue_state: &Arc<Mutex<ExecutionQueueState>>,
+        max_queue_depth: usize,
+        execution_id: &ExecutionId,
+    ) -> TineResult<u64> {
+        let pending_snapshot = {
+            let mut queue = execution_queue_state.lock().await;
+            if queue.pending.len() >= max_queue_depth {
+                return Err(TineError::BudgetExceeded(format!(
+                    "execution queue full ({}/{})",
+                    queue.pending.len(),
+                    max_queue_depth
+                )));
+            }
+            queue.pending.push_back(execution_id.clone());
+            queue.pending.iter().cloned().collect::<Vec<_>>()
+        };
+        Self::sync_pending_queue_positions(pool, &pending_snapshot).await?;
+        Ok(pending_snapshot.len() as u64)
+    }
+
+    async fn enqueue_execution(&self, execution_id: &ExecutionId) -> TineResult<u64> {
+        Self::enqueue_execution_with(
+            &self.pool,
+            &self.execution_queue_state,
+            self.max_queue_depth,
+            execution_id,
+        )
+        .await
+    }
+
+    async fn reject_execution(&self, execution_id: &ExecutionId) -> TineResult<()> {
+        Self::update_execution_status_record(&self.pool, execution_id, |status| {
+            status.queue_position = None;
+            status.finished_at = Some(Utc::now());
+            Self::apply_execution_phase(status, ExecutionPhase::Rejected);
+        })
+        .await
+    }
+
+    async fn wait_for_execution_slot_with(
+        pool: &SqlitePool,
+        execution_queue_state: &Arc<Mutex<ExecutionQueueState>>,
+        execution_queue_notify: &Arc<Notify>,
+        max_concurrent_executions: usize,
+        execution_id: &ExecutionId,
+    ) -> TineResult<bool> {
+        loop {
+            let should_wait = {
+                let mut queue = execution_queue_state.lock().await;
+                if queue.active.contains(execution_id) {
+                    false
+                } else if queue.pending.front() == Some(execution_id)
+                    && queue.active.len() < max_concurrent_executions
+                {
+                    queue.pending.pop_front();
+                    queue.active.insert(execution_id.clone());
+                    let pending_snapshot = queue.pending.iter().cloned().collect::<Vec<_>>();
+                    drop(queue);
+                    Self::sync_pending_queue_positions(pool, &pending_snapshot).await?;
+                    Self::update_execution_status_record(pool, execution_id, |status| {
+                        status.queue_position = None;
+                    })
+                    .await?;
+                    return Ok(true);
+                } else if queue.pending.iter().any(|queued_id| queued_id == execution_id) {
+                    true
+                } else {
+                    return Ok(false);
+                }
+            };
+
+            if should_wait {
+                execution_queue_notify.notified().await;
+            }
+        }
+    }
+
+    async fn release_execution_slot_with(
+        execution_queue_state: &Arc<Mutex<ExecutionQueueState>>,
+        execution_queue_notify: &Arc<Notify>,
+        execution_id: &ExecutionId,
+    ) {
+        let changed = {
+            let mut queue = execution_queue_state.lock().await;
+            let changed = queue.active.remove(execution_id);
+            if !changed {
+                queue.pending.retain(|queued_id| queued_id != execution_id);
+            }
+            changed
+        };
+        if changed {
+            execution_queue_notify.notify_waiters();
+        }
+    }
+
+    async fn release_execution_slot(&self, execution_id: &ExecutionId) {
+        Self::release_execution_slot_with(
+            &self.execution_queue_state,
+            &self.execution_queue_notify,
+            execution_id,
+        )
+        .await;
+    }
+
+    async fn dequeue_execution_with(
+        pool: &SqlitePool,
+        execution_queue_state: &Arc<Mutex<ExecutionQueueState>>,
+        execution_queue_notify: &Arc<Notify>,
+        execution_id: &ExecutionId,
+    ) -> TineResult<bool> {
+        let pending_snapshot = {
+            let mut queue = execution_queue_state.lock().await;
+            let Some(position) = queue.pending.iter().position(|queued_id| queued_id == execution_id)
+            else {
+                return Ok(false);
+            };
+            queue.pending.remove(position);
+            queue.pending.iter().cloned().collect::<Vec<_>>()
+        };
+        Self::sync_pending_queue_positions(pool, &pending_snapshot).await?;
+        execution_queue_notify.notify_waiters();
+        Ok(true)
+    }
+
+    async fn dequeue_execution(&self, execution_id: &ExecutionId) -> TineResult<bool> {
+        Self::dequeue_execution_with(
+            &self.pool,
+            &self.execution_queue_state,
+            &self.execution_queue_notify,
+            execution_id,
+        )
+        .await
     }
 
     fn cell_row_id(tree_id: &ExperimentTreeId, cell_id: &CellId) -> String {
@@ -228,6 +402,59 @@ impl Workspace {
         })
     }
 
+    fn build_tree_cell_execution_plan(
+        tree: &ExperimentTreeDef,
+        target_branch_id: &BranchId,
+        cell_id: &CellId,
+    ) -> TineResult<TreeCellExecutionPlan> {
+        let cell = tree
+            .cells
+            .iter()
+            .find(|cell| &cell.id == cell_id)
+            .ok_or_else(|| {
+                TineError::Internal(format!(
+                    "cell '{}' not found in branch '{}' for tree '{}'",
+                    cell_id, target_branch_id, tree.id
+                ))
+            })?
+            .clone();
+        let executable_cell = ExecutableTreeCell {
+            tree_id: tree.id.clone(),
+            branch_id: target_branch_id.clone(),
+            cell_id: cell.id.clone(),
+            name: cell.name.clone(),
+            code: cell.code.clone(),
+            inputs: HashMap::new(),
+            outputs: cell.declared_outputs.clone(),
+            cache: cell.cache,
+            map_over: cell.map_over.clone(),
+            map_concurrency: cell.map_concurrency,
+            timeout_secs: cell.timeout_secs,
+            tags: cell.tags.clone(),
+            revision_id: cell.revision_id.clone(),
+        };
+        let executable_branch = ExecutableTreeBranch {
+            tree_id: tree.id.clone(),
+            branch_id: target_branch_id.clone(),
+            name: format!("{} [{}]", tree.name, target_branch_id),
+            lineage: vec![target_branch_id.clone()],
+            path_cell_order: vec![cell.id.clone()],
+            topo_order: vec![cell.id.clone()],
+            cells: vec![executable_cell.clone()],
+            environment: tree.environment.clone(),
+            execution_mode: tree.execution_mode.clone(),
+            budget: tree.budget.clone(),
+            project_id: tree.project_id.clone(),
+            created_at: tree.created_at,
+        };
+        let target = Self::execution_target_for_tree_branch(&tree.id, target_branch_id);
+        Ok(TreeCellExecutionPlan {
+            executable_branch,
+            executable_cell,
+            target,
+        })
+    }
+
     async fn insert_branch_execution_record(
         pool: &SqlitePool,
         execution_id: &ExecutionId,
@@ -242,6 +469,10 @@ impl Workspace {
             branch_id: Some(branch_id.clone()),
             target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
             target: Some(target.clone()),
+            status: ExecutionLifecycleStatus::Queued,
+            phase: ExecutionPhase::Queued,
+            queue_position: None,
+            cancellation_requested_at: None,
             node_statuses: topo_order
                 .iter()
                 .map(|cell_id| (NodeId::new(cell_id.as_str()), NodeStatus::Queued))
@@ -272,12 +503,32 @@ impl Workspace {
         target: &ExecutionTargetRef,
         outcome: tine_core::ExecutionOutcome,
     ) {
+        let existing: Option<(String,)> = sqlx::query_as("SELECT status FROM executions WHERE id = ?")
+            .bind(execution_id.as_str())
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+        if let Some((status_json,)) = existing {
+            if let Ok(status) = serde_json::from_str::<ExecutionStatus>(&status_json) {
+                if Self::normalize_execution_status(status).finished_at.is_some() {
+                    return;
+                }
+            }
+        }
+
+        let terminal_status =
+            Self::terminal_status_from_outcome(&outcome.node_statuses, &outcome.node_logs);
         let status = ExecutionStatus {
             execution_id: execution_id.clone(),
             tree_id: Some(tree_id.clone()),
             branch_id: Some(branch_id.clone()),
             target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
             target: Some(target.clone()),
+            status: terminal_status.clone(),
+            phase: Self::terminal_phase_from_status(&terminal_status),
+            queue_position: None,
+            cancellation_requested_at: None,
             node_statuses: outcome.node_statuses,
             started_at: Utc::now() - chrono::Duration::milliseconds(outcome.duration_ms as i64),
             finished_at: Some(Utc::now()),
@@ -317,12 +568,30 @@ impl Workspace {
         branch_id: &BranchId,
         target: &ExecutionTargetRef,
     ) {
+        let existing: Option<(String,)> = sqlx::query_as("SELECT status FROM executions WHERE id = ?")
+            .bind(execution_id.as_str())
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+        if let Some((status_json,)) = existing {
+            if let Ok(status) = serde_json::from_str::<ExecutionStatus>(&status_json) {
+                if Self::normalize_execution_status(status).finished_at.is_some() {
+                    return;
+                }
+            }
+        }
+
         let status = ExecutionStatus {
             execution_id: execution_id.clone(),
             tree_id: Some(tree_id.clone()),
             branch_id: Some(branch_id.clone()),
             target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
             target: Some(target.clone()),
+            status: ExecutionLifecycleStatus::Failed,
+            phase: ExecutionPhase::Failed,
+            queue_position: None,
+            cancellation_requested_at: None,
             node_statuses: HashMap::new(),
             started_at: Utc::now(),
             finished_at: Some(Utc::now()),
@@ -337,7 +606,193 @@ impl Workspace {
         .await;
     }
 
+    fn node_logs_indicate_timeout(node_logs: &HashMap<NodeId, NodeLogs>) -> bool {
+        node_logs.values().any(|logs| {
+            logs.error
+                .as_ref()
+                .map(|error| error.ename == "ExecutionTimedOut")
+                .unwrap_or(false)
+        })
+    }
+
+    fn terminal_status_from_outcome(
+        node_statuses: &HashMap<NodeId, NodeStatus>,
+        node_logs: &HashMap<NodeId, NodeLogs>,
+    ) -> ExecutionLifecycleStatus {
+        if Self::node_logs_indicate_timeout(node_logs) {
+            ExecutionLifecycleStatus::TimedOut
+        } else if node_statuses
+            .values()
+            .any(|node_status| matches!(node_status, NodeStatus::Failed))
+        {
+            ExecutionLifecycleStatus::Failed
+        } else if !node_statuses.is_empty()
+            && node_statuses.values().all(|node_status| matches!(node_status, NodeStatus::Interrupted))
+        {
+            ExecutionLifecycleStatus::Cancelled
+        } else {
+            ExecutionLifecycleStatus::Completed
+        }
+    }
+
+    fn terminal_status_from_nodes(node_statuses: &HashMap<NodeId, NodeStatus>) -> ExecutionLifecycleStatus {
+        if node_statuses
+            .values()
+            .any(|node_status| matches!(node_status, NodeStatus::Failed))
+        {
+            ExecutionLifecycleStatus::Failed
+        } else if !node_statuses.is_empty()
+            && node_statuses.values().all(|node_status| matches!(node_status, NodeStatus::Interrupted))
+        {
+            ExecutionLifecycleStatus::Cancelled
+        } else {
+            ExecutionLifecycleStatus::Completed
+        }
+    }
+
+    fn terminal_phase_from_status(status: &ExecutionLifecycleStatus) -> ExecutionPhase {
+        match status {
+            ExecutionLifecycleStatus::Completed => ExecutionPhase::Completed,
+            ExecutionLifecycleStatus::Failed => ExecutionPhase::Failed,
+            ExecutionLifecycleStatus::Cancelled => ExecutionPhase::Cancelled,
+            ExecutionLifecycleStatus::TimedOut => ExecutionPhase::TimedOut,
+            ExecutionLifecycleStatus::Rejected => ExecutionPhase::Rejected,
+            ExecutionLifecycleStatus::Queued => ExecutionPhase::Queued,
+            ExecutionLifecycleStatus::Running => ExecutionPhase::Running,
+        }
+    }
+
+    fn normalize_execution_status(mut status: ExecutionStatus) -> ExecutionStatus {
+        if status.finished_at.is_some() {
+            let terminal_status = match status.status {
+                ExecutionLifecycleStatus::Completed
+                | ExecutionLifecycleStatus::Failed
+                | ExecutionLifecycleStatus::Cancelled
+                | ExecutionLifecycleStatus::TimedOut
+                | ExecutionLifecycleStatus::Rejected => status.status.clone(),
+                ExecutionLifecycleStatus::Queued | ExecutionLifecycleStatus::Running => {
+                    Self::terminal_status_from_nodes(&status.node_statuses)
+                }
+            };
+            status.status = terminal_status.clone();
+            status.phase = Self::terminal_phase_from_status(&terminal_status);
+            status.queue_position = None;
+            return status;
+        }
+
+        if matches!(status.phase, ExecutionPhase::Completed | ExecutionPhase::Failed | ExecutionPhase::Cancelled | ExecutionPhase::TimedOut | ExecutionPhase::Rejected) {
+            status.phase = ExecutionPhase::Running;
+        }
+
+        if status
+            .node_statuses
+            .values()
+            .any(|node_status| matches!(node_status, NodeStatus::Running))
+        {
+            status.status = ExecutionLifecycleStatus::Running;
+            if matches!(status.phase, ExecutionPhase::Queued) {
+                status.phase = ExecutionPhase::Running;
+            }
+        } else if !status.node_statuses.is_empty()
+            && status.node_statuses.values().all(|node_status| {
+                matches!(node_status, NodeStatus::Pending | NodeStatus::Queued)
+            })
+        {
+            status.status = ExecutionLifecycleStatus::Queued;
+            status.phase = ExecutionPhase::Queued;
+        }
+
+        status
+    }
+
+    fn apply_execution_phase(status: &mut ExecutionStatus, phase: ExecutionPhase) {
+        status.phase = phase.clone();
+        status.status = match phase {
+            ExecutionPhase::Queued => ExecutionLifecycleStatus::Queued,
+            ExecutionPhase::PreparingEnvironment
+            | ExecutionPhase::AcquiringRuntime
+            | ExecutionPhase::ReplayingContext
+            | ExecutionPhase::Running
+            | ExecutionPhase::CancellationRequested
+            | ExecutionPhase::SerializingArtifacts
+            | ExecutionPhase::Retrying => ExecutionLifecycleStatus::Running,
+            ExecutionPhase::Completed => ExecutionLifecycleStatus::Completed,
+            ExecutionPhase::Failed => ExecutionLifecycleStatus::Failed,
+            ExecutionPhase::Cancelled => ExecutionLifecycleStatus::Cancelled,
+            ExecutionPhase::TimedOut => ExecutionLifecycleStatus::TimedOut,
+            ExecutionPhase::Rejected => ExecutionLifecycleStatus::Rejected,
+        };
+    }
+
+    async fn finalize_cancelled_execution(
+        pool: &SqlitePool,
+        execution_id: &ExecutionId,
+        cancellation_requested_at: chrono::DateTime<Utc>,
+    ) -> TineResult<()> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM executions WHERE id = ?")
+            .bind(execution_id.as_str())
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| TineError::Database(e.to_string()))?;
+        let Some((status_json,)) = row else {
+            return Ok(());
+        };
+        let status: ExecutionStatus =
+            Self::normalize_execution_status(serde_json::from_str(&status_json)?);
+        if status.finished_at.is_some() && status.status == ExecutionLifecycleStatus::Cancelled {
+            return Ok(());
+        }
+
+        let cancelled_status =
+            Self::reconcile_cancelled_execution_status(status, cancellation_requested_at);
+        let status_json = serde_json::to_string(&cancelled_status).unwrap_or_default();
+
+        sqlx::query("UPDATE executions SET status = ?, finished_at = datetime('now') WHERE id = ?")
+            .bind(&status_json)
+            .bind(execution_id.as_str())
+            .execute(pool)
+            .await
+            .map_err(|e| TineError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn update_execution_status_record<F>(
+        pool: &SqlitePool,
+        execution_id: &ExecutionId,
+        update: F,
+    ) -> TineResult<()>
+    where
+        F: FnOnce(&mut ExecutionStatus),
+    {
+        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM executions WHERE id = ?")
+            .bind(execution_id.as_str())
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| TineError::Database(e.to_string()))?;
+        let Some((status_json,)) = row else {
+            return Ok(());
+        };
+
+        let mut status = Self::normalize_execution_status(serde_json::from_str(&status_json)?);
+        if status.finished_at.is_some() {
+            return Ok(());
+        }
+        update(&mut status);
+        let updated_status_json = serde_json::to_string(&status).map_err(TineError::Serialization)?;
+        sqlx::query(
+            "UPDATE executions SET status = ?, finished_at = COALESCE(finished_at, ?) WHERE id = ?",
+        )
+        .bind(&updated_status_json)
+        .bind(status.finished_at.map(|timestamp| timestamp.to_rfc3339()))
+        .bind(execution_id.as_str())
+        .execute(pool)
+        .await
+        .map_err(|e| TineError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     fn reconcile_abandoned_execution_status(mut status: ExecutionStatus) -> ExecutionStatus {
+        status = Self::normalize_execution_status(status);
         status.finished_at = Some(Utc::now());
         for node_status in status.node_statuses.values_mut() {
             if matches!(
@@ -347,7 +802,68 @@ impl Workspace {
                 *node_status = NodeStatus::Interrupted;
             }
         }
+        status.status = ExecutionLifecycleStatus::Failed;
+        status.phase = ExecutionPhase::Failed;
         status
+    }
+
+    fn reconcile_cancelled_execution_status(
+        mut status: ExecutionStatus,
+        cancellation_requested_at: chrono::DateTime<Utc>,
+    ) -> ExecutionStatus {
+        status = Self::normalize_execution_status(status);
+        status.finished_at = Some(Utc::now());
+        for node_status in status.node_statuses.values_mut() {
+            if !matches!(node_status, NodeStatus::Completed | NodeStatus::CacheHit) {
+                *node_status = NodeStatus::Interrupted;
+            }
+        }
+        status.status = ExecutionLifecycleStatus::Cancelled;
+        status.phase = ExecutionPhase::Cancelled;
+        status.queue_position = None;
+        status.cancellation_requested_at = Some(cancellation_requested_at);
+        status
+    }
+
+    fn reconcile_kernel_lost_execution_status(
+        mut status: ExecutionStatus,
+        mut node_logs: HashMap<NodeId, NodeLogs>,
+        reason: &str,
+    ) -> (ExecutionStatus, HashMap<NodeId, NodeLogs>) {
+        status = Self::normalize_execution_status(status);
+        status.finished_at = Some(Utc::now());
+        status.status = ExecutionLifecycleStatus::Failed;
+        status.phase = ExecutionPhase::Failed;
+        status.queue_position = None;
+
+        for (node_id, node_status) in status.node_statuses.iter_mut() {
+            if matches!(node_status, NodeStatus::Pending | NodeStatus::Queued | NodeStatus::Running)
+            {
+                *node_status = NodeStatus::Interrupted;
+                let logs = node_logs.entry(node_id.clone()).or_insert_with(|| NodeLogs {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    outputs: Vec::new(),
+                    error: None,
+                    duration_ms: None,
+                    metrics: HashMap::new(),
+                });
+                if logs.stderr.is_empty() {
+                    logs.stderr = reason.to_string();
+                } else if !logs.stderr.contains(reason) {
+                    logs.stderr.push('\n');
+                    logs.stderr.push_str(reason);
+                }
+                logs.error = Some(NodeError {
+                    ename: "KernelLost".to_string(),
+                    evalue: reason.to_string(),
+                    traceback: Vec::new(),
+                    hints: Vec::new(),
+                });
+            }
+        }
+
+        (status, node_logs)
     }
 
     fn execution_nodes_finished(status: &ExecutionStatus) -> bool {
@@ -373,7 +889,7 @@ impl Workspace {
         let mut reconciled = 0usize;
         for (execution_id, status_json) in rows {
             let status = match serde_json::from_str::<ExecutionStatus>(&status_json) {
-                Ok(status) => status,
+                Ok(status) => Self::normalize_execution_status(status),
                 Err(_) => continue,
             };
             let reconciled_status = Self::reconcile_abandoned_execution_status(status);
@@ -396,6 +912,54 @@ impl Workspace {
             );
         }
         Ok(())
+    }
+
+    async fn reconcile_tree_kernel_lost_executions(
+        pool: &SqlitePool,
+        tree_id: &ExperimentTreeId,
+        reason: &str,
+    ) -> TineResult<usize> {
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, status, node_logs FROM executions WHERE tree_id = ? AND finished_at IS NULL",
+        )
+        .bind(tree_id.as_str())
+        .fetch_all(pool)
+        .await
+        .map_err(|e| TineError::Database(e.to_string()))?;
+
+        let mut reconciled = 0usize;
+        for (execution_id, status_json, node_logs_json) in rows {
+            let status = match serde_json::from_str::<ExecutionStatus>(&status_json) {
+                Ok(status) => Self::normalize_execution_status(status),
+                Err(_) => continue,
+            };
+            if status.finished_at.is_some() || status.status != ExecutionLifecycleStatus::Running {
+                continue;
+            }
+
+            let node_logs: HashMap<NodeId, NodeLogs> = node_logs_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .unwrap_or_default();
+            let (reconciled_status, reconciled_logs) =
+                Self::reconcile_kernel_lost_execution_status(status, node_logs, reason);
+            let reconciled_status_json =
+                serde_json::to_string(&reconciled_status).map_err(TineError::Serialization)?;
+            let reconciled_logs_json =
+                serde_json::to_string(&reconciled_logs).map_err(TineError::Serialization)?;
+            sqlx::query(
+                "UPDATE executions SET status = ?, node_logs = ?, finished_at = datetime('now') WHERE id = ?",
+            )
+            .bind(&reconciled_status_json)
+            .bind(&reconciled_logs_json)
+            .bind(&execution_id)
+            .execute(pool)
+            .await
+            .map_err(|e| TineError::Database(e.to_string()))?;
+            reconciled += 1;
+        }
+
+        Ok(reconciled)
     }
 
     async fn run_branch_execution(
@@ -622,6 +1186,15 @@ impl Workspace {
                         .await
                         {
                             Ok(Some(state)) => {
+                                if let Err(err) = Self::reconcile_tree_kernel_lost_executions(
+                                    &pool,
+                                    &tree_id,
+                                    "Kernel heartbeat lost while execution was running",
+                                )
+                                .await
+                                {
+                                    warn!(tree = %tree_id, error = %err, "failed to reconcile running executions after heartbeat loss");
+                                }
                                 Self::emit_tree_runtime_state_event(&event_tx, &state)
                             }
                             Ok(None) => {}
@@ -644,10 +1217,13 @@ impl Workspace {
         event: &ExecutionEvent,
     ) -> TineResult<()> {
         let execution_id = match event {
-            ExecutionEvent::NodeStarted { execution_id, .. }
+            ExecutionEvent::ExecutionStarted { execution_id, .. }
+            | ExecutionEvent::NodeStarted { execution_id, .. }
             | ExecutionEvent::NodeStream { execution_id, .. }
             | ExecutionEvent::NodeDisplayData { execution_id, .. }
             | ExecutionEvent::NodeDisplayUpdate { execution_id, .. }
+            | ExecutionEvent::ExecutionCompleted { execution_id, .. }
+            | ExecutionEvent::ExecutionFailed { execution_id, .. }
             | ExecutionEvent::NodeCompleted { execution_id, .. }
             | ExecutionEvent::NodeCacheHit { execution_id, .. }
             | ExecutionEvent::NodeFailed { execution_id, .. } => execution_id,
@@ -664,7 +1240,8 @@ impl Workspace {
             return Ok(());
         };
 
-        let mut status: ExecutionStatus = serde_json::from_str(&status_json)?;
+        let mut status: ExecutionStatus =
+            Self::normalize_execution_status(serde_json::from_str(&status_json)?);
         if status.finished_at.is_some() {
             return Ok(());
         }
@@ -674,7 +1251,11 @@ impl Workspace {
             .unwrap_or_default();
 
         match event {
+            ExecutionEvent::ExecutionStarted { .. } => {
+                Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+            }
             ExecutionEvent::NodeStarted { node_id, .. } => {
+                Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
                 status
                     .node_statuses
                     .insert(node_id.clone(), NodeStatus::Running);
@@ -733,6 +1314,7 @@ impl Workspace {
                 duration_ms,
                 ..
             } => {
+                Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
                 status
                     .node_statuses
                     .insert(node_id.clone(), NodeStatus::Completed);
@@ -749,11 +1331,13 @@ impl Workspace {
                 logs.duration_ms = Some(*duration_ms);
             }
             ExecutionEvent::NodeCacheHit { node_id, .. } => {
+                Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
                 status
                     .node_statuses
                     .insert(node_id.clone(), NodeStatus::CacheHit);
             }
             ExecutionEvent::NodeFailed { node_id, error, .. } => {
+                Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
                 status
                     .node_statuses
                     .insert(node_id.clone(), NodeStatus::Failed);
@@ -769,11 +1353,26 @@ impl Workspace {
                     });
                 logs.error = Some(error.clone());
             }
+            ExecutionEvent::ExecutionCompleted { .. } => {
+                status.finished_at = Some(Utc::now());
+                Self::apply_execution_phase(&mut status, ExecutionPhase::Completed);
+            }
+            ExecutionEvent::ExecutionFailed { .. } => {
+                status.finished_at = Some(Utc::now());
+                let terminal_status =
+                    Self::terminal_status_from_outcome(&status.node_statuses, &node_logs);
+                status.status = terminal_status.clone();
+                status.phase = Self::terminal_phase_from_status(&terminal_status);
+            }
             _ => {}
         }
 
         if status.finished_at.is_none() && Self::execution_nodes_finished(&status) {
             status.finished_at = Some(Utc::now());
+            let terminal_status =
+                Self::terminal_status_from_outcome(&status.node_statuses, &node_logs);
+            status.status = terminal_status.clone();
+            status.phase = Self::terminal_phase_from_status(&terminal_status);
         }
 
         let updated_status_json = serde_json::to_string(&status).unwrap_or_default();
@@ -1212,56 +1811,231 @@ impl Workspace {
         target_branch_id: &BranchId,
         cell_id: &CellId,
     ) -> TineResult<(ExecutionId, NodeLogs)> {
-        let cell = tree
-            .cells
-            .iter()
-            .find(|cell| &cell.id == cell_id)
-            .ok_or_else(|| {
-                TineError::Internal(format!(
-                    "cell '{}' not found in branch '{}' for tree '{}'",
-                    cell_id, target_branch_id, tree.id
-                ))
-            })?
-            .clone();
-        let executable_cell = ExecutableTreeCell {
-            tree_id: tree.id.clone(),
-            branch_id: target_branch_id.clone(),
-            cell_id: cell.id.clone(),
-            name: cell.name.clone(),
-            code: cell.code.clone(),
-            inputs: HashMap::new(),
-            outputs: cell.declared_outputs.clone(),
-            cache: cell.cache,
-            map_over: cell.map_over.clone(),
-            map_concurrency: cell.map_concurrency,
-            timeout_secs: cell.timeout_secs,
-            tags: cell.tags.clone(),
-            revision_id: cell.revision_id.clone(),
-        };
-        let executable_branch = ExecutableTreeBranch {
-            tree_id: tree.id.clone(),
-            branch_id: target_branch_id.clone(),
-            name: format!("{} [{}]", tree.name, target_branch_id),
-            lineage: vec![target_branch_id.clone()],
-            path_cell_order: vec![cell.id.clone()],
-            topo_order: vec![cell.id.clone()],
-            cells: vec![executable_cell.clone()],
-            environment: tree.environment.clone(),
-            execution_mode: tree.execution_mode.clone(),
-            budget: tree.budget.clone(),
-            project_id: tree.project_id.clone(),
-            created_at: tree.created_at,
-        };
-        let target = Self::execution_target_for_tree_branch(&tree.id, target_branch_id);
+        let plan = Self::build_tree_cell_execution_plan(tree, target_branch_id, cell_id)?;
         let working_dir = self.file_base_for_project(tree.project_id.as_ref()).await?;
         self.scheduler
             .execute_executable_cell_for_target(
-                &executable_branch,
-                &executable_cell,
-                &target,
+                &plan.executable_branch,
+                &plan.executable_cell,
+                &plan.target,
                 Some(&working_dir),
             )
             .await
+    }
+
+    pub async fn submit_cell_execution_in_experiment_tree_branch(
+        workspace: Arc<Self>,
+        tree_id: &ExperimentTreeId,
+        branch_id: &BranchId,
+        cell_id: &CellId,
+    ) -> TineResult<ExecutionAccepted> {
+        let tree = workspace.get_experiment_tree(tree_id).await?;
+        Self::validate_branch_membership(&tree, branch_id, cell_id)?;
+        let working_dir = workspace.file_base_for_project(tree.project_id.as_ref()).await?;
+        let plan = Self::build_tree_cell_execution_plan(&tree, branch_id, cell_id)?;
+        let execution_id = ExecutionId::generate();
+        let created_at = Utc::now();
+        let topo_order = vec![cell_id.clone()];
+
+        Self::insert_branch_execution_record(
+            &workspace.pool,
+            &execution_id,
+            tree_id,
+            branch_id,
+            &plan.target,
+            &topo_order,
+        )
+        .await?;
+        let queue_position = match workspace.enqueue_execution(&execution_id).await {
+            Ok(queue_position) => queue_position,
+            Err(err) => {
+                workspace.reject_execution(&execution_id).await?;
+                return Err(err);
+            }
+        };
+
+        let execution_id_for_task = execution_id.clone();
+        let tree_id_for_task = tree_id.clone();
+        let branch_id_for_task = branch_id.clone();
+        let cell_id_for_task = cell_id.clone();
+        let target_for_task = plan.target.clone();
+        let working_dir_for_task = working_dir.clone();
+        let workspace_for_task = workspace.clone();
+        let pool_for_task = workspace.pool.clone();
+        let queue_state_for_task = workspace.execution_queue_state.clone();
+        let queue_notify_for_task = workspace.execution_queue_notify.clone();
+        let max_concurrent_executions = workspace.max_concurrent_executions;
+
+        tokio::spawn(async move {
+            let can_run = match Self::wait_for_execution_slot_with(
+                &pool_for_task,
+                &queue_state_for_task,
+                &queue_notify_for_task,
+                max_concurrent_executions,
+                &execution_id_for_task,
+            )
+            .await {
+                Ok(can_run) => can_run,
+                Err(err) => {
+                    error!(
+                        tree = %tree_id_for_task,
+                        branch = %branch_id_for_task,
+                        cell = %cell_id_for_task,
+                        execution = %execution_id_for_task,
+                        error = %err,
+                        "failed while waiting for queued cell execution slot"
+                    );
+                    let _ = Self::finalize_branch_execution_failure(
+                        &pool_for_task,
+                        &execution_id_for_task,
+                        &tree_id_for_task,
+                        &branch_id_for_task,
+                        &target_for_task,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if !can_run {
+                return;
+            }
+
+            let cache = match Self::load_cache_from_pool(&workspace_for_task.pool).await {
+                Ok(cache) => cache,
+                Err(err) => {
+                    error!(
+                        tree = %tree_id_for_task,
+                        branch = %branch_id_for_task,
+                        cell = %cell_id_for_task,
+                        execution = %execution_id_for_task,
+                        error = %err,
+                        "failed to load cache for submitted cell execution"
+                    );
+                    Self::finalize_branch_execution_failure(
+                        &pool_for_task,
+                        &execution_id_for_task,
+                        &tree_id_for_task,
+                        &branch_id_for_task,
+                        &target_for_task,
+                    )
+                    .await;
+                    Self::release_execution_slot_with(
+                        &queue_state_for_task,
+                        &queue_notify_for_task,
+                        &execution_id_for_task,
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            let prepared = match workspace_for_task
+                .prepare_context_internal(
+                    &tree_id_for_task,
+                    &branch_id_for_task,
+                    &cell_id_for_task,
+                    Some(&execution_id_for_task),
+                )
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    error!(
+                        tree = %tree_id_for_task,
+                        branch = %branch_id_for_task,
+                        cell = %cell_id_for_task,
+                        execution = %execution_id_for_task,
+                        error = %err,
+                        "failed to prepare runtime context for submitted cell execution"
+                    );
+                    Self::finalize_branch_execution_failure(
+                        &pool_for_task,
+                        &execution_id_for_task,
+                        &tree_id_for_task,
+                        &branch_id_for_task,
+                        &target_for_task,
+                    )
+                    .await;
+                    Self::release_execution_slot_with(
+                        &queue_state_for_task,
+                        &queue_notify_for_task,
+                        &execution_id_for_task,
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            match workspace_for_task
+                .scheduler
+                .execute_executable_branch_for_target(
+                    &execution_id_for_task,
+                    &plan.executable_branch,
+                    &target_for_task,
+                    &cache,
+                    Some(&workspace_for_task.pool),
+                    Some(&working_dir_for_task),
+                )
+                .await
+            {
+                Ok(outcome) => {
+                    Self::finalize_branch_execution_success(
+                        &pool_for_task,
+                        &execution_id_for_task,
+                        &tree_id_for_task,
+                        &branch_id_for_task,
+                        &target_for_task,
+                        outcome,
+                    )
+                    .await;
+                    let mut runtime_state = prepared.runtime_state;
+                    runtime_state.kernel_state = TreeKernelState::Ready;
+                    runtime_state.last_prepared_cell_id = Some(cell_id_for_task.clone());
+                    if let Err(err) = workspace_for_task.set_tree_runtime_state(runtime_state).await
+                    {
+                        warn!(
+                            tree = %tree_id_for_task,
+                            branch = %branch_id_for_task,
+                            cell = %cell_id_for_task,
+                            execution = %execution_id_for_task,
+                            error = %err,
+                            "failed to persist runtime state after submitted cell execution"
+                        );
+                    }
+                }
+                Err(err) => {
+                    error!(
+                        tree = %tree_id_for_task,
+                        branch = %branch_id_for_task,
+                        cell = %cell_id_for_task,
+                        execution = %execution_id_for_task,
+                        error = %err,
+                        "submitted cell execution failed"
+                    );
+                    Self::finalize_branch_execution_failure(
+                        &pool_for_task,
+                        &execution_id_for_task,
+                        &tree_id_for_task,
+                        &branch_id_for_task,
+                        &target_for_task,
+                    )
+                    .await;
+                }
+            }
+
+            workspace_for_task
+                .release_execution_slot(&execution_id_for_task)
+                .await;
+        });
+
+        Ok(ExecutionAccepted::for_cell(
+            execution_id,
+            tree_id.clone(),
+            branch_id.clone(),
+            cell_id.clone(),
+            created_at,
+        )
+        .with_queue_position(Some(queue_position)))
     }
 
     async fn invalidate_tree_runtime_for_mutation(
@@ -1298,13 +2072,24 @@ impl Workspace {
                 tine_core::NodeStatus::Completed
             },
         );
-
         let status = ExecutionStatus {
             execution_id: execution_id.clone(),
             tree_id: tree_id.cloned(),
             branch_id: branch_id.cloned(),
-            target_kind: Some(target_kind.clone()),
+            target_kind: Some(target_kind),
             target: Some(target.clone()),
+            status: if logs.error.is_some() {
+                ExecutionLifecycleStatus::Failed
+            } else {
+                ExecutionLifecycleStatus::Completed
+            },
+            phase: if logs.error.is_some() {
+                ExecutionPhase::Failed
+            } else {
+                ExecutionPhase::Completed
+            },
+            queue_position: None,
+            cancellation_requested_at: None,
             node_statuses,
             started_at: Utc::now()
                 - chrono::Duration::milliseconds(logs.duration_ms.unwrap_or_default() as i64),
@@ -1592,40 +2377,86 @@ impl Workspace {
             &plan.executable_branch.topo_order,
         )
         .await?;
+        if let Err(err) = self.enqueue_execution(&exec_id).await {
+            self.reject_execution(&exec_id).await?;
+            return Err(err);
+        }
 
+        let pool_for_task = self.pool.clone();
         let scheduler = self.scheduler.clone();
-        let pool = self.pool.clone();
+        let queue_state_for_task = self.execution_queue_state.clone();
+        let queue_notify_for_task = self.execution_queue_notify.clone();
+        let max_concurrent_executions = self.max_concurrent_executions;
         let eid = exec_id.clone();
         let tid = tree_id.clone();
         let bid = branch_id.clone();
         let target_for_task = plan.target.clone();
         let working_dir_for_task = working_dir.clone();
-        let cache = match Self::load_cache_from_pool(&self.pool).await {
-            Ok(cache) => cache,
-            Err(e) => {
-                error!(tree = %tree_id, branch = %branch_id, execution = %exec_id, error = %e, "failed to load cache for branch execution");
-                Self::finalize_branch_execution_failure(
-                    &self.pool,
-                    &exec_id,
-                    tree_id,
-                    branch_id,
-                    &plan.target,
-                )
-                .await;
-                return Err(TineError::Database(e.to_string()));
-            }
-        };
         tokio::spawn(async move {
+            let can_run = match Self::wait_for_execution_slot_with(
+                &pool_for_task,
+                &queue_state_for_task,
+                &queue_notify_for_task,
+                max_concurrent_executions,
+                &eid,
+            )
+            .await {
+                Ok(can_run) => can_run,
+                Err(err) => {
+                    error!(tree = %tid, branch = %bid, execution = %eid, error = %err, "failed while waiting for queued branch execution slot");
+                    let _ = Self::finalize_branch_execution_failure(
+                        &pool_for_task,
+                        &eid,
+                        &tid,
+                        &bid,
+                        &target_for_task,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if !can_run {
+                return;
+            }
+
+            let cache = match Self::load_cache_from_pool(&pool_for_task).await {
+                Ok(cache) => cache,
+                Err(e) => {
+                    error!(tree = %tid, branch = %bid, execution = %eid, error = %e, "failed to load cache for branch execution");
+                    Self::finalize_branch_execution_failure(
+                        &pool_for_task,
+                        &eid,
+                        &tid,
+                        &bid,
+                        &target_for_task,
+                    )
+                    .await;
+                    Self::release_execution_slot_with(
+                        &queue_state_for_task,
+                        &queue_notify_for_task,
+                        &eid,
+                    )
+                    .await;
+                    return;
+                }
+            };
+
             Self::run_branch_execution(
                 scheduler,
-                pool,
+                pool_for_task.clone(),
                 tid,
                 bid,
-                eid,
+                eid.clone(),
                 plan.executable_branch,
                 target_for_task,
                 cache,
                 working_dir_for_task,
+            )
+            .await;
+            Self::release_execution_slot_with(
+                &queue_state_for_task,
+                &queue_notify_for_task,
+                &eid,
             )
             .await;
         });
@@ -1655,6 +2486,10 @@ impl Workspace {
                 &plan.executable_branch.topo_order,
             )
             .await?;
+            if let Err(err) = self.enqueue_execution(&exec_id).await {
+                self.reject_execution(&exec_id).await?;
+                return Err(err);
+            }
             response.push((branch_id.clone(), exec_id.clone()));
             runs.push((branch_id, exec_id, plan.executable_branch, plan.target));
         }
@@ -1663,6 +2498,9 @@ impl Workspace {
         let kernel_mgr = self.kernel_mgr.clone();
         let env_mgr = self.env_mgr.clone();
         let pool = self.pool.clone();
+        let execution_queue_state = self.execution_queue_state.clone();
+        let execution_queue_notify = self.execution_queue_notify.clone();
+        let max_concurrent_executions = self.max_concurrent_executions;
         let tree_runtime_states = self.tree_runtime_states.clone();
         let tid = tree_id.clone();
         let event_tx = self.scheduler.event_sender();
@@ -1679,6 +2517,31 @@ impl Workspace {
                     while let Some((branch_id, exec_id, executable_branch, target)) =
                         runs_iter.next()
                     {
+                        let can_run = match Self::wait_for_execution_slot_with(
+                            &pool,
+                            &execution_queue_state,
+                            &execution_queue_notify,
+                            max_concurrent_executions,
+                            &exec_id,
+                        )
+                        .await {
+                            Ok(can_run) => can_run,
+                            Err(err) => {
+                                error!(tree = %tid, branch = %branch_id, execution = %exec_id, error = %err, "failed while waiting for queued execute-all slot");
+                                Self::finalize_branch_execution_failure(
+                                    &pool,
+                                    &exec_id,
+                                    &tid,
+                                    &branch_id,
+                                    &target,
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
+                        if !can_run {
+                            continue;
+                        }
                         if kernel_mgr.has_tree_kernel(&tid) {
                             if let Err(e) = kernel_mgr.shutdown_tree(&tid).await {
                                 error!(tree = %tid, branch = %branch_id, execution = %exec_id, error = %e, "failed to reset tree kernel before branch execution");
@@ -1696,11 +2559,24 @@ impl Workspace {
                             working_dir_for_task.clone(),
                         )
                         .await;
+                        Self::release_execution_slot_with(
+                            &execution_queue_state,
+                            &execution_queue_notify,
+                            &exec_id,
+                        )
+                        .await;
                         if !succeeded {
                             warn!(tree = %tid, branch = %branch_id, execution = %exec_id, "stopping execute-all after first branch failure");
                             for (remaining_branch_id, remaining_exec_id, _, remaining_target) in
                                 runs_iter
                             {
+                                let _ = Self::dequeue_execution_with(
+                                    &pool,
+                                    &execution_queue_state,
+                                    &execution_queue_notify,
+                                    &remaining_exec_id,
+                                )
+                                .await;
                                 warn!(tree = %tid, branch = %remaining_branch_id, execution = %remaining_exec_id, "marking remaining run-all branch as failed after earlier branch failure");
                                 Self::finalize_branch_execution_failure(
                                     &pool,
@@ -1722,172 +2598,209 @@ impl Workspace {
                         let kernel_mgr = kernel_mgr.clone();
                         let env_mgr = env_mgr.clone();
                         let pool = pool.clone();
+                        let execution_queue_state = execution_queue_state.clone();
+                        let execution_queue_notify = execution_queue_notify.clone();
                         let tree_runtime_states = tree_runtime_states.clone();
                         let tid = tid.clone();
                         let event_tx = event_tx.clone();
                         let working_dir_for_task = working_dir_for_task.clone();
                         handles.push(tokio::spawn(async move {
-                            let mut restart_after_teardown = false;
-                            let branch_id_for_isolation = branch_id.clone();
-                            let session_id = exec_id.as_str().to_string();
-                            let _ = event_tx.send(ExecutionEvent::IsolationAttempted {
-                                tree_id: tid.clone(),
-                                branch_id: branch_id.clone(),
-                            });
-                            let should_restart = if !kernel_mgr.has_tree_kernel(&tid) {
-                                let tree_env = TreeEnvironmentDescriptor::new(
-                                    tid.clone(),
-                                    executable_branch.project_id.clone(),
-                                    executable_branch.environment.clone(),
-                                );
-                                match env_mgr.ensure_tree_environment(&tree_env).await {
-                                    Ok(venv_dir) => {
-                                        if let Err(err) = kernel_mgr
-                                            .start_tree_kernel(
-                                                &tid,
-                                                &venv_dir,
-                                                &working_dir_for_task,
-                                            )
-                                            .await
-                                        {
+                            let can_run = match Self::wait_for_execution_slot_with(
+                                &pool,
+                                &execution_queue_state,
+                                &execution_queue_notify,
+                                max_concurrent_executions,
+                                &exec_id,
+                            )
+                            .await {
+                                Ok(can_run) => can_run,
+                                Err(err) => {
+                                    error!(tree = %tid, branch = %branch_id, execution = %exec_id, error = %err, "failed while waiting for queued guarded execute-all slot");
+                                    Self::finalize_branch_execution_failure(
+                                        &pool,
+                                        &exec_id,
+                                        &tid,
+                                        &branch_id,
+                                        &target,
+                                    )
+                                    .await;
+                                    return false;
+                                }
+                            };
+                            if !can_run {
+                                return false;
+                            }
+                            let restart_after_teardown = async {
+                                let mut restart_after_teardown = false;
+                                let branch_id_for_isolation = branch_id.clone();
+                                let session_id = exec_id.as_str().to_string();
+                                let _ = event_tx.send(ExecutionEvent::IsolationAttempted {
+                                    tree_id: tid.clone(),
+                                    branch_id: branch_id.clone(),
+                                });
+                                let should_restart = if !kernel_mgr.has_tree_kernel(&tid) {
+                                    let tree_env = TreeEnvironmentDescriptor::new(
+                                        tid.clone(),
+                                        executable_branch.project_id.clone(),
+                                        executable_branch.environment.clone(),
+                                    );
+                                    match env_mgr.ensure_tree_environment(&tree_env).await {
+                                        Ok(venv_dir) => {
+                                            if let Err(err) = kernel_mgr
+                                                .start_tree_kernel(
+                                                    &tid,
+                                                    &venv_dir,
+                                                    &working_dir_for_task,
+                                                )
+                                                .await
+                                            {
+                                                let _ = event_tx.send(
+                                                    ExecutionEvent::FallbackRestartTriggered {
+                                                        tree_id: tid.clone(),
+                                                        branch_id: branch_id.clone(),
+                                                        reason: format!(
+                                                            "failed_to_start_guarded_kernel:{}",
+                                                            err
+                                                        ),
+                                                    },
+                                                );
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        Err(err) => {
                                             let _ = event_tx.send(
                                                 ExecutionEvent::FallbackRestartTriggered {
                                                     tree_id: tid.clone(),
                                                     branch_id: branch_id.clone(),
                                                     reason: format!(
-                                                        "failed_to_start_guarded_kernel:{}",
+                                                        "failed_to_prepare_guarded_environment:{}",
                                                         err
                                                     ),
                                                 },
                                             );
                                             true
-                                        } else {
-                                            false
                                         }
                                     }
-                                    Err(err) => {
-                                        let _ = event_tx.send(
-                                            ExecutionEvent::FallbackRestartTriggered {
-                                                tree_id: tid.clone(),
-                                                branch_id: branch_id.clone(),
-                                                reason: format!(
-                                                    "failed_to_prepare_guarded_environment:{}",
-                                                    err
-                                                ),
-                                            },
-                                        );
-                                        true
-                                    }
-                                }
-                            } else {
-                                false
-                            };
+                                } else {
+                                    false
+                                };
 
-                            let mut used_namespace_guard = false;
-                            if !should_restart {
-                                match kernel_mgr
-                                    .begin_tree_branch_session(&tid, &session_id)
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        used_namespace_guard = true;
-                                        tokio::task::yield_now().await;
-                                    }
-                                    Err(err) => {
-                                        let _ = event_tx.send(
-                                            ExecutionEvent::FallbackRestartTriggered {
-                                                tree_id: tid.clone(),
-                                                branch_id: branch_id.clone(),
-                                                reason: format!(
-                                                    "failed_to_begin_branch_session:{}",
-                                                    err
-                                                ),
-                                            },
-                                        );
-                                        if kernel_mgr.has_tree_kernel(&tid) {
-                                            let _ = kernel_mgr.shutdown_tree(&tid).await;
+                                let mut used_namespace_guard = false;
+                                if !should_restart {
+                                    match kernel_mgr
+                                        .begin_tree_branch_session(&tid, &session_id)
+                                        .await
+                                    {
+                                        Ok(()) => {
+                                            used_namespace_guard = true;
+                                            tokio::task::yield_now().await;
                                         }
-                                    }
-                                }
-                            }
-
-                            Self::run_branch_execution(
-                                scheduler,
-                                pool.clone(),
-                                tid.clone(),
-                                branch_id.clone(),
-                                exec_id,
-                                executable_branch,
-                                target,
-                                HashMap::new(),
-                                working_dir_for_task,
-                            )
-                            .await;
-
-                            if used_namespace_guard {
-                                match kernel_mgr.end_tree_branch_session(&tid, &session_id).await {
-                                    Ok(outcome) => {
-                                        let _ = Self::record_isolation_result(
-                                            &pool,
-                                            &tree_runtime_states,
-                                            &tid,
-                                            &branch_id_for_isolation,
-                                            &outcome,
-                                        )
-                                        .await;
-                                        if outcome.contaminated {
-                                            let _ = event_tx.send(
-                                                ExecutionEvent::ContaminationDetected {
-                                                    tree_id: tid.clone(),
-                                                    branch_id: branch_id_for_isolation.clone(),
-                                                    signals: outcome.signals.clone(),
-                                                },
-                                            );
+                                        Err(err) => {
                                             let _ = event_tx.send(
                                                 ExecutionEvent::FallbackRestartTriggered {
                                                     tree_id: tid.clone(),
-                                                    branch_id: branch_id_for_isolation.clone(),
-                                                    reason: "contamination_detected".to_string(),
+                                                    branch_id: branch_id.clone(),
+                                                    reason: format!(
+                                                        "failed_to_begin_branch_session:{}",
+                                                        err
+                                                    ),
                                                 },
                                             );
-                                            restart_after_teardown = true;
-                                        } else {
-                                            let _ =
-                                                event_tx.send(ExecutionEvent::IsolationSucceeded {
+                                            if kernel_mgr.has_tree_kernel(&tid) {
+                                                let _ = kernel_mgr.shutdown_tree(&tid).await;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Self::run_branch_execution(
+                                    scheduler,
+                                    pool.clone(),
+                                    tid.clone(),
+                                    branch_id.clone(),
+                                    exec_id.clone(),
+                                    executable_branch,
+                                    target,
+                                    HashMap::new(),
+                                    working_dir_for_task,
+                                )
+                                .await;
+
+                                if used_namespace_guard {
+                                    match kernel_mgr.end_tree_branch_session(&tid, &session_id).await {
+                                        Ok(outcome) => {
+                                            let _ = Self::record_isolation_result(
+                                                &pool,
+                                                &tree_runtime_states,
+                                                &tid,
+                                                &branch_id_for_isolation,
+                                                &outcome,
+                                            )
+                                            .await;
+                                            if outcome.contaminated {
+                                                let _ = event_tx.send(
+                                                    ExecutionEvent::ContaminationDetected {
+                                                        tree_id: tid.clone(),
+                                                        branch_id: branch_id_for_isolation.clone(),
+                                                        signals: outcome.signals.clone(),
+                                                    },
+                                                );
+                                                let _ = event_tx.send(
+                                                    ExecutionEvent::FallbackRestartTriggered {
+                                                        tree_id: tid.clone(),
+                                                        branch_id: branch_id_for_isolation.clone(),
+                                                        reason: "contamination_detected".to_string(),
+                                                    },
+                                                );
+                                                restart_after_teardown = true;
+                                            } else {
+                                                let _ = event_tx.send(ExecutionEvent::IsolationSucceeded {
                                                     tree_id: tid.clone(),
                                                     branch_id: branch_id_for_isolation.clone(),
                                                     delta: outcome.delta.clone(),
                                                 });
+                                            }
+                                        }
+                                        Err(err) => {
+                                            let failed_outcome = KernelIsolationOutcome {
+                                                contaminated: true,
+                                                signals: vec!["session_end_failed".to_string()],
+                                                delta: tine_core::NamespaceDelta::default(),
+                                            };
+                                            let _ = Self::record_isolation_result(
+                                                &pool,
+                                                &tree_runtime_states,
+                                                &tid,
+                                                &branch_id_for_isolation,
+                                                &failed_outcome,
+                                            )
+                                            .await;
+                                            let _ = event_tx.send(
+                                                ExecutionEvent::FallbackRestartTriggered {
+                                                    tree_id: tid.clone(),
+                                                    branch_id: branch_id_for_isolation.clone(),
+                                                    reason: format!(
+                                                        "failed_to_end_branch_session:{}",
+                                                        err
+                                                    ),
+                                                },
+                                            );
+                                            restart_after_teardown = true;
                                         }
                                     }
-                                    Err(err) => {
-                                        let failed_outcome = KernelIsolationOutcome {
-                                            contaminated: true,
-                                            signals: vec!["session_end_failed".to_string()],
-                                            delta: tine_core::NamespaceDelta::default(),
-                                        };
-                                        let _ = Self::record_isolation_result(
-                                            &pool,
-                                            &tree_runtime_states,
-                                            &tid,
-                                            &branch_id_for_isolation,
-                                            &failed_outcome,
-                                        )
-                                        .await;
-                                        let _ = event_tx.send(
-                                            ExecutionEvent::FallbackRestartTriggered {
-                                                tree_id: tid.clone(),
-                                                branch_id: branch_id_for_isolation.clone(),
-                                                reason: format!(
-                                                    "failed_to_end_branch_session:{}",
-                                                    err
-                                                ),
-                                            },
-                                        );
-                                        restart_after_teardown = true;
-                                    }
                                 }
+
+                                restart_after_teardown
                             }
+                            .await;
+                            Self::release_execution_slot_with(
+                                &execution_queue_state,
+                                &execution_queue_notify,
+                                &exec_id,
+                            )
+                            .await;
                             restart_after_teardown
                         }));
                     }
@@ -1998,6 +2911,16 @@ impl Workspace {
         &self,
         tree_id: &ExperimentTreeId,
     ) -> TineResult<Option<TreeRuntimeState>> {
+        match self.scheduler.interrupt_tree_kernel(tree_id).await {
+            Ok(()) => {}
+            Err(TineError::KernelNotFound { .. }) => {}
+            Err(err) => return Err(err),
+        }
+        match self.scheduler.shutdown_tree_kernel(tree_id).await {
+            Ok(()) => {}
+            Err(TineError::KernelNotFound { .. }) => {}
+            Err(err) => return Err(err),
+        }
         let updated = Self::apply_runtime_state_transition(
             &self.pool,
             &self.tree_runtime_states,
@@ -2010,6 +2933,15 @@ impl Workspace {
             },
         )
         .await?;
+        let reconciled = Self::reconcile_tree_kernel_lost_executions(
+            &self.pool,
+            tree_id,
+            "Tree kernel was marked lost while execution was running",
+        )
+        .await?;
+        if reconciled > 0 {
+            warn!(tree = %tree_id, reconciled, "reconciled running executions after tree kernel loss");
+        }
         if let Some(state) = &updated {
             Self::emit_tree_runtime_state_event(&self.scheduler.event_sender(), state);
         }
@@ -2041,11 +2973,12 @@ impl Workspace {
         .await
     }
 
-    pub async fn prepare_context(
+    async fn prepare_context_internal(
         &self,
         tree_id: &ExperimentTreeId,
         branch_id: &BranchId,
         cell_id: &CellId,
+        execution_id: Option<&ExecutionId>,
     ) -> TineResult<PreparedContext> {
         let tree = self.get_experiment_tree(tree_id).await?;
         Self::validate_branch_membership(&tree, branch_id, cell_id)?;
@@ -2064,6 +2997,12 @@ impl Workspace {
         let transition =
             plan_branch_transition(planning_state, branch_id, cell_id, &path_cell_ids)?;
         let replay_prefix = transition.replay_prefix_before_target()?;
+        if let Some(execution_id) = execution_id {
+            Self::update_execution_status_record(&self.pool, execution_id, |status| {
+                Self::apply_execution_phase(status, ExecutionPhase::PreparingEnvironment);
+            })
+            .await?;
+        }
         let reusing_existing_kernel = has_live_kernel
             && current.kernel_state == TreeKernelState::Ready
             && transition.replay_from_idx == current.materialized_path_cell_ids.len();
@@ -2085,6 +3024,12 @@ impl Workspace {
         self.set_tree_runtime_state(switching_state).await?;
 
         if !reusing_existing_kernel {
+            if let Some(execution_id) = execution_id {
+                Self::update_execution_status_record(&self.pool, execution_id, |status| {
+                    Self::apply_execution_phase(status, ExecutionPhase::AcquiringRuntime);
+                })
+                .await?;
+            }
             if has_live_kernel {
                 self.kernel_mgr.shutdown_tree(tree_id).await?;
             }
@@ -2096,6 +3041,14 @@ impl Workspace {
                 .await?;
         }
 
+        if !replay_prefix.is_empty() {
+            if let Some(execution_id) = execution_id {
+                Self::update_execution_status_record(&self.pool, execution_id, |status| {
+                    Self::apply_execution_phase(status, ExecutionPhase::ReplayingContext);
+                })
+                .await?;
+            }
+        }
         for replay_cell_id in &replay_prefix {
             self.execute_tree_cell_for_target(&tree, branch_id, replay_cell_id)
                 .await?;
@@ -2118,6 +3071,16 @@ impl Workspace {
             target_cell_id: cell_id.clone(),
             runtime_state,
         })
+    }
+
+    pub async fn prepare_context(
+        &self,
+        tree_id: &ExperimentTreeId,
+        branch_id: &BranchId,
+        cell_id: &CellId,
+    ) -> TineResult<PreparedContext> {
+        self.prepare_context_internal(tree_id, branch_id, cell_id, None)
+            .await
     }
 
     async fn run_additive_migration(pool: &SqlitePool, sql: &str) {
@@ -2357,6 +3320,8 @@ impl Workspace {
             catalog.clone(),
             workspace_root.clone(),
         ));
+        let max_concurrent_executions = std::cmp::max(1, max_kernels);
+        let max_queue_depth = Self::default_max_queue_depth(max_concurrent_executions);
 
         Self::reconcile_unfinished_executions(&pool).await?;
 
@@ -2388,6 +3353,10 @@ impl Workspace {
             catalog,
             workspace_root,
             tree_runtime_states,
+            execution_queue_state: Arc::new(Mutex::new(ExecutionQueueState::default())),
+            execution_queue_notify: Arc::new(Notify::new()),
+            max_concurrent_executions,
+            max_queue_depth,
             kernel_monitor_handle,
             kernel_lifecycle_handle,
             execution_event_bridge_handle,
@@ -2832,22 +3801,52 @@ impl WorkspaceApi for Workspace {
 
         let (status_json,) =
             row.ok_or_else(|| TineError::ExecutionNotFound(execution_id.clone()))?;
-        let status: ExecutionStatus = serde_json::from_str(&status_json)?;
+        let status: ExecutionStatus =
+            Self::normalize_execution_status(serde_json::from_str(&status_json)?);
+        if status.finished_at.is_some() {
+            return Ok(());
+        }
+
+        if status.cancellation_requested_at.is_some()
+            && matches!(status.phase, ExecutionPhase::CancellationRequested)
+        {
+            return Ok(());
+        }
+
+        let cancellation_requested_at = status.cancellation_requested_at.unwrap_or_else(Utc::now);
+        let was_queued = self.dequeue_execution(execution_id).await?;
+        if was_queued {
+            Self::finalize_cancelled_execution(&self.pool, execution_id, cancellation_requested_at)
+                .await?;
+            return Ok(());
+        }
+
+        Self::update_execution_status_record(&self.pool, execution_id, |status| {
+            status.cancellation_requested_at = Some(cancellation_requested_at);
+            status.queue_position = None;
+            Self::apply_execution_phase(status, ExecutionPhase::CancellationRequested);
+        })
+        .await?;
+
         let tree_id = status.tree_id.clone().ok_or_else(|| {
             TineError::Internal(format!("execution '{}' is missing tree_id", execution_id))
         })?;
-
         self.kernel_mgr.interrupt_tree(&tree_id).await?;
 
-        let cancelled_status = Self::reconcile_abandoned_execution_status(status);
-        let status_json = serde_json::to_string(&cancelled_status).unwrap_or_default();
-
-        sqlx::query("UPDATE executions SET status = ?, finished_at = datetime('now') WHERE id = ?")
-            .bind(&status_json)
-            .bind(execution_id.as_str())
-            .execute(&self.pool)
+        let pool = self.pool.clone();
+        let execution_id = execution_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            if let Err(err) = Self::finalize_cancelled_execution(
+                &pool,
+                &execution_id,
+                cancellation_requested_at,
+            )
             .await
-            .map_err(|e| TineError::Database(e.to_string()))?;
+            {
+                warn!(execution = %execution_id, error = %err, "failed to finalize cancelled execution after interrupt");
+            }
+        });
 
         Ok(())
     }
@@ -2862,7 +3861,7 @@ impl WorkspaceApi for Workspace {
         let (status_json,) =
             row.ok_or_else(|| TineError::ExecutionNotFound(execution_id.clone()))?;
         let status: ExecutionStatus = serde_json::from_str(&status_json)?;
-        Ok(status)
+        Ok(Self::normalize_execution_status(status))
     }
 
     async fn logs_for_tree_cell(
@@ -3188,6 +4187,10 @@ mod tests {
                 tree_id: ExperimentTreeId::new("tree"),
                 branch_id: BranchId::new("main"),
             }),
+            status: ExecutionLifecycleStatus::Running,
+            phase: ExecutionPhase::Running,
+            queue_position: None,
+            cancellation_requested_at: None,
             node_statuses,
             started_at: Utc::now(),
             finished_at: None,
@@ -3196,6 +4199,8 @@ mod tests {
         let reconciled = Workspace::reconcile_abandoned_execution_status(status);
 
         assert!(reconciled.finished_at.is_some());
+        assert_eq!(reconciled.status, ExecutionLifecycleStatus::Failed);
+        assert_eq!(reconciled.phase, ExecutionPhase::Failed);
         assert_eq!(
             reconciled.node_statuses.get(&NodeId::new("queued")),
             Some(&NodeStatus::Interrupted)
@@ -3207,6 +4212,62 @@ mod tests {
         assert_eq!(
             reconciled.node_statuses.get(&NodeId::new("done")),
             Some(&NodeStatus::Completed)
+        );
+    }
+
+    #[test]
+    fn reconcile_kernel_lost_execution_status_marks_running_nodes_interrupted() {
+        let execution_id = ExecutionId::new("exec-kernel-lost");
+        let mut node_statuses = HashMap::new();
+        node_statuses.insert(NodeId::new("queued"), NodeStatus::Queued);
+        node_statuses.insert(NodeId::new("running"), NodeStatus::Running);
+        node_statuses.insert(NodeId::new("done"), NodeStatus::Completed);
+
+        let status = ExecutionStatus {
+            execution_id,
+            tree_id: Some(ExperimentTreeId::new("tree")),
+            branch_id: Some(BranchId::new("main")),
+            target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+            target: Some(ExecutionTargetRef::ExperimentTreeBranch {
+                tree_id: ExperimentTreeId::new("tree"),
+                branch_id: BranchId::new("main"),
+            }),
+            status: ExecutionLifecycleStatus::Running,
+            phase: ExecutionPhase::Running,
+            queue_position: None,
+            cancellation_requested_at: None,
+            node_statuses,
+            started_at: Utc::now(),
+            finished_at: None,
+        };
+
+        let (reconciled, node_logs) = Workspace::reconcile_kernel_lost_execution_status(
+            status,
+            HashMap::new(),
+            "Kernel heartbeat lost while execution was running",
+        );
+
+        assert!(reconciled.finished_at.is_some());
+        assert_eq!(reconciled.status, ExecutionLifecycleStatus::Failed);
+        assert_eq!(reconciled.phase, ExecutionPhase::Failed);
+        assert_eq!(
+            reconciled.node_statuses.get(&NodeId::new("queued")),
+            Some(&NodeStatus::Interrupted)
+        );
+        assert_eq!(
+            reconciled.node_statuses.get(&NodeId::new("running")),
+            Some(&NodeStatus::Interrupted)
+        );
+        assert_eq!(
+            reconciled.node_statuses.get(&NodeId::new("done")),
+            Some(&NodeStatus::Completed)
+        );
+        assert_eq!(
+            node_logs
+                .get(&NodeId::new("running"))
+                .and_then(|logs| logs.error.as_ref())
+                .map(|error| error.ename.as_str()),
+            Some("KernelLost")
         );
     }
 
@@ -3311,6 +4372,92 @@ mod tests {
         assert_eq!(tree.cells[0].name, "Cell 1");
         assert_eq!(tree.cells[0].code.language, "python");
         assert!(tree.cells[0].code.source.is_empty());
+
+        workspace.shutdown().await.expect("failed to shut down workspace");
+    }
+
+    #[tokio::test]
+    async fn enqueue_execution_tracks_queue_positions_and_enforces_backpressure() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store: Arc<dyn ArtifactStore> = Arc::new(NoopArtifactStore);
+        let workspace = Workspace::open(tmp.path().to_path_buf(), store, 1)
+            .await
+            .expect("failed to open workspace");
+
+        let tree_id = ExperimentTreeId::new("tree");
+        let branch_id = BranchId::new("main");
+        let target = Workspace::execution_target_for_tree_branch(&tree_id, &branch_id);
+        let topo_order = vec![CellId::new("cell_1")];
+
+        let mut queued_ids = Vec::new();
+        for expected_position in 1..=workspace.max_queue_depth {
+            let execution_id = ExecutionId::generate();
+            Workspace::insert_branch_execution_record(
+                &workspace.pool,
+                &execution_id,
+                &tree_id,
+                &branch_id,
+                &target,
+                &topo_order,
+            )
+            .await
+            .expect("failed to insert execution record");
+            let queue_position = workspace
+                .enqueue_execution(&execution_id)
+                .await
+                .expect("failed to enqueue execution");
+            assert_eq!(queue_position, expected_position as u64);
+            queued_ids.push(execution_id);
+        }
+
+        let second_status = WorkspaceApi::status(&workspace, &queued_ids[1])
+            .await
+            .expect("failed to load queued status");
+        assert_eq!(second_status.queue_position, Some(2));
+        assert_eq!(second_status.status, ExecutionLifecycleStatus::Queued);
+
+        assert!(workspace
+            .dequeue_execution(&queued_ids[0])
+            .await
+            .expect("failed to dequeue queued execution"));
+        let shifted_status = WorkspaceApi::status(&workspace, &queued_ids[1])
+            .await
+            .expect("failed to load shifted queued status");
+        assert_eq!(shifted_status.queue_position, Some(1));
+
+        let refill_execution = ExecutionId::generate();
+        Workspace::insert_branch_execution_record(
+            &workspace.pool,
+            &refill_execution,
+            &tree_id,
+            &branch_id,
+            &target,
+            &topo_order,
+        )
+        .await
+        .expect("failed to insert refill execution record");
+        let refill_position = workspace
+            .enqueue_execution(&refill_execution)
+            .await
+            .expect("expected queue slot freed by dequeue to be reusable");
+        assert_eq!(refill_position, workspace.max_queue_depth as u64);
+
+        let rejected_execution = ExecutionId::generate();
+        Workspace::insert_branch_execution_record(
+            &workspace.pool,
+            &rejected_execution,
+            &tree_id,
+            &branch_id,
+            &target,
+            &topo_order,
+        )
+        .await
+        .expect("failed to insert rejected execution record");
+        let err = workspace
+            .enqueue_execution(&rejected_execution)
+            .await
+            .expect_err("expected queue backpressure");
+        assert!(matches!(err, TineError::BudgetExceeded(_)));
 
         workspace.shutdown().await.expect("failed to shut down workspace");
     }

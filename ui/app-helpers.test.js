@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   activeBranchPathCellIds,
+  describeExecutionProgress,
   fileQuery,
   normalizeFileTreePath,
   normalizeSavedExperimentTreePayload,
@@ -93,4 +94,84 @@ test("normalizeSavedExperimentTreePayload preserves legacy id-only compatibility
       id: "tree_1",
     },
   );
+});
+
+test("describeExecutionProgress surfaces queue positions for queued executions", () => {
+  assert.deepEqual(
+    describeExecutionProgress({ phase: "queued", queue_position: 3 }, "queued"),
+    {
+      label: "Queued #3",
+      message: "Queued. Position 3.",
+      active: true,
+    },
+  );
+});
+
+test("describeExecutionProgress prefers detailed lifecycle phases over generic running", () => {
+  assert.deepEqual(
+    describeExecutionProgress({ phase: "preparing_environment", status: "running" }, "running"),
+    {
+      label: "Preparing environment",
+      message: "Preparing environment…",
+      active: true,
+    },
+  );
+});
+
+test("describeExecutionProgress treats cancellation_requested as active work", () => {
+  assert.deepEqual(
+    describeExecutionProgress(
+      { phase: "cancellation_requested", status: "running" },
+      "running",
+    ),
+    {
+      label: "Cancelling",
+      message: "Cancelling…",
+      active: true,
+    },
+  );
+});
+
+test("describeExecutionProgress treats serializing_artifacts as active work", () => {
+  assert.deepEqual(
+    describeExecutionProgress(
+      { phase: "serializing_artifacts", status: "running" },
+      "running",
+    ),
+    {
+      label: "Serializing artifacts",
+      message: "Serializing artifacts…",
+      active: true,
+    },
+  );
+});
+
+test("describeExecutionProgress renders retrying as active work", () => {
+  assert.deepEqual(
+    describeExecutionProgress({ phase: "retrying", status: "running" }, "running"),
+    {
+      label: "Retrying",
+      message: "Retrying…",
+      active: true,
+    },
+  );
+});
+
+test("describeExecutionProgress renders timed_out as terminal work", () => {
+  assert.deepEqual(
+    describeExecutionProgress({ phase: "timed_out", status: "timed_out" }, "running"),
+    {
+      label: "Timed out",
+      message: "Timed out",
+      active: false,
+    },
+  );
+});
+
+test("describeExecutionProgress falls back to simple cell status when no snapshot exists", () => {
+  assert.deepEqual(describeExecutionProgress(null, "failed"), {
+    label: "Failed",
+    message: "Failed",
+    active: false,
+  });
 });

@@ -1,11 +1,5 @@
 # Tine
 
-[![PyPI version](https://img.shields.io/pypi/v/tine?label=PyPI)](https://pypi.org/project/tine/)
-[![CI](https://img.shields.io/github/actions/workflow/status/tinelabs/tine/ci.yml?branch=main&label=CI)](https://github.com/tinelabs/tine/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/tinelabs/tine)](https://github.com/tinelabs/tine/blob/main/LICENSE)
-[![Python](https://img.shields.io/pypi/pyversions/tine)](https://pypi.org/project/tine/)
-[![GitHub release](https://img.shields.io/github/v/release/tinelabs/tine?label=Release)](https://github.com/tinelabs/tine/releases)
-
 A branching notebook runtime for AI and humans.
 
 Tine is a local-first execution engine where notebooks branch like code. Run work in the browser, connect an agent through MCP, and keep both attached to the same fast local runtime.

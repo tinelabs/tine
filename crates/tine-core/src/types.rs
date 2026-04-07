@@ -719,6 +719,137 @@ pub struct BranchTargetInspection {
     pub replay_prefix_before_target: Vec<CellId>,
 }
 
+/// Submission status returned immediately after an execution is accepted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionSubmissionStatus {
+    Accepted,
+}
+
+/// Canonical execution lifecycle phase.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPhase {
+    Queued,
+    PreparingEnvironment,
+    AcquiringRuntime,
+    ReplayingContext,
+    Running,
+    CancellationRequested,
+    SerializingArtifacts,
+    Completed,
+    Failed,
+    Cancelled,
+    TimedOut,
+    Retrying,
+    Rejected,
+}
+
+impl Default for ExecutionPhase {
+    fn default() -> Self {
+        Self::Queued
+    }
+}
+
+/// High-level execution status exposed by status polling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionLifecycleStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    TimedOut,
+    Rejected,
+}
+
+impl Default for ExecutionLifecycleStatus {
+    fn default() -> Self {
+        Self::Queued
+    }
+}
+
+/// High-level target shape returned in an accepted execution envelope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionSubmissionTargetKind {
+    Cell,
+    Branch,
+}
+
+/// Submission-time target metadata for an accepted execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionSubmissionTarget {
+    pub kind: ExecutionSubmissionTargetKind,
+    pub tree_id: ExperimentTreeId,
+    pub branch_id: BranchId,
+    #[serde(default)]
+    pub cell_id: Option<CellId>,
+}
+
+/// Immediate response returned when an execution has been durably accepted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionAccepted {
+    pub execution_id: ExecutionId,
+    pub status: ExecutionSubmissionStatus,
+    pub phase: ExecutionPhase,
+    pub target: ExecutionSubmissionTarget,
+    #[serde(default)]
+    pub queue_position: Option<u64>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl ExecutionAccepted {
+    pub fn for_cell(
+        execution_id: ExecutionId,
+        tree_id: ExperimentTreeId,
+        branch_id: BranchId,
+        cell_id: CellId,
+        created_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            execution_id,
+            status: ExecutionSubmissionStatus::Accepted,
+            phase: ExecutionPhase::Queued,
+            target: ExecutionSubmissionTarget {
+                kind: ExecutionSubmissionTargetKind::Cell,
+                tree_id,
+                branch_id,
+                cell_id: Some(cell_id),
+            },
+            queue_position: None,
+            created_at,
+        }
+    }
+
+    pub fn for_branch(
+        execution_id: ExecutionId,
+        tree_id: ExperimentTreeId,
+        branch_id: BranchId,
+        created_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            execution_id,
+            status: ExecutionSubmissionStatus::Accepted,
+            phase: ExecutionPhase::Queued,
+            target: ExecutionSubmissionTarget {
+                kind: ExecutionSubmissionTargetKind::Branch,
+                tree_id,
+                branch_id,
+                cell_id: None,
+            },
+            queue_position: None,
+            created_at,
+        }
+    }
+
+    pub fn with_queue_position(mut self, queue_position: Option<u64>) -> Self {
+        self.queue_position = queue_position;
+        self
+    }
+}
+
 /// Overall execution status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionStatus {
@@ -731,6 +862,14 @@ pub struct ExecutionStatus {
     pub target_kind: Option<ExecutionTargetKind>,
     #[serde(default)]
     pub target: Option<ExecutionTargetRef>,
+    #[serde(default)]
+    pub status: ExecutionLifecycleStatus,
+    #[serde(default)]
+    pub phase: ExecutionPhase,
+    #[serde(default)]
+    pub queue_position: Option<u64>,
+    #[serde(default)]
+    pub cancellation_requested_at: Option<DateTime<Utc>>,
     pub node_statuses: HashMap<NodeId, NodeStatus>,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,

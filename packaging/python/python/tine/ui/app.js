@@ -35,6 +35,7 @@ import {
 } from "https://esm.sh/lucide-preact@0.511.0";
 import {
   activeBranchPathCellIds,
+  describeExecutionProgress,
   fileQuery,
   normalizeFileTreePath,
   pickActiveBranchId,
@@ -316,15 +317,6 @@ function hasDesktopBridge() {
   return typeof resolveDesktopInvoke() === "function";
 }
 
-function slugifyProjectName(name) {
-  const slug = String(name || "")
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  return slug || "new-project";
-}
-
 function previewTypeForPath(path) {
   const ext = String(path || "")
     .split(".")
@@ -333,19 +325,6 @@ function previewTypeForPath(path) {
   if (["csv", "tsv"].includes(ext)) return "csv";
   if (["png", "jpg", "jpeg", "gif", "svg", "webp"].includes(ext)) return "image";
   return "text";
-}
-
-function joinProjectPath(base, leaf) {
-  const trimmedBase = String(base || "").trim().replace(/[\\/]+$/, "");
-  if (!trimmedBase) return leaf;
-  return `${trimmedBase}/${leaf}`;
-}
-
-function suggestProjectDir(baseDir, name) {
-  if (!baseDir) return "";
-  const trimmedName = String(name || "").trim();
-  if (!trimmedName) return baseDir;
-  return joinProjectPath(baseDir, slugifyProjectName(trimmedName));
 }
 
 const api = {
@@ -463,6 +442,7 @@ const store = createStore({
   cellDisplays: {},
   activePollIds: {},
   executionTargets: {},
+  executionStatuses: {},
   activeCellExecutions: {},
   treeRuntimeStates: {},
   sidebarTab: "experiments",
@@ -543,6 +523,14 @@ function nodeStatusToCellStatus(status) {
   }
 }
 
+function isTerminalExecutionStatus(status) {
+  const lifecycle = String(status?.status || "").trim().toLowerCase();
+  if (["completed", "failed", "cancelled", "timed_out", "rejected"].includes(lifecycle)) {
+    return true;
+  }
+  return Boolean(status?.finished_at);
+}
+
 function applyExecutionStatusSnapshot(execId, status, fallbackTarget = null) {
   if (!execId || !status) return;
   const currentTarget = store.get().executionTargets?.[execId] || null;
@@ -554,10 +542,17 @@ function applyExecutionStatusSnapshot(execId, status, fallbackTarget = null) {
   store.set((s) => {
     const cellStatuses = { ...s.cellStatuses };
     const executionTargets = { ...s.executionTargets };
+    const executionStatuses = { ...s.executionStatuses };
     executionTargets[execId] = {
       treeId,
       branchId,
       targetKind,
+    };
+    executionStatuses[execId] = {
+      ...status,
+      tree_id: treeId,
+      branch_id: branchId,
+      target_kind: targetKind,
     };
     for (const nodeId of nodeIds) {
       const cellKey = runtimeCellKey({
@@ -573,6 +568,7 @@ function applyExecutionStatusSnapshot(execId, status, fallbackTarget = null) {
       ...s,
       cellStatuses,
       executionTargets,
+      executionStatuses,
     };
   });
 }
@@ -739,7 +735,9 @@ function cancelTrackedExecution(execId) {
       return s;
     const activePollIds = { ...s.activePollIds, [execId]: false };
     const executionTargets = { ...s.executionTargets };
+    const executionStatuses = { ...s.executionStatuses };
     delete executionTargets[execId];
+    delete executionStatuses[execId];
     const activeCellExecutions = { ...s.activeCellExecutions };
     for (const [cellKey, currentExecId] of Object.entries(
       activeCellExecutions,
@@ -750,6 +748,7 @@ function cancelTrackedExecution(execId) {
       ...s,
       activePollIds,
       executionTargets,
+      executionStatuses,
       activeCellExecutions,
     };
   });
@@ -761,7 +760,9 @@ function finishTrackedExecution(execId) {
     const activePollIds = { ...s.activePollIds };
     delete activePollIds[execId];
     const executionTargets = { ...s.executionTargets };
+    const executionStatuses = { ...s.executionStatuses };
     delete executionTargets[execId];
+    delete executionStatuses[execId];
     const activeCellExecutions = { ...s.activeCellExecutions };
     for (const [cellKey, currentExecId] of Object.entries(
       activeCellExecutions,
@@ -772,12 +773,13 @@ function finishTrackedExecution(execId) {
       ...s,
       activePollIds,
       executionTargets,
+      executionStatuses,
       activeCellExecutions,
     };
   });
 }
 
-function registerExecution(execId, treeId, nodeIds, target = null) {
+function registerExecution(execId, treeId, nodeIds, target = null, status = null) {
   if (!execId || !treeId) return;
   const targetNodeIds = nodeIds || [];
   store.set((s) => {
@@ -790,6 +792,8 @@ function registerExecution(execId, treeId, nodeIds, target = null) {
         targetKind: "experiment_tree_branch",
       },
     };
+    const executionStatuses = { ...s.executionStatuses };
+    if (status) executionStatuses[execId] = { ...status };
     const activeCellExecutions = { ...s.activeCellExecutions };
     const cellLogs = { ...s.cellLogs };
     const executionTarget = executionTargets[execId] || null;
@@ -809,6 +813,7 @@ function registerExecution(execId, treeId, nodeIds, target = null) {
       ...s,
       activePollIds,
       executionTargets,
+      executionStatuses,
       activeCellExecutions,
       cellLogs,
     };
@@ -847,7 +852,7 @@ async function runSelectedExecution(ae, activeTree, selectedBranch) {
       treeId: activeTree.id,
       branchId: targetBranchId,
       targetKind: "experiment_tree_branch",
-    });
+    }, r);
   }
 }
 
@@ -883,7 +888,8 @@ async function runAllBranchesExecution(ae, activeTree) {
         treeId: activeTree.id,
         branchId: item.branch_id,
         targetKind: "experiment_tree_branch",
-      }
+      },
+      item,
     );
   }
   showToast("Running all branches");
@@ -1086,6 +1092,7 @@ function handleEvent(evt) {
       cellDisplays: { ...s.cellDisplays },
       activePollIds: { ...s.activePollIds },
       executionTargets: { ...s.executionTargets },
+      executionStatuses: { ...s.executionStatuses },
       activeCellExecutions: { ...s.activeCellExecutions },
       treeRuntimeStates: { ...s.treeRuntimeStates },
     };
@@ -1232,6 +1239,7 @@ function handleEvent(evt) {
       case "ExecutionCompleted":
         delete ns.activePollIds[d.execution_id];
         delete ns.executionTargets[d.execution_id];
+        delete ns.executionStatuses[d.execution_id];
         for (const [cellKey, currentExecId] of Object.entries(
           ns.activeCellExecutions,
         )) {
@@ -1248,6 +1256,7 @@ function handleEvent(evt) {
       case "ExecutionFailed":
         delete ns.activePollIds[d.execution_id];
         delete ns.executionTargets[d.execution_id];
+        delete ns.executionStatuses[d.execution_id];
         for (const [cellKey, currentExecId] of Object.entries(
           ns.activeCellExecutions,
         )) {
@@ -1430,7 +1439,7 @@ async function pollExecution(execId, runtimeId, nodeIds) {
           return { ...s, cellStatuses };
         });
       }
-      if (st.finished_at) {
+      if (isTerminalExecutionStatus(st)) {
         const nodes = liveNodes;
         for (const nid of nodes) {
           try {
@@ -1674,6 +1683,13 @@ function Cell({
   const [unsaved, setUnsaved] = useState(false);
   const status = useStore((s) => s.cellStatuses[key] || "idle");
   const logs = useStore((s) => s.cellLogs[key]);
+  const executionProgress = useStore((s) => {
+    const execId = s.activeCellExecutions[key] || null;
+    return describeExecutionProgress(
+      execId ? s.executionStatuses?.[execId] || null : null,
+      s.cellStatuses[key] || "idle",
+    );
+  });
   const saveT = useRef(null);
   const latestCode = useRef(code);
   const saveInFlight = useRef(null);
@@ -1777,76 +1793,7 @@ function Cell({
     [],
   );
 
-  const ensureBranchContext = useCallback(async () => {
-    if (isTreeExecutionRuntime) {
-      return true;
-    }
-    if (treeContext && activeTree) {
-      const branchId = treeExecutionBranchId;
-      const branchById = new Map(
-        (activeTree.branches || []).map((branch) => [branch.id, branch]),
-      );
-      const lineage = [];
-      let current = branchById.get(branchId);
-      while (current) {
-        lineage.unshift(current);
-        current = current.parent_branch_id
-          ? branchById.get(current.parent_branch_id)
-          : null;
-      }
-
-      const warmIds = [];
-      for (let i = 0; i < lineage.length; i += 1) {
-        const branch = lineage[i];
-        const next = lineage[i + 1] || null;
-        const order = branch.cell_order || [];
-        if (next?.branch_point_cell_id) {
-          const stopIdx = order.indexOf(next.branch_point_cell_id);
-          if (stopIdx >= 0) warmIds.push(...order.slice(0, stopIdx + 1));
-          continue;
-        }
-        warmIds.push(...order.slice(0, index));
-      }
-
-      for (const warmId of warmIds) {
-        if (warmId === nid) continue;
-        const warmKey = runtimeCellKey({ treeId: treeContext.treeId, branchId, nodeId: warmId });
-        store.set((s) => ({
-          ...s,
-          cellStatuses: { ...s.cellStatuses, [warmKey]: "running" },
-        }));
-        try {
-          const result = await api.executeTreeCell(treeContext.treeId, branchId, warmId);
-          recordExecutionResult(warmKey, result?.logs);
-        } catch (e) {
-          termLog(`Warm branch context: ${e}`, "error");
-          store.set((s) => ({
-            ...s,
-            cellStatuses: { ...s.cellStatuses, [warmKey]: "failed" },
-            cellLogs: {
-              ...s.cellLogs,
-              [warmKey]: {
-                ...mergeLogs(s.cellLogs[warmKey]),
-                error: { ename: "RunError", evalue: String(e), traceback: [] },
-              },
-            },
-          }));
-          return false;
-        }
-      }
-      return true;
-    }
-    return true;
-  }, [
-    treeContext,
-    activeTree,
-    runtimePid,
-    nid,
-    index,
-    pipeline,
-    recordExecutionResult,
-    isTreeExecutionRuntime,
-  ]);
+  const ensureBranchContext = useCallback(async () => true, []);
 
   const onChange = useCallback(
     (c) => {
@@ -1870,16 +1817,21 @@ function Cell({
     cancelTrackedExecution(store.get().activeCellExecutions[key]);
     store.set((s) => ({
       ...s,
-      cellStatuses: { ...s.cellStatuses, [key]: "running" },
+      cellStatuses: { ...s.cellStatuses, [key]: "queued" },
       cellLogs: { ...s.cellLogs, [key]: emptyLogs() },
     }));
     try {
       const r = await api.executeTreeCell(
-          treeContext.treeId,
-          treeExecutionBranchId,
-          nid,
-        );
-      recordExecutionResult(key, r?.logs);
+        treeContext.treeId,
+        treeExecutionBranchId,
+        nid,
+      );
+      if (!r?.execution_id) throw new Error("missing execution id");
+      registerExecution(r.execution_id, treeContext.treeId, [nid], {
+        treeId: treeContext.treeId,
+        branchId: treeExecutionBranchId,
+        targetKind: "experiment_tree_branch",
+      }, r);
     } catch (e) {
       termLog(`Run: ${e}`, "error");
       store.set((s) => ({
@@ -1898,7 +1850,6 @@ function Cell({
     nid,
     key,
     flushSave,
-    ensureBranchContext,
     recordExecutionResult,
     readOnly,
     runtimePid,
@@ -2032,7 +1983,7 @@ function Cell({
             : status === "failed" || status === "save_error"
               ? "✗"
               : status === "cached"
-                ? "⚡"
+                ? "✓"
                 : status === "timeout"
                   ? "⏱"
                   : "○";
@@ -2049,19 +2000,15 @@ function Cell({
   const statusLabel =
     status === "saving"
       ? "Saving"
-      : status === "queued"
-        ? "Queued"
-        : status === "running"
-          ? "Running"
-          : status === "done"
-            ? "Done"
-            : status === "failed" || status === "save_error"
+      : status === "done"
+        ? "Done"
+        : status === "cached"
+          ? "Cached"
+          : status === "timeout"
+            ? "Timed out"
+            : status === "save_error"
               ? "Failed"
-              : status === "cached"
-                ? "Cached"
-                : status === "timeout"
-                  ? "Timed out"
-                  : "Idle";
+              : executionProgress.label;
   const statusIndicator =
     status === "running" || status === "queued" || status === "saving"
       ? html`<span
@@ -2180,7 +2127,7 @@ function Cell({
           </div>
         </div>
 
-        ${renderOutput(logs, index, status)}
+        ${renderOutput(logs, index, status, executionProgress)}
       </div>
       ${showBranchHandle && !readOnly
         ? html`<button
@@ -2199,7 +2146,7 @@ function Cell({
   `;
 }
 
-function renderOutput(logs, idx, status) {
+function renderOutput(logs, idx, status, executionProgress = null) {
   const safeLogs = logs || emptyLogs();
   const hasRenderableContent = !!(
     safeLogs.stdout ||
@@ -2214,8 +2161,9 @@ function renderOutput(logs, idx, status) {
 
   let statusMessage = null;
   if (!hasRenderableContent) {
-    if (status === "queued") statusMessage = "Queued…";
-    else if (status === "running") statusMessage = "Running…";
+    if (status === "queued" || status === "running") {
+      statusMessage = executionProgress?.message || (status === "queued" ? "Queued…" : "Running…");
+    }
     else if (status === "timeout") statusMessage = "Execution timed out.";
     else if (status === "save_error")
       statusMessage = "Code could not be saved.";
@@ -3557,17 +3505,14 @@ function Dashboard() {
   const [showForm, setShowForm] = useState(false);
   const [name, setName] = useState("");
   const [baseDir, setBaseDir] = useState("");
-  const [customPath, setCustomPath] = useState("");
   const [desc, setDesc] = useState("");
   const [defaultProjectsDir, setDefaultProjectsDir] = useState("");
-  const [useCustomPath, setUseCustomPath] = useState(false);
   const [pickerSource, setPickerSource] = useState(() =>
     hasDesktopBridge() ? "desktop" : null,
   );
   const supportsNativePicker =
     pickerSource === "desktop" || pickerSource === "server";
   const resolvedBaseDir = baseDir || defaultProjectsDir || "";
-  const resolvedProjectDir = suggestProjectDir(resolvedBaseDir, name);
   const [submitAttempted, setSubmitAttempted] = useState(false);
   const [formError, setFormError] = useState("");
   const nameError = submitAttempted && !name.trim() ? "Project name is required." : "";
@@ -3626,14 +3571,14 @@ function Dashboard() {
   const create = async () => {
     setSubmitAttempted(true);
     setFormError("");
-    if (!name.trim() || !resolvedBaseDir.trim() || !resolvedProjectDir.trim()) {
+    if (!name.trim() || !resolvedBaseDir.trim()) {
       return;
     }
     try {
       const created = await api.createProject({
         name: name.trim(),
         description: desc.trim() || null,
-        workspace_dir: resolvedProjectDir.trim(),
+        workspace_dir: resolvedBaseDir.trim(),
       });
       const project = await api.project(created.id);
       setName("");
@@ -3791,7 +3736,7 @@ function Dashboard() {
                       <button
                         class="form-btn create btn btn-primary project-submit-btn"
                         onClick=${create}
-                        disabled=${!name.trim() || !resolvedBaseDir.trim() || !resolvedProjectDir.trim()}
+                        disabled=${!name.trim() || !resolvedBaseDir.trim()}
                       >
                         Create Project
                       </button>

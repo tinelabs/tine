@@ -138,36 +138,30 @@ class TineApiClient:
         self,
         experiment_id: str,
         branch_id: str,
-    ) -> str:
-        response = self._post_json(
+    ) -> dict[str, Any]:
+        return self._post_json(
             f"/api/experiment-trees/{experiment_id}/branches/{branch_id}/execute", None
         )
-        return self._require(response, "execution_id")
 
     def execute_cell_in_experiment_tree_branch(
         self,
         experiment_id: str,
         branch_id: str,
         cell_id: str,
-    ) -> tuple[str, dict[str, Any]]:
-        response = self._post_json(
+    ) -> dict[str, Any]:
+        return self._post_json(
             f"/api/experiment-trees/{experiment_id}/branches/{branch_id}/cells/{cell_id}/execute",
             None,
         )
-        return self._require(response, "execution_id"), self._require(response, "logs")
 
     def execute_all_branches_in_experiment_tree(
         self,
         experiment_id: str,
-    ) -> list[tuple[str, str]]:
+    ) -> list[dict[str, Any]]:
         response = self._post_json(
             f"/api/experiment-trees/{experiment_id}/execute-all-branches", None
         )
-        executions = self._require(response, "executions")
-        return [
-            (self._require(item, "branch_id"), self._require(item, "execution_id"))
-            for item in executions
-        ]
+        return self._require(response, "executions")
 
     def cancel(self, execution_id: str) -> None:
         self._post_no_content(f"/api/executions/{execution_id}/cancel", None)

@@ -23,8 +23,8 @@ use tine_api::Workspace;
 use tine_api::{export_branch_as_ipynb, export_branch_as_python};
 use tine_core::{
     BranchId, BranchTargetInspection, CellDef, CellId, CellRuntimeState, ExecutionId,
-    ExecutionStatus, ExperimentTreeDef, ExperimentTreeId, NodeCode, NodeLogs, ProjectDef,
-    ProjectId, RevisionId, SlotName, TreeRuntimeState, WorkspaceApi,
+    ExecutionAccepted, ExecutionStatus, ExperimentTreeDef, ExperimentTreeId, NodeCode,
+    NodeLogs, ProjectDef, ProjectId, RevisionId, SlotName, TreeRuntimeState, WorkspaceApi,
 };
 
 use crate::file_watcher::start_file_watcher;
@@ -172,6 +172,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(move_experiment_tree_branch_cell),
         )
         .route(
+            "/api/experiment-trees/{id}/branches/{branch_id}/cells/{cell_id}",
+            axum::routing::delete(delete_experiment_tree_branch_cell),
+        )
+        .route(
             "/api/experiment-trees/{id}/branches/{branch_id}/cells/{cell_id}/execute",
             post(execute_experiment_tree_branch_cell),
         )
@@ -188,6 +192,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(execute_experiment_tree_branch),
         )
         .route(
+            "/api/experiment-trees/{id}/execute-all-branches",
+            post(execute_all_experiment_tree_branches),
+        )
+        .route(
             "/api/experiment-trees/{id}/branches/{branch_id}/export.py",
             get(export_experiment_tree_branch_python),
         )
@@ -195,22 +203,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/experiment-trees/{id}/branches/{branch_id}/export.ipynb",
             get(export_experiment_tree_branch_ipynb),
         )
-        .route(
-            "/api/experiment-trees/{id}/execute-all-branches",
-            post(execute_all_experiment_tree_branches),
-        )
-        .route(
-            "/api/experiment-trees/{id}/branches/{branch_id}/cells/{cell_id}",
-            axum::routing::delete(delete_experiment_tree_branch_cell),
-        )
-        // Execution
         .route("/api/executions/{id}", get(get_execution_status))
         .route("/api/executions/{id}/cancel", post(cancel_execution))
-        // File browser
         .route("/api/files", get(list_files_handler))
         .route("/api/files/read", get(read_file_handler))
         .route("/api/files/write", post(write_file_handler))
-        // Projects (experiments = trees within a project)
         .route(
             "/api/projects",
             get(list_projects).post(create_project_handler),
@@ -575,50 +572,61 @@ async fn delete_experiment_tree_branch(
 async fn execute_experiment_tree_branch_cell(
     State(state): State<Arc<AppState>>,
     Path((id, branch_id, cell_id)): Path<(String, String, String)>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let (exec_id, logs) = state
-        .workspace
-        .execute_cell_in_experiment_tree_branch(
-            &ExperimentTreeId::new(id),
-            &BranchId::new(branch_id),
-            &CellId::new(cell_id),
-        )
-        .await?;
-    Ok(Json(
-        serde_json::json!({ "execution_id": exec_id, "logs": logs }),
-    ))
+) -> Result<(StatusCode, Json<ExecutionAccepted>), AppError> {
+    let accepted = Workspace::submit_cell_execution_in_experiment_tree_branch(
+        state.workspace.clone(),
+        &ExperimentTreeId::new(id),
+        &BranchId::new(branch_id),
+        &CellId::new(cell_id),
+    )
+    .await?;
+    Ok((StatusCode::ACCEPTED, Json(accepted)))
 }
 
 async fn execute_experiment_tree_branch(
     State(state): State<Arc<AppState>>,
     Path((id, branch_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<(StatusCode, Json<ExecutionAccepted>), AppError> {
+    let tree_id = ExperimentTreeId::new(id);
+    let branch_id = BranchId::new(branch_id);
     let exec_id = state
         .workspace
-        .execute_branch_in_experiment_tree(&ExperimentTreeId::new(id), &BranchId::new(branch_id))
+        .execute_branch_in_experiment_tree(&tree_id, &branch_id)
         .await?;
-    Ok(Json(
-        serde_json::json!({ "execution_id": exec_id.as_str() }),
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ExecutionAccepted::for_branch(
+            exec_id,
+            tree_id,
+            branch_id,
+            chrono::Utc::now(),
+        )),
     ))
 }
 
 async fn execute_all_experiment_tree_branches(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let tree_id = ExperimentTreeId::new(id);
     let executions = state
         .workspace
-        .execute_all_branches_in_experiment_tree(&ExperimentTreeId::new(id))
+        .execute_all_branches_in_experiment_tree(&tree_id)
         .await?;
-    Ok(Json(serde_json::json!({
-        "executions": executions
-            .into_iter()
-            .map(|(branch_id, execution_id)| serde_json::json!({
-                "branch_id": branch_id.as_str(),
-                "execution_id": execution_id.as_str(),
-            }))
-            .collect::<Vec<_>>()
-    })))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "executions": executions
+                .into_iter()
+                .map(|(branch_id, execution_id)| ExecutionAccepted::for_branch(
+                    execution_id,
+                    tree_id.clone(),
+                    branch_id,
+                    chrono::Utc::now(),
+                ))
+                .collect::<Vec<_>>()
+        })),
+    ))
 }
 
 async fn export_experiment_tree_branch_python(
@@ -1673,9 +1681,10 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(warmup_execute.status(), StatusCode::OK);
-        let warmup_body: serde_json::Value = read_json(warmup_execute).await;
-        let warmup_execution_id = warmup_body["execution_id"].as_str().unwrap().to_string();
+        assert_eq!(warmup_execute.status(), StatusCode::ACCEPTED);
+        let warmup_body: ExecutionAccepted = read_json(warmup_execute).await;
+        assert_eq!(warmup_body.phase, tine_core::ExecutionPhase::Queued);
+        let warmup_execution_id = warmup_body.execution_id.as_str().to_string();
         let warmup_status = wait_for_finished_status(&app, &warmup_execution_id).await;
         assert_eq!(
             warmup_status
@@ -1708,12 +1717,15 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(execute.status(), StatusCode::OK);
-        let execute_body: serde_json::Value = read_json(execute).await;
-        let execution_id = execute_body["execution_id"].as_str().unwrap().to_string();
+        assert_eq!(execute.status(), StatusCode::ACCEPTED);
+        let execute_body: ExecutionAccepted = read_json(execute).await;
+        assert_eq!(execute_body.phase, tine_core::ExecutionPhase::Queued);
+        let execution_id = execute_body.execution_id.as_str().to_string();
 
         let status = wait_for_finished_status(&app, &execution_id).await;
         assert_eq!(status.tree_id.as_ref(), Some(&tree_id));
+        assert_eq!(status.status, tine_core::ExecutionLifecycleStatus::Completed);
+        assert_eq!(status.phase, tine_core::ExecutionPhase::Completed);
 
         let logs_response = send_json(
             &app,
@@ -2003,16 +2015,16 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(execute_cell.status(), StatusCode::OK);
-        let execute_cell_body: serde_json::Value = read_json(execute_cell).await;
-        assert!(execute_cell_body["execution_id"].is_string());
-        let logs: tine_core::NodeLogs =
-            serde_json::from_value(execute_cell_body["logs"].clone()).unwrap();
-        assert!(
-            logs.stdout.contains("85"),
-            "expected immediate branch-cell logs to include replayed branch value, got {:?}",
-            logs.stdout
-        );
+        assert_eq!(execute_cell.status(), StatusCode::ACCEPTED);
+        let execute_cell_body: ExecutionAccepted = read_json(execute_cell).await;
+        assert_eq!(execute_cell_body.phase, tine_core::ExecutionPhase::Queued);
+        let execution_id = execute_cell_body.execution_id.as_str().to_string();
+
+        let status = wait_for_finished_status(&app, &execution_id).await;
+        assert_eq!(status.tree_id.as_ref(), Some(&tree_id));
+        assert_eq!(status.branch_id.as_ref(), Some(&branch_id));
+        assert_eq!(status.status, tine_core::ExecutionLifecycleStatus::Completed);
+        assert_eq!(status.phase, tine_core::ExecutionPhase::Completed);
 
         let persisted_logs = send_json(
             &app,
@@ -2137,13 +2149,16 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(execute_branch.status(), StatusCode::OK);
-        let execute_branch_body: serde_json::Value = read_json(execute_branch).await;
-        let execution_id = execute_branch_body["execution_id"].as_str().unwrap();
+        assert_eq!(execute_branch.status(), StatusCode::ACCEPTED);
+        let execute_branch_body: ExecutionAccepted = read_json(execute_branch).await;
+        assert_eq!(execute_branch_body.phase, tine_core::ExecutionPhase::Queued);
+        let execution_id = execute_branch_body.execution_id.as_str();
 
         let status = wait_for_finished_status(&app, execution_id).await;
         assert_eq!(status.tree_id.as_ref(), Some(&tree_id));
         assert_eq!(status.branch_id.as_ref(), Some(&branch_id));
+        assert_eq!(status.status, tine_core::ExecutionLifecycleStatus::Completed);
+        assert_eq!(status.phase, tine_core::ExecutionPhase::Completed);
         assert_eq!(
             status
                 .node_statuses
@@ -2224,9 +2239,9 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(warmup_execute.status(), StatusCode::OK);
-        let warmup_body: serde_json::Value = read_json(warmup_execute).await;
-        let warmup_execution_id = warmup_body["execution_id"].as_str().unwrap().to_string();
+        assert_eq!(warmup_execute.status(), StatusCode::ACCEPTED);
+        let warmup_body: ExecutionAccepted = read_json(warmup_execute).await;
+        let warmup_execution_id = warmup_body.execution_id.as_str().to_string();
         let warmup_status = wait_for_finished_status(&app, &warmup_execution_id).await;
         assert_eq!(
             warmup_status
@@ -2278,9 +2293,9 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(execute.status(), StatusCode::OK);
-        let execute_body: serde_json::Value = read_json(execute).await;
-        let execution_id = execute_body["execution_id"].as_str().unwrap().to_string();
+        assert_eq!(execute.status(), StatusCode::ACCEPTED);
+        let execute_body: ExecutionAccepted = read_json(execute).await;
+        let execution_id = execute_body.execution_id.as_str().to_string();
 
         let mut saw_running = false;
         for _ in 0..240 {
@@ -2317,8 +2332,49 @@ mod tests {
         .await;
         assert_eq!(cancel.status(), StatusCode::OK);
 
-        let status = wait_for_finished_status(&app, &execution_id).await;
+        let requested_status = send_json(
+            &app,
+            Method::GET,
+            &format!("/api/executions/{execution_id}"),
+            None,
+        )
+        .await;
+        assert_eq!(requested_status.status(), StatusCode::OK);
+        let requested_status: tine_core::ExecutionStatus = read_json(requested_status).await;
+        assert_eq!(requested_status.status, tine_core::ExecutionLifecycleStatus::Running);
+        assert_eq!(requested_status.phase, tine_core::ExecutionPhase::CancellationRequested);
+        assert!(requested_status.cancellation_requested_at.is_some());
+
+        let cancel_again = send_json(
+            &app,
+            Method::POST,
+            &format!("/api/executions/{execution_id}/cancel"),
+            None,
+        )
+        .await;
+        assert_eq!(cancel_again.status(), StatusCode::OK);
+
+        let status = loop {
+            let status = send_json(
+                &app,
+                Method::GET,
+                &format!("/api/executions/{execution_id}"),
+                None,
+            )
+            .await;
+            assert_eq!(status.status(), StatusCode::OK);
+            let status: tine_core::ExecutionStatus = read_json(status).await;
+            if status.finished_at.is_some()
+                && status.status == tine_core::ExecutionLifecycleStatus::Cancelled
+            {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
         assert_eq!(status.tree_id.as_ref(), Some(&tree_id));
+        assert_eq!(status.status, tine_core::ExecutionLifecycleStatus::Cancelled);
+        assert_eq!(status.phase, tine_core::ExecutionPhase::Cancelled);
+        assert!(status.cancellation_requested_at.is_some());
         assert_eq!(
             status.node_statuses.get(&tine_core::NodeId::new("cell_1")),
             Some(&tine_core::NodeStatus::Interrupted)

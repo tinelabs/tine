@@ -40,6 +40,9 @@ pub enum TineError {
     #[error("execution {0} was interrupted")]
     ExecutionInterrupted(ExecutionId),
 
+    #[error("execution timed out after {timeout_secs}s")]
+    ExecutionTimedOut { timeout_secs: u64 },
+
     // -- Kernel errors --
     #[error("kernel startup failed for runtime {runtime_id}: {message}")]
     KernelStartupFailed { runtime_id: String, message: String },

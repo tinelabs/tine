@@ -178,6 +178,22 @@ pub struct KernelManager {
 }
 
 impl KernelManager {
+    #[cfg(unix)]
+    fn send_sigint(&self, owner_id: &KernelOwnerId) -> Option<u32> {
+        let pid = self.kernel_pids.get(owner_id).map(|entry| *entry.value());
+        if let Some(pid) = pid {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGINT);
+            }
+        }
+        pid
+    }
+
+    #[cfg(not(unix))]
+    fn send_sigint(&self, _owner_id: &KernelOwnerId) -> Option<u32> {
+        None
+    }
+
     fn normalize_workspace_root(workspace_root: &Path) -> PathBuf {
         let candidate = if workspace_root.is_absolute() {
             workspace_root.to_path_buf()
@@ -846,15 +862,18 @@ impl KernelManager {
         let mut consecutive_timeouts: u32 = 0;
 
         loop {
-            if start.elapsed() > timeout {
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                let pid = self.send_sigint(owner_id);
+                warn!(owner = %owner_id, pid = ?pid, timeout_secs, "execution exceeded timeout; interrupting kernel");
                 kernel.set_executing(false);
-                return Err(TineError::KernelComm(format!(
-                    "execution timed out after {}s",
-                    timeout_secs
-                )));
+                return Err(TineError::ExecutionTimedOut { timeout_secs });
             }
 
-            let msg = match tokio::time::timeout(Duration::from_secs(30), kernel.iopub.read()).await
+            let remaining = timeout.saturating_sub(elapsed);
+            let read_timeout = remaining.min(Duration::from_secs(30));
+
+            let msg = match tokio::time::timeout(read_timeout, kernel.iopub.read()).await
             {
                 Ok(Ok(msg)) => {
                     consecutive_timeouts = 0; // reset on success
@@ -867,6 +886,12 @@ impl KernelManager {
                     return Err(TineError::KernelComm(format!("iopub read error: {}", e)));
                 }
                 Err(_) => {
+                    if start.elapsed() >= timeout {
+                        let pid = self.send_sigint(owner_id);
+                        warn!(owner = %owner_id, pid = ?pid, timeout_secs, "execution timed out while waiting for iopub; interrupting kernel");
+                        kernel.set_executing(false);
+                        return Err(TineError::ExecutionTimedOut { timeout_secs });
+                    }
                     consecutive_timeouts += 1;
                     if consecutive_timeouts >= MAX_IOPUB_TIMEOUTS {
                         error!(
@@ -1047,15 +1072,8 @@ print("__tine_isolation__" + _pf_json.dumps(_pf_result, sort_keys=True))
 
     /// Interrupt a running kernel via the control channel.
     async fn interrupt_owned(&self, owner_id: &KernelOwnerId) -> TineResult<()> {
-        let pid = self.kernel_pids.get(owner_id).map(|entry| *entry.value());
+        let pid = self.send_sigint(owner_id);
         info!(owner = %owner_id, pid = ?pid, "interrupting kernel");
-
-        #[cfg(unix)]
-        if let Some(pid) = pid {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGINT);
-            }
-        }
 
         if let Some(kernel) = self
             .kernels

@@ -270,7 +270,7 @@ class McpServer:
             ),
             _tool(
                 "execute_branch",
-                "Execute one branch in an experiment tree and return the execution id. `branch_id` defaults to `main` when omitted.",
+                "Execute one branch in an experiment tree and return the accepted execution envelope, including execution id, submission status, phase, and queue position when available. `branch_id` defaults to `main` when omitted.",
                 {
                     "type": "object",
                     "properties": {
@@ -282,7 +282,7 @@ class McpServer:
             ),
             _tool(
                 "execute_cell",
-                "Execute one cell in a branch and return execution id plus logs. `branch_id` defaults to `main` when omitted.",
+                "Execute one cell in a branch and return the accepted execution envelope, including execution id, submission status, phase, and queue position when available. `branch_id` defaults to `main` when omitted.",
                 {
                     "type": "object",
                     "properties": {
@@ -295,7 +295,7 @@ class McpServer:
             ),
             _tool(
                 "execute_all_branches",
-                "Execute all branches in one experiment tree.",
+                "Execute all branches in one experiment tree and return accepted execution envelopes for each submitted branch.",
                 {
                     "type": "object",
                     "properties": {"experiment_id": {"type": "string"}},
@@ -313,7 +313,7 @@ class McpServer:
             ),
             _tool(
                 "status",
-                "Get execution status and node progress for an execution id.",
+                "Get durable execution status, lifecycle phase, and node progress for an execution id.",
                 {
                     "type": "object",
                     "properties": {"execution_id": {"type": "string"}},
@@ -322,7 +322,7 @@ class McpServer:
             ),
             _tool(
                 "wait_for_execution",
-                "Wait for an execution to finish by polling the existing status API. Returns the final status object and whether the wait timed out.",
+                "Wait for an execution to reach a terminal lifecycle state by polling the status API. Returns the latest status object plus whether the wait itself timed out.",
                 {
                     "type": "object",
                     "properties": {
@@ -515,31 +515,28 @@ class McpServer:
             if name == "execute_branch":
                 experiment_id = _required_string(args, "experiment_id")
                 branch_id = _optional_string(args, "branch_id") or "main"
-                execution_id = self.api.execute_branch_in_experiment_tree(
+                execution = self.api.execute_branch_in_experiment_tree(
                     experiment_id, branch_id
                 )
-                return self._text_ok(f"Execution started: {execution_id}")
+                return self._ok(execution)
             if name == "execute_cell":
                 experiment_id = _required_string(args, "experiment_id")
                 branch_id = _optional_string(args, "branch_id") or "main"
                 cell_id = _required_string(args, "cell_id")
-                execution_id, logs = self.api.execute_cell_in_experiment_tree_branch(
+                execution = self.api.execute_cell_in_experiment_tree_branch(
                     experiment_id, branch_id, cell_id
                 )
-                return self._ok({"execution_id": execution_id, "logs": logs})
+                return self._ok(execution)
             if name == "execute_all_branches":
                 experiment_id = _required_string(args, "experiment_id")
                 executions = self.api.execute_all_branches_in_experiment_tree(experiment_id)
-                return self._ok(
-                    [
-                        {"branch_id": branch_id, "execution_id": execution_id}
-                        for branch_id, execution_id in executions
-                    ]
-                )
+                return self._ok(executions)
             if name == "cancel":
                 execution_id = _required_string(args, "execution_id")
                 self.api.cancel(execution_id)
-                return self._text_ok(f"Execution {execution_id} cancelled")
+                return self._text_ok(
+                    f"Cancellation requested for execution {execution_id}"
+                )
             if name == "status":
                 return self._ok(self.api.status(_required_string(args, "execution_id")))
             if name == "wait_for_execution":
@@ -549,9 +546,14 @@ class McpServer:
                 timeout_secs = 30 if timeout_secs is None else timeout_secs
                 poll_interval_ms = 500 if poll_interval_ms is None else poll_interval_ms
                 deadline = time.monotonic() + timeout_secs
+                def _is_terminal_execution_status(status: dict[str, Any]) -> bool:
+                    lifecycle = str(status.get("status") or "").strip().lower()
+                    if lifecycle in {"completed", "failed", "cancelled", "timed_out", "rejected"}:
+                        return True
+                    return status.get("finished_at") is not None
                 while True:
                     status = self.api.status(execution_id)
-                    if status.get("finished_at") is not None:
+                    if _is_terminal_execution_status(status):
                         return self._ok({"timed_out": False, "status": status})
                     if time.monotonic() >= deadline:
                         return self._ok({"timed_out": True, "status": status})

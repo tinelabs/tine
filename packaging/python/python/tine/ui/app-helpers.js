@@ -69,3 +69,62 @@ export function normalizeSavedExperimentTreePayload(payload, fallbackDefinition 
   }
   return fallbackDefinition;
 }
+
+const EXECUTION_PHASE_LABELS = {
+  queued: "Queued",
+  preparing_environment: "Preparing environment",
+  acquiring_runtime: "Acquiring runtime",
+  replaying_context: "Replaying context",
+  running: "Running",
+  cancellation_requested: "Cancelling",
+  serializing_artifacts: "Serializing artifacts",
+  retrying: "Retrying",
+  completed: "Completed",
+  failed: "Failed",
+  cancelled: "Cancelled",
+  rejected: "Rejected",
+  timed_out: "Timed out",
+};
+
+export function describeExecutionProgress(status, fallbackCellStatus = "idle") {
+  const phase = String(status?.phase || "").trim().toLowerCase();
+  const lifecycle = String(status?.status || "").trim().toLowerCase();
+  const fallback = String(fallbackCellStatus || "").trim().toLowerCase();
+  const effectivePhase = phase || lifecycle || fallback;
+  const queuePosition = Number(status?.queue_position);
+  const hasQueuePosition = Number.isFinite(queuePosition) && queuePosition > 0;
+
+  if (effectivePhase === "queued") {
+    return {
+      label: hasQueuePosition ? `Queued #${queuePosition}` : "Queued",
+      message: hasQueuePosition ? `Queued. Position ${queuePosition}.` : "Queued…",
+      active: true,
+    };
+  }
+
+  const label =
+    EXECUTION_PHASE_LABELS[effectivePhase] ||
+    (effectivePhase
+      ? effectivePhase
+          .split("_")
+          .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+          .join(" ")
+      : "Idle");
+
+  const active = [
+    "preparing_environment",
+    "acquiring_runtime",
+    "replaying_context",
+    "cancellation_requested",
+    "serializing_artifacts",
+    "retrying",
+    "running",
+    "saving",
+  ].includes(effectivePhase);
+
+  return {
+    label,
+    message: active ? `${label}…` : label,
+    active,
+  };
+}

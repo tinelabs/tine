@@ -21,9 +21,9 @@ use tokio::time::{timeout, Duration};
 use tine_api::Workspace;
 use tine_core::{
     ArtifactKey, ArtifactMetadata, ArtifactStore, BranchDef, BranchId, BranchIsolationMode,
-    CellDef, CellId, CellRuntimeState, ExecutionEvent, ExecutionMode, ExperimentTreeDef,
-    ExperimentTreeId, NodeCode, NodeId, NodeStatus, ProjectDef, ProjectId, SlotName, TineError,
-    TineResult, TreeKernelState, WorkspaceApi,
+    CellDef, CellId, CellRuntimeState, ExecutionEvent, ExecutionLifecycleStatus, ExecutionMode,
+    ExperimentTreeDef, ExperimentTreeId, NodeCode, NodeId, NodeStatus, ProjectDef, ProjectId,
+    SlotName, TineError, TineResult, TreeKernelState, WorkspaceApi,
 };
 
 // ---------------------------------------------------------------------------
@@ -85,10 +85,6 @@ impl ArtifactStore for MemoryArtifactStore {
             .collect())
     }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[serial]
@@ -364,17 +360,40 @@ async fn open_temp_workspace() -> (TempDir, Workspace) {
     (tmp, ws)
 }
 
+async fn open_temp_workspace_with_max_kernels(max_kernels: usize) -> (TempDir, Workspace) {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    eprintln!("[e2e] opening temp workspace at {}", tmp.path().display());
+    let store: Arc<dyn ArtifactStore> = Arc::new(MemoryArtifactStore::new());
+    let ws = Workspace::open(tmp.path().to_path_buf(), store, max_kernels)
+        .await
+        .expect("failed to open workspace");
+    (tmp, ws)
+}
+
+fn is_terminal_execution_status(status: &tine_core::ExecutionStatus) -> bool {
+    matches!(
+        status.status,
+        ExecutionLifecycleStatus::Completed
+            | ExecutionLifecycleStatus::Failed
+            | ExecutionLifecycleStatus::Cancelled
+            | ExecutionLifecycleStatus::TimedOut
+            | ExecutionLifecycleStatus::Rejected
+    ) || status.finished_at.is_some()
+}
+
 async fn wait_for_execution_finished(
     ws: &Workspace,
     exec_id: &tine_core::ExecutionId,
 ) -> tine_core::ExecutionStatus {
     for attempt in 0..480 {
         let status = ws.status(exec_id).await.unwrap();
-        if status.finished_at.is_some() {
+        if is_terminal_execution_status(&status) {
             eprintln!(
-                "[e2e] execution {} finished on poll {} tree={:?} branch={:?} states={:?}",
+                "[e2e] execution {} reached terminal state on poll {} status={:?} phase={:?} tree={:?} branch={:?} states={:?}",
                 exec_id.as_str(),
                 attempt,
+                status.status,
+                status.phase,
                 status.tree_id,
                 status.branch_id,
                 status.node_statuses
@@ -383,9 +402,12 @@ async fn wait_for_execution_finished(
         }
         if attempt == 0 || attempt % 10 == 0 {
             eprintln!(
-                "[e2e] waiting for execution {} poll={} tree={:?} branch={:?} states={:?}",
+                "[e2e] waiting for execution {} poll={} status={:?} phase={:?} queue={:?} tree={:?} branch={:?} states={:?}",
                 exec_id.as_str(),
                 attempt,
+                status.status,
+                status.phase,
+                status.queue_position,
                 status.tree_id,
                 status.branch_id,
                 status.node_statuses
@@ -395,8 +417,11 @@ async fn wait_for_execution_finished(
     }
     let final_status = ws.status(exec_id).await.unwrap();
     panic!(
-        "execution {} did not finish in time; tree={:?} branch={:?} states={:?}",
+        "execution {} did not finish in time; status={:?} phase={:?} queue={:?} tree={:?} branch={:?} states={:?}",
         exec_id.as_str(),
+        final_status.status,
+        final_status.phase,
+        final_status.queue_position,
         final_status.tree_id,
         final_status.branch_id,
         final_status.node_statuses
@@ -413,11 +438,13 @@ async fn wait_for_node_running(
         if matches!(status.node_statuses.get(node_id), Some(NodeStatus::Running)) {
             return status;
         }
-        if status.finished_at.is_some() {
+        if is_terminal_execution_status(&status) {
             panic!(
-                "execution {} finished before node {} reached running; states={:?}",
+                "execution {} finished before node {} reached running; status={:?} phase={:?} states={:?}",
                 exec_id.as_str(),
                 node_id.as_str(),
+                status.status,
+                status.phase,
                 status.node_statuses
             );
         }
@@ -438,6 +465,7 @@ async fn wait_for_node_running(
         exec_id.as_str()
     );
 }
+
 fn trivial_tree() -> ExperimentTreeDef {
     let tree_id = ExperimentTreeId::new("trivial");
     let branch_id = BranchId::new("main");
@@ -462,6 +490,50 @@ fn trivial_tree() -> ExperimentTreeDef {
             name: "step1".to_string(),
             code: NodeCode {
                 source: "step1 = 42\n".to_string(),
+                language: "python".to_string(),
+            },
+            upstream_cell_ids: vec![],
+            declared_outputs: vec![SlotName::new("step1")],
+            cache: false,
+            map_over: None,
+            map_concurrency: None,
+            timeout_secs: None,
+            tags: HashMap::new(),
+            revision_id: None,
+            state: CellRuntimeState::Clean,
+        }],
+        environment: Default::default(),
+        execution_mode: ExecutionMode::Parallel,
+        budget: None,
+        created_at: chrono::Utc::now(),
+    }
+}
+
+fn slow_single_cell_tree() -> ExperimentTreeDef {
+    let tree_id = ExperimentTreeId::new("slow-tree");
+    let branch_id = BranchId::new("main");
+    let cell_id = CellId::new("step1");
+    ExperimentTreeDef {
+        id: tree_id.clone(),
+        name: "slow-tree".to_string(),
+        project_id: None,
+        root_branch_id: branch_id.clone(),
+        branches: vec![BranchDef {
+            id: branch_id.clone(),
+            name: "main".to_string(),
+            parent_branch_id: None,
+            branch_point_cell_id: None,
+            cell_order: vec![cell_id.clone()],
+            display: HashMap::new(),
+        }],
+        cells: vec![CellDef {
+            id: cell_id.clone(),
+            tree_id: tree_id.clone(),
+            branch_id: branch_id.clone(),
+            name: "slow-step".to_string(),
+            code: NodeCode {
+                source: "import time\ntime.sleep(1.5)\nstep1 = 1\nprint('slow root done', flush=True)"
+                    .to_string(),
                 language: "python".to_string(),
             },
             upstream_cell_ids: vec![],
@@ -632,6 +704,108 @@ async fn test_execute_branch_path_persists_target_metadata_and_tree_logs() {
     );
 }
 
+#[tokio::test]
+#[serial]
+#[ignore]
+async fn test_execute_all_branches_exposes_queued_lifecycle_status() {
+    let (_tmp, ws) = open_temp_workspace_with_max_kernels(1).await;
+    let tree = slow_single_cell_tree();
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+
+    let branch_a = ws
+        .create_branch_in_experiment_tree(
+            &tree_id,
+            &tree.root_branch_id,
+            "branch-a".to_string(),
+            &CellId::new("step1"),
+            CellDef {
+                id: CellId::new("branch_a_step"),
+                tree_id: tree_id.clone(),
+                branch_id: tree.root_branch_id.clone(),
+                name: "branch a step".to_string(),
+                code: NodeCode {
+                    source: "import time\ntime.sleep(1.5)\nbranch_a = step1 + 1\nprint('branch a done', flush=True)"
+                        .to_string(),
+                    language: "python".to_string(),
+                },
+                upstream_cell_ids: vec![CellId::new("step1")],
+                declared_outputs: vec![SlotName::new("branch_a")],
+                cache: false,
+                map_over: None,
+                map_concurrency: None,
+                timeout_secs: None,
+                tags: HashMap::new(),
+                revision_id: None,
+                state: CellRuntimeState::Clean,
+            },
+        )
+        .await
+        .unwrap();
+
+    let branch_b = ws
+        .create_branch_in_experiment_tree(
+            &tree_id,
+            &tree.root_branch_id,
+            "branch-b".to_string(),
+            &CellId::new("step1"),
+            CellDef {
+                id: CellId::new("branch_b_step"),
+                tree_id: tree_id.clone(),
+                branch_id: tree.root_branch_id.clone(),
+                name: "branch b step".to_string(),
+                code: NodeCode {
+                    source: "import time\ntime.sleep(1.5)\nbranch_b = step1 + 2\nprint('branch b done', flush=True)"
+                        .to_string(),
+                    language: "python".to_string(),
+                },
+                upstream_cell_ids: vec![CellId::new("step1")],
+                declared_outputs: vec![SlotName::new("branch_b")],
+                cache: false,
+                map_over: None,
+                map_concurrency: None,
+                timeout_secs: None,
+                tags: HashMap::new(),
+                revision_id: None,
+                state: CellRuntimeState::Clean,
+            },
+        )
+        .await
+        .unwrap();
+
+    let executions = ws
+        .execute_all_branches_in_experiment_tree(&tree_id)
+        .await
+        .unwrap();
+    assert_eq!(executions.len(), 3);
+    assert!(executions.iter().any(|(branch_id, _)| branch_id == &branch_a));
+    assert!(executions.iter().any(|(branch_id, _)| branch_id == &branch_b));
+
+    let mut saw_queued = false;
+    for _ in 0..40 {
+        let mut queued_positions = Vec::new();
+        for (_, exec_id) in &executions {
+            let status = ws.status(exec_id).await.unwrap();
+            if status.status == ExecutionLifecycleStatus::Queued {
+                assert_eq!(status.phase, tine_core::ExecutionPhase::Queued);
+                queued_positions.push(status.queue_position);
+            }
+        }
+        if !queued_positions.is_empty() {
+            assert!(queued_positions.iter().all(|position| position.is_some()));
+            saw_queued = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(saw_queued, "expected execute-all to expose queued executions");
+
+    for (_, exec_id) in &executions {
+        let status = wait_for_execution_finished(&ws, exec_id).await;
+        assert_eq!(status.status, ExecutionLifecycleStatus::Completed);
+        assert!(status.queue_position.is_none());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 9. Event subscription
 // ---------------------------------------------------------------------------
@@ -754,16 +928,13 @@ async fn test_namespace_guarded_run_all_emits_success_events() {
         .last_isolation_result
         .as_ref()
         .expect("expected isolation result to be recorded");
-    assert_eq!(runtime_state.kernel_state, TreeKernelState::NeedsReplay);
+    assert_eq!(runtime_state.kernel_state, TreeKernelState::Ready);
     assert!(runtime_state.materialized_path_cell_ids.is_empty());
     assert_eq!(runtime_state.last_prepared_cell_id, None);
-    assert!(!isolation_result.succeeded);
+    assert!(isolation_result.succeeded);
     assert!(
-        isolation_result
-            .contamination_signals
-            .iter()
-            .any(|signal| signal == "session_overlap"),
-        "expected guarded overlap to be recorded as contamination, got {:?}",
+        isolation_result.contamination_signals.is_empty(),
+        "expected queued guarded run-all to avoid contamination, got {:?}",
         isolation_result.contamination_signals
     );
 }
@@ -821,12 +992,12 @@ async fn test_prepare_context_reuses_guarded_baseline_without_bumping_epoch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn test_namespace_guarded_contamination_marks_replay_and_emits_fallback() {
+async fn test_namespace_guarded_queued_run_all_avoids_contamination_fallback() {
     let (_tmp, ws) = open_temp_workspace().await;
     let tree_id = ws.save_experiment_tree(&two_cell_tree()).await.unwrap().id;
     let root_branch_id = tine_core::BranchId::new("main");
 
-    let _branch_id = ws
+    let branch_id = ws
         .create_branch_in_experiment_tree(
             &tree_id,
             &root_branch_id,
@@ -879,81 +1050,84 @@ async fn test_namespace_guarded_contamination_marks_replay_and_emits_fallback() 
         .await
         .unwrap();
     for (_, exec_id) in &executions {
-        wait_for_execution_finished(&ws, exec_id).await;
-    }
-    for _ in 0..120 {
-        if ws
-            .get_tree_runtime_state(&tree_id)
-            .await
-            .is_some_and(|state| state.kernel_state == TreeKernelState::NeedsReplay)
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let status = wait_for_execution_finished(&ws, exec_id).await;
+        assert_eq!(status.status, ExecutionLifecycleStatus::Completed);
     }
 
-    let (saw_contamination, saw_fallback) = timeout(Duration::from_secs(30), async {
+    let (saw_attempted, saw_success, saw_contamination, saw_fallback) = timeout(Duration::from_secs(5), async {
+        let mut saw_attempted = HashSet::new();
+        let mut saw_success = HashSet::new();
         let mut saw_contamination = false;
         let mut saw_fallback = false;
         loop {
-            match rx.recv().await {
-                Ok(ExecutionEvent::ContaminationDetected {
+            match timeout(Duration::from_millis(250), rx.recv()).await {
+                Err(_) => break,
+                Ok(Ok(ExecutionEvent::IsolationAttempted {
+                    tree_id: evt_tree,
+                    branch_id,
+                    ..
+                })) if evt_tree == tree_id => {
+                    saw_attempted.insert(branch_id);
+                }
+                Ok(Ok(ExecutionEvent::IsolationSucceeded {
+                    tree_id: evt_tree,
+                    branch_id,
+                    ..
+                })) if evt_tree == tree_id => {
+                    saw_success.insert(branch_id);
+                }
+                Ok(Ok(ExecutionEvent::ContaminationDetected {
                     tree_id: evt_tree,
                     signals,
                     ..
-                }) if evt_tree == tree_id => {
+                })) if evt_tree == tree_id => {
                     saw_contamination |= !signals.is_empty();
                 }
-                Ok(ExecutionEvent::FallbackRestartTriggered {
+                Ok(Ok(ExecutionEvent::FallbackRestartTriggered {
                     tree_id: evt_tree,
                     reason,
                     ..
-                }) if evt_tree == tree_id => {
+                })) if evt_tree == tree_id => {
                     saw_fallback |= reason == "contamination_detected";
                 }
-                Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                Ok(Ok(_)) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
                     panic!(
                         "lagged while waiting for guarded contamination events, skipped {skipped}"
                     );
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                     panic!("event channel closed before guarded contamination signals arrived");
                 }
             }
-
-            if saw_contamination && saw_fallback {
-                break (saw_contamination, saw_fallback);
-            }
         }
+
+        (saw_attempted, saw_success, saw_contamination, saw_fallback)
     })
     .await
-    .expect("timed out waiting for guarded contamination/fallback events");
+    .expect("timed out waiting for guarded isolation events");
 
     assert!(
-        saw_contamination,
-        "expected contamination event for guarded branch"
+        saw_attempted.contains(&root_branch_id) && saw_attempted.contains(&branch_id),
+        "expected guarded isolation attempts for both branches, got {:?}",
+        saw_attempted
     );
     assert!(
-        saw_fallback,
-        "expected fallback restart for contaminated guarded branch"
+        saw_success.contains(&root_branch_id) && saw_success.contains(&branch_id),
+        "expected guarded isolation success for both branches, got {:?}",
+        saw_success
     );
+    assert!(!saw_contamination, "did not expect contamination under queued run-all");
+    assert!(!saw_fallback, "did not expect fallback restart under queued run-all");
 
     let runtime_state = ws.get_tree_runtime_state(&tree_id).await.unwrap();
     let isolation_result = runtime_state
         .last_isolation_result
         .as_ref()
-        .expect("expected contamination result to be recorded");
-    assert!(!isolation_result.succeeded);
-    assert!(
-        isolation_result
-            .contamination_signals
-            .iter()
-            .any(|signal| signal == "session_overlap" || signal == "session_end_failed"),
-        "expected guarded contamination signal, got {:?}",
-        isolation_result.contamination_signals
-    );
-    assert_eq!(runtime_state.kernel_state, TreeKernelState::NeedsReplay);
+        .expect("expected guarded isolation result to be recorded");
+    assert!(isolation_result.succeeded);
+    assert!(isolation_result.contamination_signals.is_empty());
+    assert_eq!(runtime_state.kernel_state, TreeKernelState::Ready);
     assert!(runtime_state.materialized_path_cell_ids.is_empty());
     assert_eq!(runtime_state.last_prepared_cell_id, None);
 }
@@ -2229,6 +2403,80 @@ async fn test_delete_cell_from_experiment_tree_branch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn test_workspace_branch_execution_times_out_and_preserves_timeout_status() {
+    let (_tmp, ws) = open_temp_workspace().await;
+    let tree_id = ExperimentTreeId::new("timeout-api-tree");
+    let branch_id = BranchId::new("main");
+    let cell_id = CellId::new("step1");
+    let tree = ExperimentTreeDef {
+        id: tree_id.clone(),
+        name: "timeout-api-tree".to_string(),
+        project_id: None,
+        root_branch_id: branch_id.clone(),
+        branches: vec![BranchDef {
+            id: branch_id.clone(),
+            name: "main".to_string(),
+            parent_branch_id: None,
+            branch_point_cell_id: None,
+            cell_order: vec![cell_id.clone()],
+            display: HashMap::new(),
+        }],
+        cells: vec![CellDef {
+            id: cell_id.clone(),
+            tree_id: tree_id.clone(),
+            branch_id: branch_id.clone(),
+            name: "step1".to_string(),
+            code: NodeCode {
+                source: "import time\nprint('starting timeout api test', flush=True)\ntime.sleep(5)\nprint('should not reach timeout api end', flush=True)\nstep1 = 42\n".to_string(),
+                language: "python".to_string(),
+            },
+            upstream_cell_ids: vec![],
+            declared_outputs: vec![SlotName::new("step1")],
+            cache: false,
+            map_over: None,
+            map_concurrency: None,
+            timeout_secs: Some(1),
+            tags: HashMap::new(),
+            revision_id: None,
+            state: CellRuntimeState::Clean,
+        }],
+        environment: Default::default(),
+        execution_mode: ExecutionMode::Parallel,
+        budget: None,
+        created_at: chrono::Utc::now(),
+    };
+    ws.save_experiment_tree(&tree).await.unwrap();
+
+    let execution_id = ws
+        .execute_branch_in_experiment_tree(&tree_id, &branch_id)
+        .await
+        .unwrap();
+
+    let final_status = wait_for_execution_finished(&ws, &execution_id).await;
+    assert_eq!(final_status.tree_id.as_ref(), Some(&tree_id));
+    assert_eq!(final_status.status, ExecutionLifecycleStatus::TimedOut);
+    assert_eq!(final_status.phase, tine_core::ExecutionPhase::TimedOut);
+    assert_eq!(
+        final_status.node_statuses.get(&NodeId::new("step1")),
+        Some(&NodeStatus::Failed)
+    );
+
+    let logs = ws
+        .logs_for_tree_cell(&tree_id, &branch_id, &cell_id)
+        .await
+        .unwrap();
+    assert!(
+        !logs.stdout.contains("should not reach timeout api end"),
+        "unexpected post-timeout stdout in {:?}",
+        logs.stdout
+    );
+    let error = logs.error.expect("expected timeout error details");
+    assert_eq!(error.ename, "ExecutionTimedOut");
+    assert!(error.evalue.contains("timed out after 1s"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn test_workspace_cancel_interrupts_running_branch_and_preserves_partial_logs() {
     let (_tmp, ws) = open_temp_workspace().await;
     let tree_id = ExperimentTreeId::new("cancel-api-tree");
@@ -2284,8 +2532,24 @@ async fn test_workspace_cancel_interrupts_running_branch_and_preserves_partial_l
 
     ws.cancel(&execution_id).await.unwrap();
 
-    let final_status = wait_for_execution_finished(&ws, &execution_id).await;
+    let requested_status = ws.status(&execution_id).await.unwrap();
+    assert_eq!(requested_status.status, ExecutionLifecycleStatus::Running);
+    assert_eq!(requested_status.phase, tine_core::ExecutionPhase::CancellationRequested);
+    assert!(requested_status.cancellation_requested_at.is_some());
+
+    ws.cancel(&execution_id).await.unwrap();
+
+    let final_status = loop {
+        let status = ws.status(&execution_id).await.unwrap();
+        if status.finished_at.is_some()
+            && status.status == ExecutionLifecycleStatus::Cancelled
+        {
+            break status;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
     assert_eq!(final_status.tree_id.as_ref(), Some(&tree_id));
+    assert!(final_status.cancellation_requested_at.is_some());
     assert_eq!(
         final_status.node_statuses.get(&NodeId::new("step1")),
         Some(&NodeStatus::Interrupted)
@@ -2304,5 +2568,97 @@ async fn test_workspace_cancel_interrupts_running_branch_and_preserves_partial_l
         !logs.stdout.contains("should not reach cancel api end"),
         "unexpected post-cancel stdout in {:?}",
         logs.stdout
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_mark_tree_kernel_lost_fails_running_branch_execution() {
+    let (_tmp, ws) = open_temp_workspace().await;
+    let tree_id = ExperimentTreeId::new("kernel-lost-api-tree");
+    let branch_id = BranchId::new("main");
+    let cell_id = CellId::new("step1");
+    let tree = ExperimentTreeDef {
+        id: tree_id.clone(),
+        name: "kernel-lost-api-tree".to_string(),
+        project_id: None,
+        root_branch_id: branch_id.clone(),
+        branches: vec![BranchDef {
+            id: branch_id.clone(),
+            name: "main".to_string(),
+            parent_branch_id: None,
+            branch_point_cell_id: None,
+            cell_order: vec![cell_id.clone()],
+            display: HashMap::new(),
+        }],
+        cells: vec![CellDef {
+            id: cell_id.clone(),
+            tree_id: tree_id.clone(),
+            branch_id: branch_id.clone(),
+            name: "step1".to_string(),
+            code: NodeCode {
+                source: "import time\nprint('starting kernel lost api test', flush=True)\ntime.sleep(20)\nprint('should not reach kernel lost api end', flush=True)\nstep1 = 42\n".to_string(),
+                language: "python".to_string(),
+            },
+            upstream_cell_ids: vec![],
+            declared_outputs: vec![SlotName::new("step1")],
+            cache: false,
+            map_over: None,
+            map_concurrency: None,
+            timeout_secs: None,
+            tags: HashMap::new(),
+            revision_id: None,
+            state: CellRuntimeState::Clean,
+        }],
+        environment: Default::default(),
+        execution_mode: ExecutionMode::Parallel,
+        budget: None,
+        created_at: chrono::Utc::now(),
+    };
+    ws.save_experiment_tree(&tree).await.unwrap();
+
+    let execution_id = ws
+        .execute_branch_in_experiment_tree(&tree_id, &branch_id)
+        .await
+        .unwrap();
+
+    let running_status = wait_for_node_running(&ws, &execution_id, &NodeId::new("step1")).await;
+    assert_eq!(running_status.tree_id.as_ref(), Some(&tree_id));
+
+    let lost_state = ws.mark_tree_kernel_lost(&tree_id).await.unwrap();
+    if let Some(state) = lost_state {
+        assert_eq!(state.kernel_state, TreeKernelState::KernelLost);
+    }
+
+    let final_status = wait_for_execution_finished(&ws, &execution_id).await;
+    assert_eq!(final_status.tree_id.as_ref(), Some(&tree_id));
+    assert_eq!(final_status.status, ExecutionLifecycleStatus::Failed);
+    assert_eq!(final_status.phase, tine_core::ExecutionPhase::Failed);
+    assert!(
+        matches!(
+            final_status.node_statuses.get(&NodeId::new("step1")),
+            Some(NodeStatus::Interrupted) | Some(NodeStatus::Failed)
+        ),
+        "expected running node to be terminated by kernel loss, got {:?}",
+        final_status.node_statuses
+    );
+
+    let logs = ws
+        .logs_for_tree_cell(&tree_id, &branch_id, &cell_id)
+        .await
+        .unwrap();
+    assert!(
+        !logs.stdout.contains("should not reach kernel lost api end"),
+        "unexpected post-kernel-lost stdout in {:?}",
+        logs.stdout
+    );
+    let error = logs.error.expect("expected kernel lost error details");
+    assert!(
+        matches!(
+            error.ename.as_str(),
+            "KernelLost" | "ExecutionError" | "KeyboardInterrupt"
+        ),
+        "unexpected kernel-lost error kind {:?}",
+        error
     );
 }

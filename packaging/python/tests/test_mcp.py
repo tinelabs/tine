@@ -23,6 +23,7 @@ class _Handler(BaseHTTPRequestHandler):
     last_update_cell_payload: dict[str, object] | None = None
     last_move_cell_payload: dict[str, object] | None = None
     deleted_path: str | None = None
+    cancel_requested = False
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/api/experiment-trees":
@@ -59,7 +60,43 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
         if self.path == "/api/executions/exec_1":
-            self._json(200, {"execution_id": "exec_1", "node_statuses": {}})
+            if type(self).cancel_requested:
+                self._json(
+                    200,
+                    {
+                        "execution_id": "exec_1",
+                        "status": "running",
+                        "phase": "cancellation_requested",
+                        "cancellation_requested_at": "2026-04-07T10:15:02Z",
+                        "node_statuses": {},
+                        "finished_at": None,
+                    },
+                )
+                return
+            self._json(
+                200,
+                {
+                    "execution_id": "exec_1",
+                    "status": "running",
+                    "phase": "running",
+                    "cancellation_requested_at": None,
+                    "node_statuses": {},
+                    "finished_at": None,
+                },
+            )
+            return
+        if self.path == "/api/executions/exec_timeout":
+            self._json(
+                200,
+                {
+                    "execution_id": "exec_timeout",
+                    "status": "timed_out",
+                    "phase": "timed_out",
+                    "cancellation_requested_at": None,
+                    "node_statuses": {"step1": "failed"},
+                    "finished_at": "2026-04-07T10:16:00Z",
+                },
+            )
             return
         self._json(404, {"error": "not found"})
 
@@ -96,7 +133,66 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             return
+        if self.path == "/api/experiment-trees/tree_1/branches/main/execute":
+            self._json(
+                202,
+                {
+                    "execution_id": "exec_branch_1",
+                    "status": "accepted",
+                    "phase": "queued",
+                    "target": {
+                        "kind": "branch",
+                        "tree_id": "tree_1",
+                        "branch_id": "main",
+                        "cell_id": None,
+                    },
+                    "queue_position": None,
+                    "created_at": "2026-04-07T10:15:00Z",
+                },
+            )
+            return
+        if self.path == "/api/experiment-trees/tree_1/branches/main/cells/cell_1/execute":
+            self._json(
+                202,
+                {
+                    "execution_id": "exec_cell_1",
+                    "status": "accepted",
+                    "phase": "queued",
+                    "target": {
+                        "kind": "cell",
+                        "tree_id": "tree_1",
+                        "branch_id": "main",
+                        "cell_id": "cell_1",
+                    },
+                    "queue_position": None,
+                    "created_at": "2026-04-07T10:15:01Z",
+                },
+            )
+            return
+        if self.path == "/api/experiment-trees/tree_1/execute-all-branches":
+            self._json(
+                202,
+                {
+                    "executions": [
+                        {
+                            "execution_id": "exec_branch_1",
+                            "status": "accepted",
+                            "phase": "queued",
+                            "target": {
+                                "kind": "branch",
+                                "tree_id": "tree_1",
+                                "branch_id": "main",
+                                "cell_id": None,
+                            },
+                            "queue_position": None,
+                            "created_at": "2026-04-07T10:15:00Z",
+                        }
+                    ]
+                },
+            )
+            return
         if self.path == "/api/executions/exec_1/cancel":
+            type(self).cancel_requested = True
             self.send_response(200)
             self.end_headers()
             return
@@ -149,6 +245,7 @@ class McpPythonTests(unittest.TestCase):
         _Handler.last_update_cell_payload = None
         _Handler.last_move_cell_payload = None
         _Handler.deleted_path = None
+        _Handler.cancel_requested = False
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -283,7 +380,60 @@ class McpPythonTests(unittest.TestCase):
 
         status = self.server.call_tool("status", {"execution_id": "exec_1"})
         self.assertFalse(status.is_error)
-        self.assertEqual(json.loads(status.content[0]["text"])["execution_id"], "exec_1")
+        status_payload = json.loads(status.content[0]["text"])
+        self.assertEqual(status_payload["execution_id"], "exec_1")
+        self.assertEqual(status_payload["status"], "running")
+        self.assertEqual(status_payload["phase"], "running")
+        self.assertIsNone(status_payload["cancellation_requested_at"])
+
+        cancel = self.server.call_tool("cancel", {"execution_id": "exec_1"})
+        self.assertFalse(cancel.is_error)
+        self.assertEqual(
+            cancel.content[0]["text"],
+            "Cancellation requested for execution exec_1",
+        )
+
+        requested_status = self.server.call_tool("status", {"execution_id": "exec_1"})
+        self.assertFalse(requested_status.is_error)
+        requested_status_payload = json.loads(requested_status.content[0]["text"])
+        self.assertEqual(requested_status_payload["status"], "running")
+        self.assertEqual(requested_status_payload["phase"], "cancellation_requested")
+        self.assertEqual(
+            requested_status_payload["cancellation_requested_at"],
+            "2026-04-07T10:15:02Z",
+        )
+
+        execute_branch = self.server.call_tool(
+            "execute_branch", {"experiment_id": "tree_1", "branch_id": "main"}
+        )
+        self.assertFalse(execute_branch.is_error)
+        execute_branch_payload = json.loads(execute_branch.content[0]["text"])
+        self.assertEqual(execute_branch_payload["execution_id"], "exec_branch_1")
+        self.assertEqual(execute_branch_payload["status"], "accepted")
+        self.assertEqual(execute_branch_payload["phase"], "queued")
+        self.assertEqual(execute_branch_payload["target"]["kind"], "branch")
+
+        execute_cell = self.server.call_tool(
+            "execute_cell",
+            {"experiment_id": "tree_1", "branch_id": "main", "cell_id": "cell_1"},
+        )
+        self.assertFalse(execute_cell.is_error)
+        execute_cell_payload = json.loads(execute_cell.content[0]["text"])
+        self.assertEqual(execute_cell_payload["execution_id"], "exec_cell_1")
+        self.assertEqual(execute_cell_payload["target"]["kind"], "cell")
+        self.assertEqual(execute_cell_payload["target"]["cell_id"], "cell_1")
+
+        execute_all = self.server.call_tool("execute_all_branches", {"experiment_id": "tree_1"})
+        self.assertFalse(execute_all.is_error)
+        execute_all_payload = json.loads(execute_all.content[0]["text"])
+        self.assertEqual(len(execute_all_payload), 1)
+        self.assertEqual(execute_all_payload[0]["execution_id"], "exec_branch_1")
+
+        timed_out_status = self.server.call_tool("status", {"execution_id": "exec_timeout"})
+        self.assertFalse(timed_out_status.is_error)
+        timed_out_status_payload = json.loads(timed_out_status.content[0]["text"])
+        self.assertEqual(timed_out_status_payload["status"], "timed_out")
+        self.assertEqual(timed_out_status_payload["phase"], "timed_out")
 
         waited = self.server.call_tool(
             "wait_for_execution",
@@ -293,6 +443,17 @@ class McpPythonTests(unittest.TestCase):
         waited_payload = json.loads(waited.content[0]["text"])
         self.assertTrue(waited_payload["timed_out"])
         self.assertEqual(waited_payload["status"]["execution_id"], "exec_1")
+        self.assertEqual(waited_payload["status"]["phase"], "cancellation_requested")
+
+        waited_timed_out = self.server.call_tool(
+            "wait_for_execution",
+            {"execution_id": "exec_timeout", "timeout_secs": 5, "poll_interval_ms": 50},
+        )
+        self.assertFalse(waited_timed_out.is_error)
+        waited_timed_out_payload = json.loads(waited_timed_out.content[0]["text"])
+        self.assertFalse(waited_timed_out_payload["timed_out"])
+        self.assertEqual(waited_timed_out_payload["status"]["status"], "timed_out")
+        self.assertEqual(waited_timed_out_payload["status"]["phase"], "timed_out")
 
     def test_create_experiment_populates_root_cell_and_saves_tree(self) -> None:
         created_tree = {
