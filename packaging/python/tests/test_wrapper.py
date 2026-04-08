@@ -117,6 +117,27 @@ class WrapperTests(unittest.TestCase):
 
             self.assertEqual(first, second)
 
+    def test_download_file_uses_certifi_ssl_context(self) -> None:
+        destination = Path(tempfile.mkdtemp()) / "artifact.bin"
+
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = None
+
+        with mock.patch("tine.runtime.certifi.where", return_value="/tmp/certifi.pem") as where_mock:
+            with mock.patch("tine.runtime.ssl.create_default_context", return_value="ssl-context") as context_mock:
+                with mock.patch("tine.runtime.urlopen", return_value=response) as urlopen_mock:
+                    with mock.patch("shutil.copyfileobj") as copy_mock:
+                        runtime.download_file("https://example.com/tine.tar.gz", destination)
+
+        where_mock.assert_called_once_with()
+        context_mock.assert_called_once_with(cafile="/tmp/certifi.pem")
+        urlopen_mock.assert_called_once_with(
+            "https://example.com/tine.tar.gz",
+            context="ssl-context",
+        )
+        copy_mock.assert_called_once()
+
     def test_fetches_windows_binary_from_zip_release_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as release_dir, tempfile.TemporaryDirectory() as cache_dir:
             release_root = Path(release_dir)
@@ -163,12 +184,13 @@ class WrapperTests(unittest.TestCase):
 
             with mock.patch.dict(os.environ, {"TINE_PACKAGE_VERSION": "0.1.0"}, clear=False):
                 with mock.patch.object(runtime, "__file__", str(module_file)):
-                    with mock.patch.object(
-                        runtime,
-                        "fetch_binary_release",
-                        side_effect=AssertionError("should not fetch release when local repo binary exists"),
-                    ):
-                        resolved = runtime.ensure_compatible_binary()
+                    with mock.patch.object(runtime, "package_root_path", return_value=repo_root / "empty-package"):
+                        with mock.patch.object(
+                            runtime,
+                            "fetch_binary_release",
+                            side_effect=AssertionError("should not fetch release when local repo binary exists"),
+                        ):
+                            resolved = runtime.ensure_compatible_binary()
 
             self.assertEqual(resolved.resolve(), binary.resolve())
 

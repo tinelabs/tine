@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tine"
-version = "0.1.5"
+version = "0.1.6"
 description = "Python wrapper and MCP package for the Tine runtime"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,7 +18,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
-dependencies = []
+dependencies = ["certifi>=2024.0.0"]
 
 [project.urls]
 GitHub = "https://github.com/tinelabs/tine"

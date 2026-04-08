@@ -4,6 +4,7 @@ import hashlib
 import os
 import platform
 import shutil
+import ssl
 import subprocess
 import tarfile
 import tempfile
@@ -13,6 +14,8 @@ from importlib import metadata, resources
 from pathlib import Path
 from urllib.parse import urljoin
 from urllib.request import urlopen
+
+import certifi
 
 
 @dataclass(frozen=True)
@@ -49,7 +52,7 @@ def package_version() -> str:
     try:
         return metadata.version("tine")
     except metadata.PackageNotFoundError:  # pragma: no cover - local source checkout
-        return "0.1.5-dev"
+        return "0.1.6-dev"
 
 
 def supported_target() -> SupportedTarget:
@@ -228,8 +231,12 @@ def fetch_binary_release(version: str | None = None) -> Path:
 
 
 def download_file(url: str, destination: Path) -> None:
-    with urlopen(url) as response, destination.open("wb") as handle:
+    with urlopen(url, context=download_ssl_context()) as response, destination.open("wb") as handle:
         shutil.copyfileobj(response, handle)
+
+
+def download_ssl_context() -> ssl.SSLContext:
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 def verify_checksum(archive_path: Path, checksum_path: Path) -> None:
