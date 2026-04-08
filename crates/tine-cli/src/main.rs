@@ -907,10 +907,9 @@ async fn run_doctor(config: &TineConfig) -> Result<(), Box<dyn std::error::Error
     }
 
     let env_manager = EnvironmentManager::new(config.workspace_dir.clone());
-    let uv_available = match env_manager.ensure_uv().await {
+    match env_manager.ensure_uv().await {
         Ok(()) => {
             print_doctor_check("uv (optional)", true, "available".to_string());
-            true
         }
         Err(error) => {
             print_doctor_check(
@@ -918,7 +917,6 @@ async fn run_doctor(config: &TineConfig) -> Result<(), Box<dyn std::error::Error
                 true,
                 format!("not installed; using stdlib venv/pip ({error})"),
             );
-            false
         }
     };
 
