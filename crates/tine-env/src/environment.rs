@@ -111,6 +111,14 @@ impl PythonCommand {
     }
 }
 
+fn supported_python_version(version: &str) -> bool {
+    let mut parts = version.split('.');
+    let major = parts.next().and_then(|part| part.parse::<u32>().ok());
+    let minor = parts.next().and_then(|part| part.parse::<u32>().ok());
+
+    matches!((major, minor), (Some(3), Some(minor)) if (10..=13).contains(&minor))
+}
+
 /// Manages Python environments for experiment kernels.
 pub struct EnvironmentManager {
     /// Path to the uv binary.
@@ -742,11 +750,24 @@ impl EnvironmentManager {
     }
 
     async fn resolve_python_command(&self, python_version: &str) -> TineResult<PythonCommand> {
+        let mut attempted = Vec::new();
+
+        for command in self.explicit_python_commands() {
+            attempted.push(command.display.clone());
+            match self
+                .python_command_matches_version(&command, python_version)
+                .await
+            {
+                Ok(true) => return Ok(command),
+                Ok(false) => {}
+                Err(_) => {}
+            }
+        }
+
         if let Some(command) = self.resolve_python_via_uv(python_version).await {
             return Ok(command);
         }
 
-        let mut attempted = Vec::new();
         for command in self.python_command_candidates(python_version) {
             attempted.push(command.display.clone());
             match self
@@ -760,10 +781,28 @@ impl EnvironmentManager {
         }
 
         Err(TineError::Config(format!(
-            "Python {} is not available. Tried {}",
+            "Python {}+ is not available. Tried {}",
             python_version,
             attempted.join(", ")
         )))
+    }
+
+    fn explicit_python_commands(&self) -> Vec<PythonCommand> {
+        let mut commands = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for key in ["TINE_PYTHON", "TINE_BUNDLED_PYTHON", "TINE_WRAPPER_PYTHON"] {
+            let Some(value) = std::env::var_os(key) else {
+                continue;
+            };
+            let path = PathBuf::from(value);
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            commands.push(PythonCommand::new(path, Vec::new()));
+        }
+
+        commands
     }
 
     async fn resolve_python_via_uv(&self, python_version: &str) -> Option<PythonCommand> {
@@ -794,32 +833,40 @@ impl EnvironmentManager {
             .to_string();
 
         let mut candidates = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        let mut push_candidate = |command: PythonCommand| {
+            let key = command.display.clone();
+            if seen.insert(key) {
+                candidates.push(command);
+            }
+        };
 
         if cfg!(windows) {
-            candidates.push(PythonCommand::new(
+            push_candidate(PythonCommand::new(
                 PathBuf::from("py"),
                 vec![format!("-{}", python_version)],
             ));
-            candidates.push(PythonCommand::new(
+            push_candidate(PythonCommand::new(
                 PathBuf::from("py"),
                 vec![format!("-{}", major)],
             ));
-            candidates.push(PythonCommand::new(
+            push_candidate(PythonCommand::new(
                 PathBuf::from(format!("python{}", python_version)),
                 Vec::new(),
             ));
-            candidates.push(PythonCommand::new(PathBuf::from("python"), Vec::new()));
+            push_candidate(PythonCommand::new(PathBuf::from("python"), Vec::new()));
         } else {
-            candidates.push(PythonCommand::new(
+            push_candidate(PythonCommand::new(
                 PathBuf::from(format!("python{}", python_version)),
                 Vec::new(),
             ));
-            candidates.push(PythonCommand::new(
+            push_candidate(PythonCommand::new(
                 PathBuf::from(format!("python{}", major)),
                 Vec::new(),
             ));
-            candidates.push(PythonCommand::new(PathBuf::from("python3"), Vec::new()));
-            candidates.push(PythonCommand::new(PathBuf::from("python"), Vec::new()));
+            push_candidate(PythonCommand::new(PathBuf::from("python3"), Vec::new()));
+            push_candidate(PythonCommand::new(PathBuf::from("python"), Vec::new()));
         }
 
         candidates
@@ -828,7 +875,7 @@ impl EnvironmentManager {
     async fn python_command_matches_version(
         &self,
         command: &PythonCommand,
-        python_version: &str,
+        _python_version: &str,
     ) -> TineResult<bool> {
         let mut probe = Command::new(&command.program);
         probe
@@ -845,7 +892,7 @@ impl EnvironmentManager {
         }
 
         let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(actual == python_version)
+        Ok(supported_python_version(&actual))
     }
 }
 
@@ -935,6 +982,59 @@ mod tests {
 
         assert!(manager.workspace_root.is_absolute());
         assert!(manager.workspace_root.ends_with(relative));
+    }
+
+    #[test]
+    fn supported_python_version_accepts_supported_range() {
+        assert!(supported_python_version("3.10"));
+        assert!(supported_python_version("3.11"));
+        assert!(supported_python_version("3.12"));
+        assert!(supported_python_version("3.13"));
+        assert!(!supported_python_version("3.9"));
+        assert!(!supported_python_version("3.14"));
+        assert!(!supported_python_version("2.7"));
+    }
+
+    #[test]
+    fn explicit_python_commands_prioritize_env_vars_without_duplicates() {
+        let manager = EnvironmentManager::new(PathBuf::from("/tmp/tine-workspace"));
+        let bundled = if cfg!(windows) {
+            r"C:\runtime\python.exe"
+        } else {
+            "/tmp/runtime/python/bin/python3"
+        };
+        let override_python = if cfg!(windows) {
+            r"C:\override\python.exe"
+        } else {
+            "/tmp/override/python3"
+        };
+
+        let previous_tine_python = std::env::var_os("TINE_PYTHON");
+        let previous_bundled = std::env::var_os("TINE_BUNDLED_PYTHON");
+        let previous_wrapper = std::env::var_os("TINE_WRAPPER_PYTHON");
+
+        std::env::set_var("TINE_PYTHON", override_python);
+        std::env::set_var("TINE_BUNDLED_PYTHON", bundled);
+        std::env::set_var("TINE_WRAPPER_PYTHON", bundled);
+        let commands = manager.explicit_python_commands();
+
+        match previous_tine_python {
+            Some(value) => std::env::set_var("TINE_PYTHON", value),
+            None => std::env::remove_var("TINE_PYTHON"),
+        }
+        match previous_bundled {
+            Some(value) => std::env::set_var("TINE_BUNDLED_PYTHON", value),
+            None => std::env::remove_var("TINE_BUNDLED_PYTHON"),
+        }
+        match previous_wrapper {
+            Some(value) => std::env::set_var("TINE_WRAPPER_PYTHON", value),
+            None => std::env::remove_var("TINE_WRAPPER_PYTHON"),
+        }
+
+        let displays: Vec<_> = commands.into_iter().map(|command| command.display).collect();
+        assert_eq!(displays.len(), 2);
+        assert_eq!(displays[0], override_python);
+        assert_eq!(displays[1], bundled);
     }
 
     #[test]

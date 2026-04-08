@@ -6,6 +6,7 @@ import platform
 import shutil
 import ssl
 import subprocess
+import sys
 import tarfile
 import tempfile
 import zipfile
@@ -27,6 +28,19 @@ class SupportedTarget:
     machine: str
     rust_target: str
     archive_ext: str = ".tar.gz"
+
+
+@dataclass(frozen=True)
+class ResolvedRuntime:
+    binary_path: Path
+    runtime_root: Path
+
+    @property
+    def bundled_python_path(self) -> Path | None:
+        candidate = bundled_python_path_for_root(self.runtime_root)
+        if candidate.is_file():
+            return candidate
+        return None
 
 
 _SUPPORTED_TARGETS: dict[tuple[str, str], SupportedTarget] = {
@@ -55,7 +69,7 @@ def package_version() -> str:
     try:
         return metadata.version("tine")
     except metadata.PackageNotFoundError:  # pragma: no cover - local source checkout
-        return "0.1.7-dev"
+        return "0.1.8-dev"
 
 
 def supported_target() -> SupportedTarget:
@@ -70,6 +84,16 @@ def supported_target() -> SupportedTarget:
 
 def binary_name() -> str:
     return "tine.exe" if platform.system() == "Windows" else "tine"
+
+
+def bundled_python_relative_path() -> Path:
+    if platform.system() == "Windows":
+        return Path("runtime") / "python" / "python.exe"
+    return Path("runtime") / "python" / "bin" / "python3"
+
+
+def bundled_python_path_for_root(runtime_root: Path) -> Path:
+    return runtime_root / bundled_python_relative_path()
 
 
 def release_base_url(version: str | None = None) -> str:
@@ -105,6 +129,7 @@ def expected_release_artifacts_for_target(
 
 def binary_candidates() -> list[Path]:
     candidates: list[Path] = []
+    prefer_release_artifacts = os.environ.get("TINE_RELEASE_BASE_URL") is not None
 
     env_bin = os.environ.get("TINE_BIN")
     if env_bin:
@@ -114,9 +139,10 @@ def binary_candidates() -> list[Path]:
     if env_bin_dir:
         candidates.append(Path(env_bin_dir) / binary_name())
 
-    candidates.extend(source_checkout_binary_candidates())
+    if not prefer_release_artifacts:
+        candidates.extend(source_checkout_binary_candidates())
 
-    if source_checkout_root() is None:
+    if not prefer_release_artifacts and source_checkout_root() is None:
         package_root = package_root_path()
         target = supported_target().rust_target
         candidates.append(package_root / "bin" / target / binary_name())
@@ -125,6 +151,10 @@ def binary_candidates() -> list[Path]:
     candidates.append(cached_binary_path())
 
     return candidates
+
+
+def runtime_root_for_binary(binary_path: Path) -> Path:
+    return binary_path.parent
 
 
 def package_root_path() -> Path:
@@ -174,11 +204,15 @@ def source_checkout_binary_candidates(module_file: Path | None = None) -> list[P
 
 
 def resolve_binary() -> Path:
+    return resolve_runtime().binary_path
+
+
+def resolve_runtime() -> ResolvedRuntime:
     for candidate in binary_candidates():
         if candidate.is_file() and os.access(candidate, os.X_OK):
-            return candidate
-    fetched = fetch_binary_release()
-    if fetched.is_file() and os.access(fetched, os.X_OK):
+            return ResolvedRuntime(candidate, runtime_root_for_binary(candidate))
+    fetched = fetch_runtime_release()
+    if fetched.binary_path.is_file() and os.access(fetched.binary_path, os.X_OK):
         return fetched
     expected = ", ".join(expected_release_artifacts())
     raise FileNotFoundError(
@@ -202,7 +236,7 @@ def read_binary_version(binary_path: Path) -> str:
 
 
 def ensure_compatible_binary(binary_path: Path | None = None) -> Path:
-    resolved = binary_path or resolve_binary()
+    resolved = binary_path or resolve_runtime().binary_path
     expected = package_version()
     actual = read_binary_version(resolved)
     if expected != actual:
@@ -213,19 +247,48 @@ def ensure_compatible_binary(binary_path: Path | None = None) -> Path:
     return resolved
 
 
+def ensure_compatible_runtime(binary_path: Path | None = None) -> ResolvedRuntime:
+    runtime = (
+        ResolvedRuntime(binary_path, runtime_root_for_binary(binary_path))
+        if binary_path is not None
+        else resolve_runtime()
+    )
+    expected = package_version()
+    actual = read_binary_version(runtime.binary_path)
+    if expected != actual:
+        raise RuntimeError(
+            f"Tine Python wrapper {expected} requires Tine engine {expected}, but found {actual}. "
+            "Reinstall `tine` so the Python package and Rust engine match."
+        )
+    return runtime
+
+
 def cached_binary_path(version: str | None = None) -> Path:
     resolved_version = version or package_version()
     target = supported_target()
     return cache_root() / "engine" / resolved_version / target.rust_target / binary_name()
 
 
-def fetch_binary_release(version: str | None = None) -> Path:
+def cached_runtime_root(version: str | None = None) -> Path:
     resolved_version = version or package_version()
-    destination = cached_binary_path(resolved_version)
-    if destination.is_file() and os.access(destination, os.X_OK):
-        return destination
+    target = supported_target()
+    return cache_root() / "engine" / resolved_version / target.rust_target
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
+
+def fetch_binary_release(version: str | None = None) -> Path:
+    return fetch_runtime_release(version).binary_path
+
+
+def fetch_runtime_release(version: str | None = None) -> ResolvedRuntime:
+    resolved_version = version or package_version()
+    runtime_root = cached_runtime_root(resolved_version)
+    destination = runtime_root / binary_name()
+    if destination.is_file() and os.access(destination, os.X_OK):
+        return ResolvedRuntime(destination, runtime_root)
+
+    if runtime_root.exists():
+        shutil.rmtree(runtime_root)
+    runtime_root.mkdir(parents=True, exist_ok=True)
     archive_name, checksum_name = expected_release_artifacts(resolved_version)
     base_url = release_base_url(resolved_version)
 
@@ -233,16 +296,19 @@ def fetch_binary_release(version: str | None = None) -> Path:
         temp_root = Path(tmpdir)
         archive_path = temp_root / archive_name
         checksum_path = temp_root / checksum_name
+        extracted_root = temp_root / "extracted"
+        extracted_root.mkdir()
 
         download_file(urljoin(base_url, archive_name), archive_path)
         download_file(urljoin(base_url, checksum_name), checksum_path)
         verify_checksum(archive_path, checksum_path)
-        extracted_binary = extract_binary_from_archive(archive_path, temp_root)
+        extract_archive(archive_path, extracted_root)
+        extracted_binary = locate_binary_in_tree(extracted_root)
         extracted_binary.chmod(extracted_binary.stat().st_mode | 0o111)
-        shutil.move(str(extracted_binary), str(destination))
+        move_tree_contents(extracted_root, runtime_root)
 
     destination.chmod(destination.stat().st_mode | 0o111)
-    return destination
+    return ResolvedRuntime(destination, runtime_root)
 
 
 def download_file(url: str, destination: Path) -> None:
@@ -267,26 +333,41 @@ def verify_checksum(archive_path: Path, checksum_path: Path) -> None:
         )
 
 
-def extract_binary_from_archive(archive_path: Path, destination_dir: Path) -> Path:
+def extract_archive(archive_path: Path, destination_dir: Path) -> None:
     if archive_path.name.endswith(".zip"):
         with zipfile.ZipFile(archive_path) as archive:
-            member = next((item for item in archive.namelist() if Path(item).name == binary_name()), None)
-            if member is None:
-                raise RuntimeError(f"archive {archive_path.name} does not contain {binary_name()}")
-            archive.extract(member, destination_dir)
-            extracted = destination_dir / member
-            final_path = destination_dir / binary_name()
-            if extracted != final_path:
-                extracted.replace(final_path)
-            return final_path
+            archive.extractall(destination_dir)
+            return
 
     with tarfile.open(archive_path, "r:gz") as archive:
-        member = next((item for item in archive.getmembers() if Path(item.name).name == binary_name()), None)
-        if member is None:
-            raise RuntimeError(f"archive {archive_path.name} does not contain {binary_name()}")
-        archive.extract(member, destination_dir)
-        extracted = destination_dir / member.name
-        final_path = destination_dir / binary_name()
-        if extracted != final_path:
-            extracted.replace(final_path)
-        return final_path
+        extract_kwargs = {"filter": "data"} if sys.version_info >= (3, 12) else {}
+        archive.extractall(destination_dir, **extract_kwargs)
+
+
+def locate_binary_in_tree(root: Path) -> Path:
+    matches = [candidate for candidate in root.rglob(binary_name()) if candidate.is_file()]
+    if not matches:
+        raise RuntimeError(f"downloaded runtime archive does not contain {binary_name()}")
+    if len(matches) == 1:
+        return matches[0]
+
+    exact_root = root / binary_name()
+    if exact_root in matches:
+        return exact_root
+
+    exact_nested = root / "tine"
+    if exact_nested in matches:
+        return exact_nested
+
+    raise RuntimeError(f"downloaded runtime archive contains multiple {binary_name()} candidates")
+
+
+def move_tree_contents(source_root: Path, destination_root: Path) -> None:
+    for child in source_root.iterdir():
+        destination = destination_root / child.name
+        if destination.exists():
+            if destination.is_dir():
+                shutil.rmtree(destination)
+            else:
+                destination.unlink()
+        shutil.move(str(child), str(destination))

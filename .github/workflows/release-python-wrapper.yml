@@ -99,22 +99,11 @@ jobs:
           )"
           mkdir -p release-artifacts
           ARCHIVE="tine-${VERSION}-${{ matrix.rust_target }}${{ matrix.archive_ext }}"
-          python - <<PY
-          import hashlib
-          import tarfile
-          import zipfile
-          from pathlib import Path
-          binary = Path("target/${{ matrix.rust_target }}/release/${{ matrix.binary_name }}")
-          archive = Path("release-artifacts/${ARCHIVE}")
-          if archive.name.endswith(".zip"):
-              with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                  zf.write(binary, arcname="${{ matrix.binary_name }}")
-          else:
-              with tarfile.open(archive, "w:gz") as tf:
-                  tf.add(binary, arcname="${{ matrix.binary_name }}")
-          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-          archive.with_suffix(archive.suffix + ".sha256").write_text(f"{digest}  {archive.name}\n")
-          PY
+          python scripts/release/package_runtime_bundle.py \
+            --binary "target/${{ matrix.rust_target }}/release/${{ matrix.binary_name }}" \
+            --binary-name "${{ matrix.binary_name }}" \
+            --rust-target "${{ matrix.rust_target }}" \
+            --archive-path "release-artifacts/${ARCHIVE}"
 
       - name: Upload packaged binary
         uses: actions/upload-artifact@v4

@@ -55,6 +55,9 @@ class WrapperTests(unittest.TestCase):
                 with mock.patch("os.execv") as execv:
                     exit_code = cli.main(["version"])
 
+                self.assertEqual(os.environ["TINE_WRAPPER_PYTHON"], sys.executable)
+                self.assertEqual(os.environ["TINE_RUNTIME_ROOT"], str(binary.parent))
+
             self.assertIsNone(exit_code)
             execv.assert_called_once_with(str(binary), [str(binary), "version"])
 
@@ -72,10 +75,32 @@ class WrapperTests(unittest.TestCase):
                     with mock.patch("os.execv") as execv:
                         exit_code = cli.main(["version"])
 
-                self.assertEqual(os.environ["TINE_UI_DIR"], str(ui_dir))
+                    self.assertEqual(os.environ["TINE_UI_DIR"], str(ui_dir))
+                    self.assertEqual(os.environ["TINE_WRAPPER_PYTHON"], sys.executable)
+                    self.assertEqual(os.environ["TINE_RUNTIME_ROOT"], str(binary.parent))
 
             self.assertIsNone(exit_code)
             execv.assert_called_once_with(str(binary), [str(binary), "version"])
+
+    def test_wrapper_sets_bundled_python_env_when_runtime_contains_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            binary = runtime_root / "tine"
+            binary.write_text("#!/bin/sh\necho 'tine 0.1.0'\n")
+            binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+            bundled_python = runtime_root / runtime.bundled_python_relative_path()
+            bundled_python.parent.mkdir(parents=True)
+            bundled_python.write_text("#!/bin/sh\n")
+            bundled_python.chmod(bundled_python.stat().st_mode | stat.S_IEXEC)
+
+            with mock.patch.dict(os.environ, {"TINE_BIN": str(binary), "TINE_PACKAGE_VERSION": "0.1.0"}, clear=True):
+                with mock.patch("os.execv") as execv:
+                    exit_code = cli.main(["doctor"])
+
+                    self.assertEqual(os.environ["TINE_BUNDLED_PYTHON"], str(bundled_python))
+
+            self.assertIsNone(exit_code)
+            execv.assert_called_once_with(str(binary), [str(binary), "doctor"])
 
     def test_fetches_binary_from_release_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as release_dir, tempfile.TemporaryDirectory() as cache_dir:
@@ -98,6 +123,31 @@ class WrapperTests(unittest.TestCase):
             self.assertTrue(binary.is_file())
             self.assertIn("x86_64-unknown-linux-gnu", str(binary))
 
+    def test_fetches_runtime_root_from_release_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as release_dir, tempfile.TemporaryDirectory() as cache_dir:
+            release_root = Path(release_dir)
+            self._write_release_artifact_set(release_root, version="0.1.0", include_runtime_python=True)
+
+            with mock.patch("platform.system", return_value="Linux"), mock.patch(
+                "platform.machine", return_value="x86_64"
+            ), mock.patch.dict(
+                os.environ,
+                {
+                    "TINE_PACKAGE_VERSION": "0.1.0",
+                    "TINE_RELEASE_BASE_URL": release_root.as_uri() + "/",
+                    "TINE_CACHE_DIR": cache_dir,
+                },
+                clear=False,
+            ), mock.patch.object(runtime, "source_checkout_binary_candidates", return_value=[]):
+                resolved = runtime.ensure_compatible_runtime()
+
+            self.assertTrue(resolved.binary_path.is_file())
+            self.assertEqual(resolved.runtime_root, Path(cache_dir) / "engine" / "0.1.0" / "x86_64-unknown-linux-gnu")
+            self.assertEqual(
+                resolved.bundled_python_path,
+                resolved.runtime_root / "runtime" / "python" / "bin" / "python3",
+            )
+
     def test_reuses_cached_binary_without_redownloading(self) -> None:
         with tempfile.TemporaryDirectory() as release_dir, tempfile.TemporaryDirectory() as cache_dir:
             release_root = Path(release_dir)
@@ -116,6 +166,27 @@ class WrapperTests(unittest.TestCase):
                 first = runtime.ensure_compatible_binary()
                 with mock.patch.object(runtime, "download_file", side_effect=AssertionError("should not redownload")):
                     second = runtime.ensure_compatible_binary()
+
+            self.assertEqual(first, second)
+
+    def test_reuses_cached_runtime_without_redownloading(self) -> None:
+        with tempfile.TemporaryDirectory() as release_dir, tempfile.TemporaryDirectory() as cache_dir:
+            release_root = Path(release_dir)
+            self._write_release_artifact_set(release_root, version="0.1.0", include_runtime_python=True)
+
+            env = {
+                "TINE_PACKAGE_VERSION": "0.1.0",
+                "TINE_RELEASE_BASE_URL": release_root.as_uri() + "/",
+                "TINE_CACHE_DIR": cache_dir,
+            }
+            with mock.patch("platform.system", return_value="Linux"), mock.patch(
+                "platform.machine", return_value="x86_64"
+            ), mock.patch.dict(os.environ, env, clear=False), mock.patch.object(
+                runtime, "source_checkout_binary_candidates", return_value=[]
+            ):
+                first = runtime.ensure_compatible_runtime()
+                with mock.patch.object(runtime, "download_file", side_effect=AssertionError("should not redownload")):
+                    second = runtime.ensure_compatible_runtime()
 
             self.assertEqual(first, second)
 
@@ -269,6 +340,37 @@ class WrapperTests(unittest.TestCase):
 
             self.assertEqual(resolved.resolve(), repo_binary.resolve())
 
+    def test_release_base_url_skips_source_checkout_binary_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            (repo_root / "Cargo.toml").write_text("[workspace]\nmembers = []\n")
+            packaging_dir = repo_root / "packaging" / "python"
+            packaging_dir.mkdir(parents=True)
+            (packaging_dir / "pyproject.toml").write_text("[project]\nname='tine'\n")
+
+            module_file = repo_root / "packaging" / "python" / "python" / "tine" / "runtime.py"
+            module_file.parent.mkdir(parents=True)
+            module_file.write_text("# test runtime module path\n")
+
+            repo_binary = repo_root / "target" / "debug" / "tine"
+            repo_binary.parent.mkdir(parents=True)
+            repo_binary.write_text("#!/bin/sh\necho 'tine 0.1.0'\n")
+            repo_binary.chmod(repo_binary.stat().st_mode | stat.S_IEXEC)
+
+            with mock.patch("platform.system", return_value="Darwin"), mock.patch(
+                "platform.machine", return_value="arm64"
+            ), mock.patch.object(runtime, "__file__", str(module_file)), mock.patch.dict(
+                os.environ,
+                {
+                    "TINE_PACKAGE_VERSION": "0.1.0",
+                    "TINE_RELEASE_BASE_URL": "file:///tmp/releases/",
+                },
+                clear=False,
+            ):
+                candidates = runtime.binary_candidates()
+
+            self.assertNotIn(repo_binary, candidates)
+
     def test_wrapper_reports_version_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             binary = Path(tmpdir) / "tine"
@@ -346,6 +448,7 @@ class WrapperTests(unittest.TestCase):
         version: str,
         target: str = "x86_64-unknown-linux-gnu",
         binary_filename: str = "tine",
+        include_runtime_python: bool = False,
     ) -> None:
         archive_name, checksum_name = runtime.expected_release_artifacts_for_target(target, version)
         staging = release_root / "staging"
@@ -354,13 +457,27 @@ class WrapperTests(unittest.TestCase):
         binary.write_text("#!/bin/sh\necho 'tine 0.1.0'\n")
         binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
 
+        if include_runtime_python:
+            if archive_name.endswith(".zip"):
+                python_rel = Path("runtime") / "python" / "python.exe"
+            else:
+                python_rel = Path("runtime") / "python" / "bin" / "python3"
+            bundled_python = staging / python_rel
+            bundled_python.parent.mkdir(parents=True, exist_ok=True)
+            bundled_python.write_text("#!/bin/sh\n")
+            bundled_python.chmod(bundled_python.stat().st_mode | stat.S_IEXEC)
+
         archive_path = release_root / archive_name
         if archive_name.endswith(".zip"):
             with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                archive.write(binary, arcname=binary_filename)
+                for file_path in staging.rglob("*"):
+                    if file_path.is_file():
+                        archive.write(file_path, arcname=file_path.relative_to(staging))
         else:
             with tarfile.open(archive_path, "w:gz") as archive:
-                archive.add(binary, arcname=binary_filename)
+                for file_path in staging.rglob("*"):
+                    if file_path.is_file():
+                        archive.add(file_path, arcname=file_path.relative_to(staging))
 
         checksum = hashlib.sha256(archive_path.read_bytes()).hexdigest()
         (release_root / checksum_name).write_text(f"{checksum}  {archive_name}\n")
