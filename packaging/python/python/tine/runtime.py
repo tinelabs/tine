@@ -50,8 +50,6 @@ _SUPPORTED_TARGETS: dict[tuple[str, str], SupportedTarget] = {
     ("Linux", "x86_64"): SupportedTarget("Linux", "x86_64", "x86_64-unknown-linux-gnu"),
     ("Linux", "arm64"): SupportedTarget("Linux", "arm64", "aarch64-unknown-linux-gnu"),
     ("Linux", "aarch64"): SupportedTarget("Linux", "arm64", "aarch64-unknown-linux-gnu"),
-    ("Windows", "AMD64"): SupportedTarget("Windows", "x86_64", "x86_64-pc-windows-msvc", ".zip"),
-    ("Windows", "x86_64"): SupportedTarget("Windows", "x86_64", "x86_64-pc-windows-msvc", ".zip"),
 }
 
 
@@ -69,7 +67,7 @@ def package_version() -> str:
     try:
         return metadata.version("tine")
     except metadata.PackageNotFoundError:  # pragma: no cover - local source checkout
-        return "0.2.0-dev"
+        return "0.2.1-dev"
 
 
 def supported_target() -> SupportedTarget:
@@ -83,12 +81,10 @@ def supported_target() -> SupportedTarget:
 
 
 def binary_name() -> str:
-    return "tine.exe" if platform.system() == "Windows" else "tine"
+    return "tine"
 
 
 def bundled_python_relative_path() -> Path:
-    if platform.system() == "Windows":
-        return Path("runtime") / "python" / "python.exe"
     return Path("runtime") / "python" / "bin" / "python3"
 
 

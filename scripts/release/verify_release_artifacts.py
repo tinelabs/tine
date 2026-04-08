@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import sys
 import tarfile
-import zipfile
 from pathlib import Path
 
 
@@ -17,10 +16,6 @@ def load_runtime(repo_root: Path):
 
 
 def archive_entries(archive_path: Path) -> set[str]:
-    if archive_path.suffix == ".zip":
-        with zipfile.ZipFile(archive_path) as archive:
-            return set(archive.namelist())
-
     with tarfile.open(archive_path, "r:gz") as archive:
         return {
             member.name
@@ -30,8 +25,6 @@ def archive_entries(archive_path: Path) -> set[str]:
 
 
 def expected_runtime_entries(archive_name: str) -> set[str]:
-    if archive_name.endswith(".zip"):
-        return {"tine.exe", "runtime/python/python.exe"}
     return {"tine", "runtime/python/bin/python3"}
 
 

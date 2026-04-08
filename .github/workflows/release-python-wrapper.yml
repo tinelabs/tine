@@ -63,11 +63,6 @@ jobs:
             rust_target: aarch64-apple-darwin
             archive_ext: .tar.gz
             binary_name: tine
-          - label: windows-x86_64
-            runner: windows-latest
-            rust_target: x86_64-pc-windows-msvc
-            archive_ext: .zip
-            binary_name: tine.exe
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -160,8 +155,6 @@ jobs:
             runner: ubuntu-24.04-arm
           - label: macos-arm64
             runner: macos-14
-          - label: windows-x86_64
-            runner: windows-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
