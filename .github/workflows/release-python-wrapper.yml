@@ -111,12 +111,6 @@ jobs:
           name: rust-binary-${{ matrix.label }}
           path: release-artifacts/*
 
-      - name: Upload Rust release assets
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: release-artifacts/*
-
   verify-release-artifacts:
     name: Verify artifact matrix
     needs: build-rust-binaries
@@ -216,9 +210,35 @@ jobs:
           name: python-wrapper-dist
           path: python-dist/*
 
+  upload-release-assets:
+    name: Upload release assets
+    needs:
+      - build-python-package
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    steps:
+      - name: Download all Rust binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Download Python package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-wrapper-dist
+          path: python-dist
+
+      - name: Upload Rust release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/*
+            python-dist/*
+
   publish-pypi:
     name: Publish to PyPI
-    needs: build-python-package
+    needs: upload-release-assets
     runs-on: ubuntu-latest
     permissions:
       id-token: write
