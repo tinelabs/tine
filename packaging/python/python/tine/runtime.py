@@ -15,7 +15,10 @@ from pathlib import Path
 from urllib.parse import urljoin
 from urllib.request import urlopen
 
-import certifi
+try:
+    import certifi
+except ImportError:  # pragma: no cover - exercised in source smoke path
+    certifi = None
 
 
 @dataclass(frozen=True)
@@ -52,7 +55,7 @@ def package_version() -> str:
     try:
         return metadata.version("tine")
     except metadata.PackageNotFoundError:  # pragma: no cover - local source checkout
-        return "0.1.6-dev"
+        return "0.1.7-dev"
 
 
 def supported_target() -> SupportedTarget:
@@ -111,11 +114,14 @@ def binary_candidates() -> list[Path]:
     if env_bin_dir:
         candidates.append(Path(env_bin_dir) / binary_name())
 
-    package_root = package_root_path()
-    target = supported_target().rust_target
-    candidates.append(package_root / "bin" / target / binary_name())
-    candidates.append(package_root / "bin" / binary_name())
     candidates.extend(source_checkout_binary_candidates())
+
+    if source_checkout_root() is None:
+        package_root = package_root_path()
+        target = supported_target().rust_target
+        candidates.append(package_root / "bin" / target / binary_name())
+        candidates.append(package_root / "bin" / binary_name())
+
     candidates.append(cached_binary_path())
 
     return candidates
@@ -132,28 +138,37 @@ def package_ui_dir() -> Path | None:
     return None
 
 
-def source_checkout_binary_candidates(module_file: Path | None = None) -> list[Path]:
+def source_checkout_root(module_file: Path | None = None) -> Path | None:
     start = (module_file or Path(__file__)).resolve()
-    names = [binary_name()]
-    candidates: list[Path] = []
-    seen: set[Path] = set()
 
     for ancestor in [start.parent, *start.parents]:
         cargo_toml = ancestor / "Cargo.toml"
         packaging_pyproject = ancestor / "packaging" / "python" / "pyproject.toml"
-        if not cargo_toml.is_file() or not packaging_pyproject.is_file():
-            continue
+        if cargo_toml.is_file() and packaging_pyproject.is_file():
+            return ancestor
 
-        for relative in (
-            Path("target") / "debug",
-            Path("target") / "release",
-        ):
-            for name in names:
-                candidate = ancestor / relative / name
-                if candidate in seen:
-                    continue
-                seen.add(candidate)
-                candidates.append(candidate)
+    return None
+
+
+def source_checkout_binary_candidates(module_file: Path | None = None) -> list[Path]:
+    root = source_checkout_root(module_file)
+    if root is None:
+        return []
+
+    names = [binary_name()]
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    for relative in (
+        Path("target") / "debug",
+        Path("target") / "release",
+    ):
+        for name in names:
+            candidate = root / relative / name
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            candidates.append(candidate)
 
     return candidates
 
@@ -236,7 +251,10 @@ def download_file(url: str, destination: Path) -> None:
 
 
 def download_ssl_context() -> ssl.SSLContext:
-    return ssl.create_default_context(cafile=certifi.where())
+    certifi_module = certifi
+    if certifi_module is not None:
+        return ssl.create_default_context(cafile=certifi_module.where())
+    return ssl.create_default_context()
 
 
 def verify_checksum(archive_path: Path, checksum_path: Path) -> None:

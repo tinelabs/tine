@@ -4,6 +4,8 @@ import hashlib
 import os
 import tarfile
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -124,19 +126,57 @@ class WrapperTests(unittest.TestCase):
         response.__enter__.return_value = response
         response.__exit__.return_value = None
 
-        with mock.patch("tine.runtime.certifi.where", return_value="/tmp/certifi.pem") as where_mock:
+        certifi_mock = mock.Mock()
+        certifi_mock.where.return_value = "/tmp/certifi.pem"
+
+        with mock.patch.object(runtime, "certifi", certifi_mock):
             with mock.patch("tine.runtime.ssl.create_default_context", return_value="ssl-context") as context_mock:
                 with mock.patch("tine.runtime.urlopen", return_value=response) as urlopen_mock:
                     with mock.patch("shutil.copyfileobj") as copy_mock:
                         runtime.download_file("https://example.com/tine.tar.gz", destination)
 
-        where_mock.assert_called_once_with()
+        certifi_mock.where.assert_called_once_with()
         context_mock.assert_called_once_with(cafile="/tmp/certifi.pem")
         urlopen_mock.assert_called_once_with(
             "https://example.com/tine.tar.gz",
             context="ssl-context",
         )
         copy_mock.assert_called_once()
+
+    def test_download_file_falls_back_to_default_ssl_context_without_certifi(self) -> None:
+        destination = Path(tempfile.mkdtemp()) / "artifact.bin"
+
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = None
+
+        with mock.patch.object(runtime, "certifi", None):
+            with mock.patch("tine.runtime.ssl.create_default_context", return_value="ssl-context") as context_mock:
+                with mock.patch("tine.runtime.urlopen", return_value=response) as urlopen_mock:
+                    with mock.patch("shutil.copyfileobj") as copy_mock:
+                        runtime.download_file("https://example.com/tine.tar.gz", destination)
+
+        context_mock.assert_called_once_with()
+        urlopen_mock.assert_called_once_with(
+            "https://example.com/tine.tar.gz",
+            context="ssl-context",
+        )
+        copy_mock.assert_called_once()
+
+    def test_runtime_imports_without_certifi_installed(self) -> None:
+        package_root = Path(__file__).resolve().parents[1] / "python"
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(package_root)
+
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", "import tine.runtime; print('ok')"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        self.assertEqual(result.stdout.strip(), "ok")
 
     def test_fetches_windows_binary_from_zip_release_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as release_dir, tempfile.TemporaryDirectory() as cache_dir:
@@ -193,6 +233,41 @@ class WrapperTests(unittest.TestCase):
                             resolved = runtime.ensure_compatible_binary()
 
             self.assertEqual(resolved.resolve(), binary.resolve())
+
+    def test_source_checkout_ignores_packaged_binary_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            (repo_root / "Cargo.toml").write_text("[workspace]\nmembers = []\n")
+            packaging_dir = repo_root / "packaging" / "python"
+            packaging_dir.mkdir(parents=True)
+            (packaging_dir / "pyproject.toml").write_text("[project]\nname='tine'\n")
+
+            module_file = repo_root / "packaging" / "python" / "python" / "tine" / "runtime.py"
+            module_file.parent.mkdir(parents=True)
+            module_file.write_text("# test runtime module path\n")
+
+            packaged_binary = module_file.parent / "bin" / "aarch64-apple-darwin" / "tine"
+            packaged_binary.parent.mkdir(parents=True)
+            packaged_binary.write_text("#!/bin/sh\necho 'tine 0.0.9'\n")
+            packaged_binary.chmod(packaged_binary.stat().st_mode | stat.S_IEXEC)
+
+            repo_binary = repo_root / "target" / "debug" / "tine"
+            repo_binary.parent.mkdir(parents=True)
+            repo_binary.write_text("#!/bin/sh\necho 'tine 0.1.0'\n")
+            repo_binary.chmod(repo_binary.stat().st_mode | stat.S_IEXEC)
+
+            with mock.patch("platform.system", return_value="Darwin"), mock.patch(
+                "platform.machine", return_value="arm64"
+            ), mock.patch.dict(os.environ, {"TINE_PACKAGE_VERSION": "0.1.0"}, clear=False):
+                with mock.patch.object(runtime, "__file__", str(module_file)):
+                    with mock.patch.object(
+                        runtime,
+                        "fetch_binary_release",
+                        side_effect=AssertionError("should not fetch release when source checkout binary exists"),
+                    ):
+                        resolved = runtime.ensure_compatible_binary()
+
+            self.assertEqual(resolved.resolve(), repo_binary.resolve())
 
     def test_wrapper_reports_version_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
