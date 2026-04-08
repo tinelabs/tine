@@ -22,7 +22,11 @@ def archive_entries(archive_path: Path) -> set[str]:
             return set(archive.namelist())
 
     with tarfile.open(archive_path, "r:gz") as archive:
-        return {member.name for member in archive.getmembers() if member.isfile()}
+        return {
+            member.name
+            for member in archive.getmembers()
+            if member.isfile() or member.issym() or member.islnk()
+        }
 
 
 def expected_runtime_entries(archive_name: str) -> set[str]:

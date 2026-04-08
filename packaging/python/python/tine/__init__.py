@@ -19,7 +19,7 @@ else:
     try:
         __version__ = metadata.version("tine")
     except metadata.PackageNotFoundError:  # pragma: no cover - local source checkout
-        __version__ = "0.1.8-dev"
+        __version__ = "0.1.9-dev"
 
 __all__ = ["__version__", "expected_release_artifacts", "supported_target"]
 
