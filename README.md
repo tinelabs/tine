@@ -1,6 +1,7 @@
 # Tine
 
 [![PyPI version](https://img.shields.io/pypi/v/tine?label=PyPI)](https://pypi.org/project/tine/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/tine?label=Downloads)](https://pypi.org/project/tine/)
 [![CI](https://img.shields.io/github/actions/workflow/status/tinelabs/tine/ci.yml?branch=main&label=CI)](https://github.com/tinelabs/tine/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/tinelabs/tine)](https://github.com/tinelabs/tine/blob/main/LICENSE)
 [![Python](https://img.shields.io/pypi/pyversions/tine)](https://pypi.org/project/tine/)
