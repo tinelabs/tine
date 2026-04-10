@@ -606,7 +606,6 @@ function createTreeBranchPayload(
       cache: true,
       map_over: null,
       map_concurrency: null,
-      timeout_secs: null,
       tags: {},
       revision_id: null,
       state: "clean",
@@ -879,14 +878,15 @@ async function runAllBranchesExecution(ae, activeTree) {
     throw e;
   }
   for (const item of r?.executions || []) {
-    const branchNodeIds = activeBranchPathCellIds(activeTree, item.branch_id);
+    const branchId = item.target?.branch_id;
+    const branchNodeIds = activeBranchPathCellIds(activeTree, branchId);
     registerExecution(
       item.execution_id,
       activeTree.id,
       branchNodeIds,
       {
         treeId: activeTree.id,
-        branchId: item.branch_id,
+        branchId,
         targetKind: "experiment_tree_branch",
       },
       item,
@@ -3148,7 +3148,6 @@ function NotebookView() {
           cache: true,
           map_over: null,
           map_concurrency: null,
-          timeout_secs: null,
           tags: {},
           revision_id: null,
           state: "clean",

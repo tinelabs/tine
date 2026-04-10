@@ -20,6 +20,8 @@ Tine is a local-first execution engine where notebooks branch like code. Run wor
 
 Tine gives AI agents a safe place to explore multiple paths in parallel while you keep the browser view over the same local state, logs, and results.
 
+For the authoritative description of what is shipped today versus what is still planned, see [docs/current-state.md](/Users/sid/tine/docs/current-state.md).
+
 
 ## What Tine is
 
@@ -225,6 +227,8 @@ If you are navigating the repo, these are the most relevant top-level areas:
 - `crates/tine-server/` for the local HTTP and WebSocket server
 - `crates/tine-cli/` for the local launcher and operator commands
 - `packaging/python/` for the Python wrapper, packaging, and MCP entrypoints
+
+For current install, runtime, and release behavior, see [docs/current-state.md](/Users/sid/tine/docs/current-state.md).
 
 ## Contributing
 

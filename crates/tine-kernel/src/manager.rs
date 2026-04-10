@@ -28,16 +28,9 @@ use tine_core::{
     ExperimentTreeId, KernelConnectionInfo, NamespaceDelta, NodeOutput, TineError, TineResult,
 };
 
-/// Maximum number of consecutive 30s IOPub read timeouts before giving up
-/// (in addition to the 7200s overall timeout).  Prevents infinite retry loops
-/// when a kernel is stuck but technically alive.
-const MAX_IOPUB_TIMEOUTS: u32 = 10;
-
-pub const DEFAULT_EXECUTION_TIMEOUT_SECS: u64 = 7200;
-
-/// Default idle timeout for kernels (seconds).  Kernels that have not executed
-/// code within this window are eligible for LRU eviction.
-const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600; // 10 minutes
+/// When the kernel pool is full, only evict kernels that have been idle for at
+/// least this long.
+const MIN_CAPACITY_EVICTION_IDLE_SECS: u64 = 60;
 
 /// Maximum time to wait for kernel heartbeat during startup.
 const HEARTBEAT_STARTUP_TIMEOUT_SECS: u64 = 30;
@@ -158,6 +151,13 @@ pub struct KernelIsolationOutcome {
     pub contaminated: bool,
     pub signals: Vec<String>,
     pub delta: NamespaceDelta,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KernelEvictionCandidate {
+    owner_id: KernelOwnerId,
+    idle_secs: u64,
+    is_executing: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -383,9 +383,10 @@ impl KernelManager {
             return Ok(());
         }
 
-        // Check budget — try to evict an idle kernel if we're at capacity
+        // Check budget — only evict an idle kernel if new startup creates
+        // actual capacity pressure.
         if self.kernels.len() >= self.max_kernels {
-            if !self.try_evict_idle().await {
+            if !self.try_evict_for_capacity().await {
                 return Err(TineError::BudgetExceeded(format!(
                     "maximum kernels ({}) reached and no idle kernels to evict",
                     self.max_kernels
@@ -780,12 +781,8 @@ impl KernelManager {
         worker_id: &str,
         code: &str,
     ) -> TineResult<KernelExecutionResult> {
-        self.execute_owned_code_with_timeout(
-            &Self::owner_id_for_worker(worker_id),
-            code,
-            DEFAULT_EXECUTION_TIMEOUT_SECS,
-        )
-        .await
+        self.execute_owned_code(&Self::owner_id_for_worker(worker_id), code)
+            .await
     }
 
     /// Execute code in the tree-owned kernel and return stdout/stderr + outputs.
@@ -794,63 +791,35 @@ impl KernelManager {
         tree_id: &ExperimentTreeId,
         code: &str,
     ) -> TineResult<KernelExecutionResult> {
-        self.execute_owned_code_with_timeout(
-            &Self::owner_id_for_tree(tree_id),
-            code,
-            DEFAULT_EXECUTION_TIMEOUT_SECS,
-        )
-        .await
-    }
-
-    /// Execute code in an ephemeral map-worker kernel with a custom timeout.
-    pub async fn execute_worker_code_with_timeout(
-        &self,
-        worker_id: &str,
-        code: &str,
-        timeout_secs: u64,
-    ) -> TineResult<KernelExecutionResult> {
-        self.execute_owned_code_with_timeout(
-            &Self::owner_id_for_worker(worker_id),
-            code,
-            timeout_secs,
-        )
-        .await
-    }
-
-    async fn execute_owned_code_with_timeout(
-        &self,
-        owner_id: &KernelOwnerId,
-        code: &str,
-        timeout_secs: u64,
-    ) -> TineResult<KernelExecutionResult> {
-        self.execute_owned_code_with_timeout_and_stream(owner_id, code, timeout_secs, |_, _| {})
+        self.execute_owned_code(&Self::owner_id_for_tree(tree_id), code)
             .await
     }
 
-    pub async fn execute_worker_code_with_timeout_and_stream<F>(
+    async fn execute_owned_code(
+        &self,
+        owner_id: &KernelOwnerId,
+        code: &str,
+    ) -> TineResult<KernelExecutionResult> {
+        self.execute_owned_code_with_stream(owner_id, code, |_, _| {}).await
+    }
+
+    pub async fn execute_worker_code_with_stream<F>(
         &self,
         worker_id: &str,
         code: &str,
-        timeout_secs: u64,
         on_stream: F,
     ) -> TineResult<KernelExecutionResult>
     where
         F: FnMut(&str, &str),
     {
-        self.execute_owned_code_with_timeout_and_stream(
-            &Self::owner_id_for_worker(worker_id),
-            code,
-            timeout_secs,
-            on_stream,
-        )
+        self.execute_owned_code_with_stream(&Self::owner_id_for_worker(worker_id), code, on_stream)
         .await
     }
 
-    async fn execute_owned_code_with_timeout_and_stream<F>(
+    async fn execute_owned_code_with_stream<F>(
         &self,
         owner_id: &KernelOwnerId,
         code: &str,
-        timeout_secs: u64,
         mut on_stream: F,
     ) -> TineResult<KernelExecutionResult>
     where
@@ -883,25 +852,10 @@ impl KernelManager {
         let mut stderr = String::new();
         let mut outputs: Vec<NodeOutput> = Vec::new();
         let mut exec_error: Option<KernelExecutionError> = None;
-        let start = Instant::now();
-        let timeout = Duration::from_secs(timeout_secs);
-        let mut consecutive_timeouts: u32 = 0;
 
         loop {
-            let elapsed = start.elapsed();
-            if elapsed >= timeout {
-                let pid = self.send_sigint(owner_id);
-                warn!(owner = %owner_id, pid = ?pid, timeout_secs, "execution exceeded timeout; interrupting kernel");
-                kernel.set_executing(false);
-                return Err(TineError::ExecutionTimedOut { timeout_secs });
-            }
-
-            let remaining = timeout.saturating_sub(elapsed);
-            let read_timeout = remaining.min(Duration::from_secs(30));
-
-            let msg = match tokio::time::timeout(read_timeout, kernel.iopub.read()).await {
+            let msg = match tokio::time::timeout(Duration::from_secs(30), kernel.iopub.read()).await {
                 Ok(Ok(msg)) => {
-                    consecutive_timeouts = 0; // reset on success
                     kernel.touch();
                     msg
                 }
@@ -911,32 +865,17 @@ impl KernelManager {
                     return Err(TineError::KernelComm(format!("iopub read error: {}", e)));
                 }
                 Err(_) => {
-                    if start.elapsed() >= timeout {
-                        let pid = self.send_sigint(owner_id);
-                        warn!(owner = %owner_id, pid = ?pid, timeout_secs, "execution timed out while waiting for iopub; interrupting kernel");
-                        kernel.set_executing(false);
-                        return Err(TineError::ExecutionTimedOut { timeout_secs });
-                    }
-                    consecutive_timeouts += 1;
-                    if consecutive_timeouts >= MAX_IOPUB_TIMEOUTS {
-                        error!(
-                            owner = %owner_id,
-                            timeouts = consecutive_timeouts,
-                            "iopub read timed out {} consecutive times, giving up",
-                            MAX_IOPUB_TIMEOUTS
-                        );
-                        kernel.set_executing(false);
-                        return Err(TineError::KernelComm(format!(
-                            "kernel unresponsive: {} consecutive 30s IOPub timeouts",
-                            consecutive_timeouts
-                        )));
-                    }
-                    warn!(
-                        owner = %owner_id,
-                        timeouts = consecutive_timeouts,
-                        max = MAX_IOPUB_TIMEOUTS,
-                        "iopub read timeout, retrying"
+                    let heartbeat_alive = matches!(
+                        tokio::time::timeout(Duration::from_secs(2), kernel.heartbeat.single_heartbeat()).await,
+                        Ok(Ok(()))
                     );
+                    if !heartbeat_alive {
+                        kernel.set_executing(false);
+                        return Err(TineError::KernelComm(
+                            "kernel became unresponsive during execution".to_string(),
+                        ));
+                    }
+                    debug!(owner = %owner_id, "iopub quiet but kernel heartbeat is healthy; continuing to wait");
                     continue;
                 }
             };
@@ -1016,32 +955,16 @@ impl KernelManager {
     }
 
     /// Tree-scoped compatibility adapter.
-    pub async fn execute_tree_code_with_timeout(
+    pub async fn execute_tree_code_with_stream<F>(
         &self,
         tree_id: &ExperimentTreeId,
         code: &str,
-        timeout_secs: u64,
-    ) -> TineResult<KernelExecutionResult> {
-        self.execute_owned_code_with_timeout(&Self::owner_id_for_tree(tree_id), code, timeout_secs)
-            .await
-    }
-
-    pub async fn execute_tree_code_with_timeout_and_stream<F>(
-        &self,
-        tree_id: &ExperimentTreeId,
-        code: &str,
-        timeout_secs: u64,
         on_stream: F,
     ) -> TineResult<KernelExecutionResult>
     where
         F: FnMut(&str, &str),
     {
-        self.execute_owned_code_with_timeout_and_stream(
-            &Self::owner_id_for_tree(tree_id),
-            code,
-            timeout_secs,
-            on_stream,
-        )
+        self.execute_owned_code_with_stream(&Self::owner_id_for_tree(tree_id), code, on_stream)
         .await
     }
 
@@ -1261,7 +1184,8 @@ print("__tine_isolation__" + _pf_json.dumps(_pf_result, sort_keys=True))
     }
 
     /// Spawn a background task that periodically checks heartbeats for all
-    /// kernels and evicts idle ones that exceed `DEFAULT_IDLE_TIMEOUT_SECS`.
+    /// kernels and records RSS metrics. Idle kernels are only evicted when
+    /// capacity pressure requires it, not just because a timer elapsed.
     ///
     /// Call this once after creating the `KernelManager` (wrapped in `Arc`).
     /// The task runs until the `CancellationToken` is cancelled or the
@@ -1289,29 +1213,7 @@ print("__tine_isolation__" + _pf_json.dumps(_pf_result, sort_keys=True))
                     if executing {
                         continue;
                     }
-                    // 1. Evict kernels that have been idle too long
-                    let idle = if let Some(entry) = mgr.kernels.get(owner_id) {
-                        let kernel = Arc::clone(entry.value());
-                        drop(entry);
-                        let idle = kernel.lock().await.idle_secs();
-                        idle
-                    } else {
-                        0
-                    };
-                    if idle >= DEFAULT_IDLE_TIMEOUT_SECS {
-                        info!(
-                            owner = %owner_id,
-                            idle_secs = idle,
-                            "evicting idle kernel"
-                        );
-                        let _ = mgr.shutdown_owned(owner_id).await;
-                        if let Some(tree_id) = owner_id.tree_id() {
-                            mgr.emit_lifecycle(KernelLifecycleEvent::Evicted { tree_id });
-                        }
-                        continue;
-                    }
-
-                    // 2. Check heartbeat — log dead kernels (callers will get
+                    // 1. Check heartbeat — log dead kernels (callers will get
                     //    errors on next execute_code and can handle accordingly)
                     if !mgr.check_owned_heartbeat(owner_id).await {
                         warn!(
@@ -1324,7 +1226,7 @@ print("__tine_isolation__" + _pf_json.dumps(_pf_result, sort_keys=True))
                         }
                     }
 
-                    // 3. Check RSS — warn if kernel is using excessive memory
+                    // 2. Check RSS — warn if kernel is using excessive memory
                     if let Some(entry) = mgr.kernels.get(owner_id) {
                         let kernel = Arc::clone(entry.value());
                         drop(entry);
@@ -1350,33 +1252,49 @@ print("__tine_isolation__" + _pf_json.dumps(_pf_result, sort_keys=True))
         })
     }
 
-    /// Try to evict the least-recently-used idle kernel to free capacity.
-    /// Returns `true` if a kernel was evicted.
-    async fn try_evict_idle(&self) -> bool {
-        // Find the kernel with the largest idle_secs
-        let mut best: Option<(KernelOwnerId, u64)> = None;
+    fn select_capacity_eviction_candidate(
+        candidates: Vec<KernelEvictionCandidate>,
+    ) -> Option<KernelEvictionCandidate> {
+        let mut eligible: Vec<_> = candidates
+            .into_iter()
+            .filter(|candidate| {
+                !candidate.is_executing && candidate.idle_secs >= MIN_CAPACITY_EVICTION_IDLE_SECS
+            })
+            .collect();
+        eligible.sort_by_key(|candidate| candidate.idle_secs);
+        eligible.pop()
+    }
+
+    /// Try to evict one idle kernel when startup would otherwise exceed the
+    /// configured kernel pool capacity. Returns `true` if a kernel was evicted.
+    async fn try_evict_for_capacity(&self) -> bool {
+        let mut candidates = Vec::new();
         for entry in self.kernels.iter() {
-            let idle = entry.value().try_lock().map(|k| k.idle_secs()).unwrap_or(0);
-            if idle > best.as_ref().map(|(_, s)| *s).unwrap_or(0) {
-                best = Some((entry.key().clone(), idle));
-            }
+            let owner_id = entry.key().clone();
+            let Ok(kernel) = entry.value().try_lock() else {
+                continue;
+            };
+            candidates.push(KernelEvictionCandidate {
+                owner_id,
+                idle_secs: kernel.idle_secs(),
+                is_executing: kernel.is_executing(),
+            });
         }
-        if let Some((owner_id, idle)) = best {
-            // Only evict if the kernel has been idle for at least 60 seconds
-            if idle >= 60 {
-                info!(
-                    owner = %owner_id,
-                    idle_secs = idle,
-                    "evicting LRU kernel to free capacity"
-                );
-                let _ = self.shutdown_owned(&owner_id).await;
-                if let Some(tree_id) = owner_id.tree_id() {
-                    self.emit_lifecycle(KernelLifecycleEvent::Evicted { tree_id });
-                }
-                return true;
-            }
+
+        let Some(candidate) = Self::select_capacity_eviction_candidate(candidates) else {
+            return false;
+        };
+
+        info!(
+            owner = %candidate.owner_id,
+            idle_secs = candidate.idle_secs,
+            "evicting idle kernel to free capacity"
+        );
+        let _ = self.shutdown_owned(&candidate.owner_id).await;
+        if let Some(tree_id) = candidate.owner_id.tree_id() {
+            self.emit_lifecycle(KernelLifecycleEvent::Evicted { tree_id });
         }
-        false
+        true
     }
 
     /// Send tine helper functions into the kernel namespace.
@@ -1623,9 +1541,7 @@ def _pf_context():
 "#;
         debug!(owner = %owner_id, "sending setup code to kernel");
 
-        let result = self
-            .execute_owned_code_with_timeout(owner_id, setup_code, DEFAULT_EXECUTION_TIMEOUT_SECS)
-            .await?;
+        let result = self.execute_owned_code(owner_id, setup_code).await?;
         if let Some(ref err) = result.error {
             warn!(
                 owner = %owner_id,
@@ -1747,6 +1663,90 @@ mod tests {
     use tine_core::EnvironmentSpec;
     use tine_env::{EnvironmentManager, TreeEnvironmentDescriptor};
 
+    #[test]
+    fn test_select_capacity_eviction_candidate_prefers_oldest_idle_kernel() {
+        let selected = KernelManager::select_capacity_eviction_candidate(vec![
+            KernelEvictionCandidate {
+                owner_id: KernelOwnerId::ExperimentTree(ExperimentTreeId::new("younger-idle")),
+                idle_secs: 120,
+                is_executing: false,
+            },
+            KernelEvictionCandidate {
+                owner_id: KernelOwnerId::ExperimentTree(ExperimentTreeId::new("oldest-idle")),
+                idle_secs: 180,
+                is_executing: false,
+            },
+        ])
+        .expect("expected an eviction candidate");
+
+        assert_eq!(
+            selected.owner_id,
+            KernelOwnerId::ExperimentTree(ExperimentTreeId::new("oldest-idle"))
+        );
+    }
+
+    #[test]
+    fn test_select_capacity_eviction_candidate_falls_back_to_oldest_idle_kernel() {
+        let selected = KernelManager::select_capacity_eviction_candidate(vec![
+            KernelEvictionCandidate {
+                owner_id: KernelOwnerId::ExperimentTree(ExperimentTreeId::new("too-fresh")),
+                idle_secs: 20,
+                is_executing: false,
+            },
+            KernelEvictionCandidate {
+                owner_id: KernelOwnerId::ExperimentTree(ExperimentTreeId::new("fallback")),
+                idle_secs: MIN_CAPACITY_EVICTION_IDLE_SECS + 1,
+                is_executing: false,
+            },
+        ])
+        .expect("expected an eviction candidate");
+
+        assert_eq!(
+            selected.owner_id,
+            KernelOwnerId::ExperimentTree(ExperimentTreeId::new("fallback"))
+        );
+    }
+
+    #[test]
+    fn test_select_capacity_eviction_candidate_never_picks_executing_kernel() {
+        let selected = KernelManager::select_capacity_eviction_candidate(vec![
+            KernelEvictionCandidate {
+                owner_id: KernelOwnerId::ExperimentTree(ExperimentTreeId::new("running")),
+                idle_secs: MIN_CAPACITY_EVICTION_IDLE_SECS + 30,
+                is_executing: true,
+            },
+            KernelEvictionCandidate {
+                owner_id: KernelOwnerId::ExperimentTree(ExperimentTreeId::new("idle")),
+                idle_secs: MIN_CAPACITY_EVICTION_IDLE_SECS + 30,
+                is_executing: false,
+            },
+        ])
+        .expect("expected an eviction candidate");
+
+        assert_eq!(
+            selected.owner_id,
+            KernelOwnerId::ExperimentTree(ExperimentTreeId::new("idle"))
+        );
+    }
+
+    #[test]
+    fn test_select_capacity_eviction_candidate_returns_none_when_no_idle_kernel_is_old_enough() {
+        let selected = KernelManager::select_capacity_eviction_candidate(vec![
+            KernelEvictionCandidate {
+                owner_id: KernelOwnerId::ExperimentTree(ExperimentTreeId::new("too-fresh")),
+                idle_secs: MIN_CAPACITY_EVICTION_IDLE_SECS - 1,
+                is_executing: false,
+            },
+            KernelEvictionCandidate {
+                owner_id: KernelOwnerId::ExperimentTree(ExperimentTreeId::new("running")),
+                idle_secs: MIN_CAPACITY_EVICTION_IDLE_SECS + 30,
+                is_executing: true,
+            },
+        ]);
+
+        assert!(selected.is_none());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_concurrent_tree_kernel_starts_share_single_owned_kernel() {
@@ -1799,6 +1799,86 @@ mod tests {
         assert!(kernel_mgr.connection_info_for_tree(&tree_id).is_none());
         assert_eq!(kernel_mgr.kernels.len(), 0);
         assert_eq!(kernel_mgr.kernel_pids.len(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn test_start_tree_kernel_evicts_oldest_idle_kernel_when_capacity_is_full() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let first_tree_id = ExperimentTreeId::new("capacity-evict-first");
+        let second_tree_id = ExperimentTreeId::new("capacity-evict-second");
+        let first_descriptor =
+            TreeEnvironmentDescriptor::new(first_tree_id.clone(), None, EnvironmentSpec::default());
+        let second_descriptor = TreeEnvironmentDescriptor::new(
+            second_tree_id.clone(),
+            None,
+            EnvironmentSpec::default(),
+        );
+        let env_mgr = EnvironmentManager::new(tmp.path().to_path_buf());
+        let first_venv = env_mgr
+            .ensure_tree_environment(&first_descriptor)
+            .await
+            .expect("failed to prepare first tree environment");
+        let second_venv = env_mgr
+            .ensure_tree_environment(&second_descriptor)
+            .await
+            .expect("failed to prepare second tree environment");
+        let kernel_mgr = KernelManager::new(tmp.path(), 1);
+        let mut lifecycle_rx = kernel_mgr.subscribe_lifecycle();
+
+        kernel_mgr
+            .start_tree_kernel(&first_tree_id, &first_venv, tmp.path())
+            .await
+            .expect("failed to start first tree kernel");
+
+        let first_owner = KernelManager::owner_id_for_tree(&first_tree_id);
+        let aged_last_used = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(MIN_CAPACITY_EVICTION_IDLE_SECS + 5);
+        let first_kernel = kernel_mgr
+            .kernels
+            .get(&first_owner)
+            .expect("expected first kernel to exist");
+        first_kernel
+            .value()
+            .lock()
+            .await
+            .last_used
+            .store(aged_last_used, Ordering::Relaxed);
+        drop(first_kernel);
+
+        kernel_mgr
+            .start_tree_kernel(&second_tree_id, &second_venv, tmp.path())
+            .await
+            .expect("failed to start second tree kernel after eviction");
+
+        let evicted_event = tokio::time::timeout(Duration::from_secs(2), lifecycle_rx.recv())
+            .await
+            .expect("timed out waiting for eviction event")
+            .expect("failed to receive lifecycle event");
+        match evicted_event {
+            KernelLifecycleEvent::Evicted { tree_id } => {
+                assert_eq!(tree_id, first_tree_id);
+            }
+            other => panic!("expected eviction event, got {:?}", other),
+        }
+
+        assert!(!kernel_mgr.has_tree_kernel(&first_tree_id));
+        assert!(kernel_mgr.has_tree_kernel(&second_tree_id));
+        assert_eq!(kernel_mgr.kernels.len(), 1);
+
+        let result = kernel_mgr
+            .execute_tree_code(&second_tree_id, "print('capacity-evict-second-ok', flush=True)")
+            .await
+            .expect("failed to execute code in second tree kernel");
+        assert!(result.stdout.contains("capacity-evict-second-ok"));
+
+        kernel_mgr
+            .shutdown_tree(&second_tree_id)
+            .await
+            .expect("failed to shut down second tree kernel");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

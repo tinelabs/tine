@@ -114,9 +114,6 @@ pub struct CellDef {
     /// Max concurrent workers for map execution.
     #[serde(default)]
     pub map_concurrency: Option<usize>,
-    /// Per-cell execution timeout in seconds.
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
     /// Optional tags for filtering / labeling.
     #[serde(default)]
     pub tags: HashMap<String, String>,
@@ -254,9 +251,6 @@ pub struct ExecutableTreeCell {
     /// Max concurrent workers for map execution.
     #[serde(default)]
     pub map_concurrency: Option<usize>,
-    /// Per-cell timeout in seconds.
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
     /// Optional tags for filtering / labeling.
     #[serde(default)]
     pub tags: HashMap<String, String>,
@@ -329,9 +323,6 @@ pub struct NodeDef {
     /// Max concurrent workers for map execution.
     #[serde(default)]
     pub map_concurrency: Option<usize>,
-    /// Per-node execution timeout in seconds.  Overrides the global 7200s default.
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
     /// Optional tags for filtering / labeling.
     #[serde(default)]
     pub tags: HashMap<String, String>,
@@ -1008,8 +999,6 @@ pub struct WorkspaceBudget {
     pub max_kernel_rss_bytes: Option<u64>,
     /// Maximum total artifact storage in bytes.
     pub max_artifact_storage_bytes: Option<u64>,
-    /// Idle kernel timeout in seconds.
-    pub idle_kernel_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1142,7 +1131,6 @@ mod tests {
                 cache: true,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: Some(30),
                 tags: HashMap::from([("stage".to_string(), "train".to_string())]),
                 revision_id: Some(RevisionId::new("rev-1")),
             }],

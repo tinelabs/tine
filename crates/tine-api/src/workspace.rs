@@ -429,7 +429,6 @@ impl Workspace {
             cache: cell.cache,
             map_over: cell.map_over.clone(),
             map_concurrency: cell.map_concurrency,
-            timeout_secs: cell.timeout_secs,
             tags: cell.tags.clone(),
             revision_id: cell.revision_id.clone(),
         };
@@ -606,22 +605,11 @@ impl Workspace {
         .await;
     }
 
-    fn node_logs_indicate_timeout(node_logs: &HashMap<NodeId, NodeLogs>) -> bool {
-        node_logs.values().any(|logs| {
-            logs.error
-                .as_ref()
-                .map(|error| error.ename == "ExecutionTimedOut")
-                .unwrap_or(false)
-        })
-    }
-
     fn terminal_status_from_outcome(
         node_statuses: &HashMap<NodeId, NodeStatus>,
-        node_logs: &HashMap<NodeId, NodeLogs>,
+        _node_logs: &HashMap<NodeId, NodeLogs>,
     ) -> ExecutionLifecycleStatus {
-        if Self::node_logs_indicate_timeout(node_logs) {
-            ExecutionLifecycleStatus::TimedOut
-        } else if node_statuses
+        if node_statuses
             .values()
             .any(|node_status| matches!(node_status, NodeStatus::Failed))
         {
@@ -992,12 +980,30 @@ impl Workspace {
             .await;
         match execution_result {
             Ok(outcome) => {
-                eprintln!(
-                    "[workspace] branch execution success execution={} tree={} branch={}",
-                    execution_id.as_str(),
-                    tree_id.as_str(),
-                    branch_id.as_str()
-                );
+                let succeeded = outcome.failed_nodes.is_empty();
+                if succeeded {
+                    eprintln!(
+                        "[workspace] branch execution success execution={} tree={} branch={}",
+                        execution_id.as_str(),
+                        tree_id.as_str(),
+                        branch_id.as_str()
+                    );
+                } else {
+                    eprintln!(
+                        "[workspace] branch execution failure execution={} tree={} branch={} failed={:?}",
+                        execution_id.as_str(),
+                        tree_id.as_str(),
+                        branch_id.as_str(),
+                        outcome.failed_nodes
+                    );
+                    warn!(
+                        tree = %tree_id,
+                        branch = %branch_id,
+                        execution = %execution_id,
+                        failed_nodes = ?outcome.failed_nodes,
+                        "branch execution completed with failed nodes"
+                    );
+                }
                 Self::finalize_branch_execution_success(
                     &pool,
                     &execution_id,
@@ -1007,7 +1013,7 @@ impl Workspace {
                     outcome,
                 )
                 .await;
-                true
+                succeeded
             }
             Err(e) => {
                 eprintln!(
@@ -1473,7 +1479,6 @@ impl Workspace {
                 cache: true,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -3502,6 +3507,10 @@ impl Workspace {
             base.clone()
         } else {
             let joined = base.join(trimmed);
+            // Return empty list if path does not exist or is not a directory
+            if !joined.exists() || !joined.is_dir() {
+                return Ok(Vec::new());
+            }
             // Prevent path traversal
             let canonical = joined
                 .canonicalize()
@@ -4096,7 +4105,6 @@ mod tests {
                     cache: false,
                     map_over: None,
                     map_concurrency: None,
-                    timeout_secs: None,
                     tags: HashMap::new(),
                     revision_id: None,
                     state: CellRuntimeState::Clean,
@@ -4112,7 +4120,6 @@ mod tests {
                     cache: false,
                     map_over: None,
                     map_concurrency: None,
-                    timeout_secs: None,
                     tags: HashMap::new(),
                     revision_id: None,
                     state: CellRuntimeState::Clean,
@@ -4128,7 +4135,6 @@ mod tests {
                     cache: false,
                     map_over: None,
                     map_concurrency: None,
-                    timeout_secs: None,
                     tags: HashMap::new(),
                     revision_id: None,
                     state: CellRuntimeState::Clean,
@@ -4303,7 +4309,6 @@ mod tests {
                     cache: false,
                     map_over: None,
                     map_concurrency: None,
-                    timeout_secs: None,
                     tags: HashMap::new(),
                     revision_id: None,
                     state: CellRuntimeState::Clean,
@@ -4319,7 +4324,6 @@ mod tests {
                     cache: false,
                     map_over: None,
                     map_concurrency: None,
-                    timeout_secs: None,
                     tags: HashMap::new(),
                     revision_id: None,
                     state: CellRuntimeState::Clean,
@@ -4335,7 +4339,6 @@ mod tests {
                     cache: false,
                     map_over: None,
                     map_concurrency: None,
-                    timeout_secs: None,
                     tags: HashMap::new(),
                     revision_id: None,
                     state: CellRuntimeState::Clean,

@@ -417,7 +417,6 @@ fn executable_cell_from_cell(
         cache: cell.cache,
         map_over: cell.map_over.clone(),
         map_concurrency: cell.map_concurrency,
-        timeout_secs: cell.timeout_secs,
         tags: cell.tags.clone(),
         revision_id: cell.revision_id.clone(),
     })
@@ -802,7 +801,6 @@ mod tests {
             cache: false,
             map_over: None,
             map_concurrency: None,
-            timeout_secs: None,
             tags: HashMap::new(),
             revision_id: None,
             state: CellRuntimeState::Clean,
@@ -836,7 +834,6 @@ mod tests {
                     cache: false,
                     map_over: None,
                     map_concurrency: None,
-                    timeout_secs: None,
                     tags: HashMap::new(),
                     revision_id: None,
                     state: CellRuntimeState::Clean,

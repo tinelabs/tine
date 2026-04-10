@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tine"
-version = "0.2.1"
+version = "0.2.2"
 description = "Python wrapper and MCP package for the Tine runtime"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -41,3 +41,6 @@ where = ["python"]
 
 [tool.setuptools.package-data]
 tine = ["bin/**/*", "ui/**/*"]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"

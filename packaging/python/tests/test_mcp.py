@@ -24,6 +24,7 @@ class _Handler(BaseHTTPRequestHandler):
     last_move_cell_payload: dict[str, object] | None = None
     deleted_path: str | None = None
     cancel_requested = False
+    wait_status_requests = 0
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/api/experiment-trees":
@@ -95,6 +96,20 @@ class _Handler(BaseHTTPRequestHandler):
                     "cancellation_requested_at": None,
                     "node_statuses": {"step1": "failed"},
                     "finished_at": "2026-04-07T10:16:00Z",
+                },
+            )
+            return
+        if self.path == "/api/executions/exec_wait":
+            type(self).wait_status_requests += 1
+            self._json(
+                200,
+                {
+                    "execution_id": "exec_wait",
+                    "status": "running",
+                    "phase": "running",
+                    "cancellation_requested_at": None,
+                    "node_statuses": {"step1": "running"},
+                    "finished_at": None,
                 },
             )
             return
@@ -246,6 +261,7 @@ class McpPythonTests(unittest.TestCase):
         _Handler.last_move_cell_payload = None
         _Handler.deleted_path = None
         _Handler.cancel_requested = False
+        _Handler.wait_status_requests = 0
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -315,8 +331,28 @@ class McpPythonTests(unittest.TestCase):
             created_payload["agent_context"]["environment"]["guidance"],
         )
         self.assertIn(
-            "uses `!`",
+            "`!pip install ...`",
             created_payload["agent_context"]["environment"]["guidance"],
+        )
+        self.assertIn(
+            "Only install packages that are missing from `effective_packages`.",
+            created_payload["agent_context"]["environment"]["install_policy"],
+        )
+        self.assertIn(
+            "Do not use plain `pip install`",
+            created_payload["agent_context"]["environment"]["install_policy"],
+        )
+        self.assertIn(
+            "Use the root cell for setup, imports, dataset loading, and package installs.",
+            created_payload["agent_context"]["environment"]["workflow_guidelines"],
+        )
+        self.assertIn(
+            "For non-default packages, install them in a setup cell with `!pip install <package>` before import.",
+            created_payload["agent_context"]["environment"]["workflow_guidelines"],
+        )
+        self.assertIn(
+            "first runnable cell a setup cell",
+            created_payload["agent_context"]["authoring"]["setup_workflow"],
         )
 
         fetched = self.server.call_tool("get_experiment", {"experiment_id": "tree_1"})
@@ -357,7 +393,6 @@ class McpPythonTests(unittest.TestCase):
                             "upstream_cell_ids": [],
                             "declared_outputs": [],
                             "cache": True,
-                            "timeout_secs": None,
                             "tags": {},
                             "state": "clean",
                         }
@@ -435,25 +470,39 @@ class McpPythonTests(unittest.TestCase):
         self.assertEqual(timed_out_status_payload["status"], "timed_out")
         self.assertEqual(timed_out_status_payload["phase"], "timed_out")
 
-        waited = self.server.call_tool(
-            "wait_for_execution",
-            {"execution_id": "exec_1", "timeout_secs": 0, "poll_interval_ms": 50},
-        )
-        self.assertFalse(waited.is_error)
-        waited_payload = json.loads(waited.content[0]["text"])
-        self.assertTrue(waited_payload["timed_out"])
-        self.assertEqual(waited_payload["status"]["execution_id"], "exec_1")
-        self.assertEqual(waited_payload["status"]["phase"], "cancellation_requested")
-
         waited_timed_out = self.server.call_tool(
             "wait_for_execution",
-            {"execution_id": "exec_timeout", "timeout_secs": 5, "poll_interval_ms": 50},
+            {"execution_id": "exec_timeout", "poll_interval_ms": 50},
         )
         self.assertFalse(waited_timed_out.is_error)
         waited_timed_out_payload = json.loads(waited_timed_out.content[0]["text"])
-        self.assertFalse(waited_timed_out_payload["timed_out"])
-        self.assertEqual(waited_timed_out_payload["status"]["status"], "timed_out")
-        self.assertEqual(waited_timed_out_payload["status"]["phase"], "timed_out")
+        self.assertEqual(waited_timed_out_payload["status"], "timed_out")
+        self.assertEqual(waited_timed_out_payload["phase"], "timed_out")
+        self.assertTrue(waited_timed_out_payload["terminal"])
+        self.assertFalse(waited_timed_out_payload["wait_exhausted"])
+
+        waited_running = self.server.call_tool(
+            "wait_for_execution",
+            {"execution_id": "exec_wait", "wait_timeout_secs": 0, "poll_interval_ms": 50},
+        )
+        self.assertFalse(waited_running.is_error)
+        waited_running_payload = json.loads(waited_running.content[0]["text"])
+        self.assertEqual(waited_running_payload["execution_id"], "exec_wait")
+        self.assertEqual(waited_running_payload["status"], "running")
+        self.assertEqual(waited_running_payload["phase"], "running")
+        self.assertFalse(waited_running_payload["terminal"])
+        self.assertTrue(waited_running_payload["wait_exhausted"])
+        self.assertEqual(_Handler.wait_status_requests, 1)
+
+        waited_legacy_alias = self.server.call_tool(
+            "wait_for_execution",
+            {"execution_id": "exec_wait", "timeout_secs": 0, "poll_interval_ms": 50},
+        )
+        self.assertFalse(waited_legacy_alias.is_error)
+        waited_legacy_alias_payload = json.loads(waited_legacy_alias.content[0]["text"])
+        self.assertEqual(waited_legacy_alias_payload["execution_id"], "exec_wait")
+        self.assertFalse(waited_legacy_alias_payload["terminal"])
+        self.assertTrue(waited_legacy_alias_payload["wait_exhausted"])
 
     def test_create_experiment_populates_root_cell_and_saves_tree(self) -> None:
         created_tree = {
@@ -470,7 +519,6 @@ class McpPythonTests(unittest.TestCase):
                     "upstream_cell_ids": [],
                     "declared_outputs": [],
                     "cache": True,
-                    "timeout_secs": None,
                     "tags": {},
                     "state": "clean",
                 }
@@ -484,7 +532,6 @@ class McpPythonTests(unittest.TestCase):
         }
         saved_tree["cells"][0]["declared_outputs"] = ["result"]
         saved_tree["cells"][0]["cache"] = False
-        saved_tree["cells"][0]["timeout_secs"] = 30
 
         with (
             mock.patch.object(
@@ -505,7 +552,6 @@ class McpPythonTests(unittest.TestCase):
                     "source": "print('root')\n",
                     "outputs": ["result"],
                     "cache": False,
-                    "timeout_secs": 30,
                 },
             )
 
@@ -520,7 +566,6 @@ class McpPythonTests(unittest.TestCase):
         self.assertEqual(first_cell["code"], {"source": "print('root')\n", "language": "python"})
         self.assertEqual(first_cell["declared_outputs"], ["result"])
         self.assertEqual(first_cell["cache"], False)
-        self.assertEqual(first_cell["timeout_secs"], 30)
 
         result_payload = json.loads(result.content[0]["text"])
         self.assertEqual(
@@ -548,7 +593,6 @@ class McpPythonTests(unittest.TestCase):
                     "upstream_cell_ids": [],
                     "declared_outputs": [],
                     "cache": True,
-                    "timeout_secs": None,
                     "tags": {},
                     "state": "clean",
                 }
@@ -587,7 +631,6 @@ class McpPythonTests(unittest.TestCase):
                     "upstream_cell_ids": [],
                     "declared_outputs": [],
                     "cache": True,
-                    "timeout_secs": None,
                     "tags": {},
                     "state": "clean",
                 }
@@ -611,6 +654,10 @@ class McpPythonTests(unittest.TestCase):
         payload = json.loads(result.content[0]["text"])
         self.assertIn(
             "empty root cell (`cell_1`)",
+            payload["agent_context"]["authoring"]["next_step_hint"],
+        )
+        self.assertIn(
+            "`!pip install ...`",
             payload["agent_context"]["authoring"]["next_step_hint"],
         )
 
@@ -723,7 +770,6 @@ class McpPythonTests(unittest.TestCase):
                 "source": "print('api')\n",
                 "outputs": ["result"],
                 "cache": False,
-                "timeout_secs": 15,
             },
         )
 
@@ -744,7 +790,6 @@ class McpPythonTests(unittest.TestCase):
         self.assertEqual(first_cell["code"], {"source": "print('api')\n", "language": "python"})
         self.assertEqual(first_cell["declared_outputs"], ["result"])
         self.assertEqual(first_cell["cache"], False)
-        self.assertEqual(first_cell["timeout_secs"], 15)
         self.assertEqual(first_cell["state"], "clean")
 
     def test_add_cell_round_trips_lightweight_payload_over_api(self) -> None:
@@ -757,7 +802,6 @@ class McpPythonTests(unittest.TestCase):
                 "source": "print('child')\n",
                 "outputs": ["result"],
                 "cache": False,
-                "timeout_secs": 5,
             },
         )
 
@@ -775,7 +819,6 @@ class McpPythonTests(unittest.TestCase):
         self.assertEqual(cell["code"], {"source": "print('child')\n", "language": "python"})
         self.assertEqual(cell["declared_outputs"], ["result"])
         self.assertEqual(cell["cache"], False)
-        self.assertEqual(cell["timeout_secs"], 5)
 
     def test_update_move_and_delete_cell_round_trip_over_api(self) -> None:
         updated = self.server.call_tool(

@@ -86,8 +86,8 @@
   /* Layout */
   --sidebar-w: 280px;
   --sidebar-collapsed-w: 44px;
-  --titlebar-h: 56px;
-  --titlebar-logo-h: 40px;
+  --titlebar-h: 72px;
+  --titlebar-logo-h: 72px;
 }
 
 /* ── Reset ────────────────────────────────────────────────────── */
@@ -163,7 +163,7 @@ html, body, #root {
 .titlebar-logo-mark {
   width: auto;
   height: var(--titlebar-logo-h);
-  max-width: min(180px, 24vw);
+  max-width: min(280px, 34vw);
   object-fit: contain;
   display: block;
 }
@@ -193,8 +193,8 @@ html, body, #root {
   }
 
   .titlebar-logo-mark {
-    height: 34px;
-    max-width: min(150px, 36vw);
+    height: 56px;
+    max-width: min(220px, 52vw);
   }
 }
 

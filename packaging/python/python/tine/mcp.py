@@ -69,7 +69,7 @@ class McpServer:
             ),
             _tool(
                 "create_experiment",
-                "Create a new experiment tree with a default main branch. You can optionally populate the root Cell 1 using either a full `first_cell` object or lightweight authoring fields such as `source`, `language`, `cell_name`, `outputs`, `cache`, and `timeout_secs`. The response includes agent context with the experiment's current package list and guidance to use `!` in a setup cell for any extra packages it needs.",
+                "Create a new experiment tree with a default main branch. You can optionally populate the root Cell 1 using either a full `first_cell` object or lightweight authoring fields such as `source`, `language`, `cell_name`, `outputs`, and `cache`. The response includes agent context with the experiment's current package list plus explicit guidance about defaults, when to install extra packages, and using `!pip install ...` in a setup cell for anything not already available.",
                 {
                     "type": "object",
                     "properties": {
@@ -92,7 +92,6 @@ class McpServer:
                         "upstream": {"type": "array", "items": {"type": "string"}},
                         "outputs": {"type": "array", "items": {"type": "string"}},
                         "cache": {"type": "boolean"},
-                        "timeout_secs": {"type": "integer"},
                     },
                     "required": ["name"],
                 },
@@ -108,7 +107,7 @@ class McpServer:
             ),
             _tool(
                 "get_experiment",
-                "Get an experiment tree definition by ID. The response includes agent context with the experiment's current package list and guidance to use `!` in a setup cell for any extra packages it needs.",
+                "Get an experiment tree definition by ID. The response includes agent context with the experiment's current package list plus explicit guidance about defaults, when to install extra packages, and using `!pip install ...` in a setup cell for anything not already available.",
                 {
                     "type": "object",
                     "properties": {"experiment_id": {"type": "string"}},
@@ -147,7 +146,7 @@ class McpServer:
             ),
             _tool(
                 "create_branch",
-                "Create a branch in an experiment tree from a parent branch and branch point cell. You can supply the first cell using either a full `first_cell` object or lightweight authoring fields such as `source`, `language`, `cell_name`, `id`, `upstream`, `outputs`, `cache`, `timeout_secs`. The MCP adapter expands lightweight inputs into the full backend cell shape and fills server-owned defaults like `tree_id` and placeholder `branch_id`. If omitted entirely, Tine creates an empty Python starter cell so the agent can begin writing immediately.",
+                "Create a branch in an experiment tree from a parent branch and branch point cell. You can supply the first cell using either a full `first_cell` object or lightweight authoring fields such as `source`, `language`, `cell_name`, `id`, `upstream`, `outputs`, and `cache`. The MCP adapter expands lightweight inputs into the full backend cell shape and fills server-owned defaults like `tree_id` and placeholder `branch_id`. If omitted entirely, Tine creates an empty Python starter cell so the agent can begin writing immediately.",
                 {
                     "type": "object",
                     "properties": {
@@ -172,14 +171,13 @@ class McpServer:
                         "upstream": {"type": "array", "items": {"type": "string"}},
                         "outputs": {"type": "array", "items": {"type": "string"}},
                         "cache": {"type": "boolean"},
-                        "timeout_secs": {"type": "integer"},
                     },
                     "required": ["experiment_id", "parent_branch_id", "name", "branch_point_cell_id"],
                 },
             ),
             _tool(
                 "add_cell",
-                "Add a cell to a branch. You can supply the cell using either a full `cell` object or lightweight authoring fields such as `source`, `language`, `cell_name`, `id`, `upstream`, `outputs`, `cache`, and `timeout_secs`.",
+                "Add a cell to a branch. You can supply the cell using either a full `cell` object or lightweight authoring fields such as `source`, `language`, `cell_name`, `id`, `upstream`, `outputs`, and `cache`.",
                 {
                     "type": "object",
                     "properties": {
@@ -197,7 +195,6 @@ class McpServer:
                         "upstream": {"type": "array", "items": {"type": "string"}},
                         "outputs": {"type": "array", "items": {"type": "string"}},
                         "cache": {"type": "boolean"},
-                        "timeout_secs": {"type": "integer"},
                     },
                     "required": ["experiment_id"],
                 },
@@ -322,12 +319,13 @@ class McpServer:
             ),
             _tool(
                 "wait_for_execution",
-                "Wait for an execution to reach a terminal lifecycle state by polling the status API. Returns the latest status object plus whether the wait itself timed out.",
+                "Wait for an execution to reach a terminal lifecycle state by polling the status API. `wait_timeout_secs` bounds how long the tool waits before returning the latest status with `terminal=false` and `wait_exhausted=true`. `timeout_secs` is accepted as a legacy alias.",
                 {
                     "type": "object",
                     "properties": {
                         "execution_id": {"type": "string"},
-                        "timeout_secs": {"type": "integer", "default": 30},
+                        "wait_timeout_secs": {"type": "integer", "default": 30, "minimum": 0},
+                        "timeout_secs": {"type": "integer", "minimum": 0},
                         "poll_interval_ms": {"type": "integer", "default": 500},
                     },
                     "required": ["execution_id"],
@@ -541,22 +539,38 @@ class McpServer:
                 return self._ok(self.api.status(_required_string(args, "execution_id")))
             if name == "wait_for_execution":
                 execution_id = _required_string(args, "execution_id")
-                timeout_secs = _optional_int(args, "timeout_secs")
+                wait_timeout_secs = _optional_int(args, "wait_timeout_secs")
+                legacy_timeout_secs = _optional_int(args, "timeout_secs")
                 poll_interval_ms = _optional_int(args, "poll_interval_ms")
-                timeout_secs = 30 if timeout_secs is None else timeout_secs
+                if wait_timeout_secs is None:
+                    wait_timeout_secs = 30 if legacy_timeout_secs is None else legacy_timeout_secs
+                if wait_timeout_secs < 0:
+                    raise RuntimeError("invalid field 'wait_timeout_secs': expected a non-negative integer")
                 poll_interval_ms = 500 if poll_interval_ms is None else poll_interval_ms
-                deadline = time.monotonic() + timeout_secs
+                deadline = time.monotonic() + wait_timeout_secs
+
                 def _is_terminal_execution_status(status: dict[str, Any]) -> bool:
                     lifecycle = str(status.get("status") or "").strip().lower()
                     if lifecycle in {"completed", "failed", "cancelled", "timed_out", "rejected"}:
                         return True
                     return status.get("finished_at") is not None
+
+                def _wait_result(status: dict[str, Any], *, terminal: bool, wait_exhausted: bool) -> dict[str, Any]:
+                    payload = dict(status)
+                    payload["terminal"] = terminal
+                    payload["wait_exhausted"] = wait_exhausted
+                    return payload
+
                 while True:
                     status = self.api.status(execution_id)
                     if _is_terminal_execution_status(status):
-                        return self._ok({"timed_out": False, "status": status})
+                        return self._ok(
+                            _wait_result(status, terminal=True, wait_exhausted=False)
+                        )
                     if time.monotonic() >= deadline:
-                        return self._ok({"timed_out": True, "status": status})
+                        return self._ok(
+                            _wait_result(status, terminal=False, wait_exhausted=True)
+                        )
                     time.sleep(max(poll_interval_ms, 50) / 1000)
             if name == "logs":
                 return self._ok(
@@ -893,7 +907,6 @@ def _cell_payload(
         "upstream_cell_ids": _optional_string_list(payload, "upstream"),
         "declared_outputs": _optional_string_list(payload, "outputs"),
         "cache": payload.get("cache", True),
-        "timeout_secs": payload.get("timeout_secs"),
         },
         experiment_id=experiment_id,
         branch_id=branch_id,
@@ -912,7 +925,6 @@ def _has_root_cell_authoring_args(payload: dict[str, Any]) -> bool:
             "upstream",
             "outputs",
             "cache",
-            "timeout_secs",
         )
     )
 
@@ -1027,7 +1039,6 @@ def _normalized_cell_payload(
         "cache": cache,
         "map_over": map_over,
         "map_concurrency": map_concurrency,
-        "timeout_secs": _optional_int(cell, "timeout_secs"),
         "tags": tags,
         "revision_id": cell.get("revision_id"),
         "state": _optional_string(cell, "state") or "clean",
@@ -1085,12 +1096,18 @@ def _experiment_payload(
             "Prefer using the root Cell 1 for initial setup, imports, and dataset loading "
             "before adding more cells or branches."
         ),
+        "setup_workflow": (
+            "Start by checking `effective_packages`. If the experiment needs packages that are "
+            "not already listed there, make the first runnable cell a setup cell that installs "
+            "them with `!pip install ...` before importing them in later cells."
+        ),
     }
     if root_cell_was_seeded is False and root_cell_id:
         authoring_context["next_step_hint"] = (
             f"This experiment was created with an empty root cell (`{root_cell_id}`). "
             f"Prefer updating `{root_cell_id}` for the initial setup or EDA cell instead of "
-            "immediately adding a second cell."
+            "immediately adding a second cell. If you need non-default packages, start there "
+            "with a setup cell that uses `!pip install ...`."
         )
 
     return {
@@ -1101,14 +1118,28 @@ def _experiment_payload(
                 "required_runtime_packages": list(TINE_REQUIRED_PACKAGES),
                 "always_available_packages": list(TINE_DEFAULT_PACKAGES),
                 "effective_packages": effective_packages,
+                "install_policy": (
+                    "Only install packages that are missing from `effective_packages`. For any "
+                    "missing package, create or update a setup cell and install it with `!pip "
+                    "install <package>` before importing it. Do not use plain `pip install` or "
+                    "`python -m pip` outside notebook cells."
+                ),
+                "workflow_guidelines": [
+                    "Check `effective_packages` before installing anything.",
+                    "Use the root cell for setup, imports, dataset loading, and package installs.",
+                    "For non-default packages, install them in a setup cell with `!pip install <package>` before import.",
+                    "Do not emit install commands for packages already listed in `effective_packages`.",
+                    "After package installation, run the setup cell successfully before executing dependent cells.",
+                ],
                 "guidance": (
                     "Every Tine experiment already includes the runtime packages in "
                     "`required_runtime_packages` and the common data-science stack in "
                     "`always_available_packages`. `declared_dependencies` are additional "
                     "packages explicitly requested for this experiment. Do not add inline "
                     "package-install helpers for those built-ins. If you need something not "
-                    "listed in `effective_packages`, add a setup cell that uses `!` to "
-                    "install it before importing."
+                    "listed in `effective_packages`, start with a setup cell that uses `!pip "
+                    "install ...` before importing. Prefer the root cell for this setup work so "
+                    "later cells can assume the environment is ready."
                 ),
             },
             "authoring": authoring_context,
@@ -1185,7 +1216,6 @@ def _experiment_summary(tree: dict[str, Any]) -> dict[str, Any]:
                 "upstream_cell_ids": cell.get("upstream_cell_ids", []),
                 "declared_outputs": cell.get("declared_outputs", []),
                 "cache": cell.get("cache"),
-                "timeout_secs": cell.get("timeout_secs"),
                 "state": cell.get("state"),
             }
             for cell in safe_cells

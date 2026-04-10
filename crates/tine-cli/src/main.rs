@@ -316,8 +316,6 @@ pub struct CellSpecArgs {
     outputs: Vec<String>,
     #[arg(long, default_value_t = false)]
     no_cache: bool,
-    #[arg(long)]
-    timeout_secs: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -789,7 +787,6 @@ fn load_or_build_cell_def(
         cache: !args.no_cache,
         map_over: None,
         map_concurrency: None,
-        timeout_secs: args.timeout_secs,
         tags: HashMap::new(),
         revision_id: None,
         state: CellRuntimeState::Clean,

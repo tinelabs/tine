@@ -356,7 +356,6 @@ struct LightweightBranchCellRequest {
     cache: Option<bool>,
     map_over: Option<String>,
     map_concurrency: Option<usize>,
-    timeout_secs: Option<u64>,
     tags: Option<HashMap<String, String>>,
     revision_id: Option<String>,
     state: Option<CellRuntimeState>,
@@ -447,7 +446,6 @@ impl LightweightBranchCellRequest {
             cache: self.cache.unwrap_or(true),
             map_over: self.map_over.map(SlotName::new),
             map_concurrency: self.map_concurrency,
-            timeout_secs: self.timeout_secs,
             tags: self.tags.unwrap_or_default(),
             revision_id: self.revision_id.map(RevisionId::new),
             state: self.state.unwrap_or(CellRuntimeState::Clean),
@@ -1315,7 +1313,6 @@ mod tests {
             "cache": false,
             "map_over": null,
             "map_concurrency": null,
-            "timeout_secs": null,
             "tags": {},
             "revision_id": null,
             "state": CellRuntimeState::Clean
@@ -1327,8 +1324,7 @@ mod tests {
             "source": source,
             "language": "python",
             "outputs": ["branch_value"],
-            "cache": false,
-            "timeout_secs": 30
+            "cache": false
         })
     }
 
@@ -1637,7 +1633,6 @@ mod tests {
         assert_eq!(branch_cell.code.source, "branch_value = 2\nprint(branch_value)\n");
         assert_eq!(branch_cell.code.language, "python");
         assert_eq!(branch_cell.declared_outputs, vec![SlotName::new("branch_value")]);
-        assert_eq!(branch_cell.timeout_secs, Some(30));
         assert!(!branch_cell.cache);
     }
 
@@ -1961,7 +1956,6 @@ mod tests {
                     "cache": false,
                     "map_over": null,
                     "map_concurrency": null,
-                    "timeout_secs": null,
                     "tags": {},
                     "revision_id": null,
                     "state": "clean"
@@ -1993,7 +1987,6 @@ mod tests {
                     "cache": false,
                     "map_over": null,
                     "map_concurrency": null,
-                    "timeout_secs": null,
                     "tags": {},
                     "revision_id": null,
                     "state": "clean"
@@ -2095,7 +2088,6 @@ mod tests {
                     "cache": false,
                     "map_over": null,
                     "map_concurrency": null,
-                    "timeout_secs": null,
                     "tags": {},
                     "revision_id": null,
                     "state": "clean"
@@ -2127,7 +2119,6 @@ mod tests {
                     "cache": false,
                     "map_over": null,
                     "map_concurrency": null,
-                    "timeout_secs": null,
                     "tags": {},
                     "revision_id": null,
                     "state": "clean"

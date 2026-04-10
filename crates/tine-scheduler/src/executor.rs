@@ -15,7 +15,7 @@ use tine_core::{
 };
 use tine_env::{EnvironmentManager, TreeEnvironmentDescriptor};
 use tine_graph::ExecutableTreeGraph;
-use tine_kernel::{KernelExecutionResult, KernelManager, DEFAULT_EXECUTION_TIMEOUT_SECS};
+use tine_kernel::{KernelExecutionResult, KernelManager};
 
 // Metric name constants (matching tine-observe)
 const M_NODES_EXECUTED: &str = "tine_nodes_executed_total";
@@ -56,19 +56,11 @@ struct SchedulerExecutionTarget {
 
 impl Scheduler {
     fn node_error_from_tine_error(error: &TineError) -> NodeError {
-        match error {
-            TineError::ExecutionTimedOut { .. } => NodeError {
-                ename: "ExecutionTimedOut".to_string(),
-                evalue: error.to_string(),
-                traceback: Vec::new(),
-                hints: Vec::new(),
-            },
-            _ => NodeError {
-                ename: "ExecutionError".to_string(),
-                evalue: error.to_string(),
-                traceback: Vec::new(),
-                hints: Vec::new(),
-            },
+        NodeError {
+            ename: "ExecutionError".to_string(),
+            evalue: error.to_string(),
+            traceback: Vec::new(),
+            hints: Vec::new(),
         }
     }
 
@@ -829,9 +821,8 @@ async fn execute_cell(
 
     let node_start = Instant::now();
 
-    // Execute the node's code (with per-node timeout if set)
+    // Execute the node's code without an execution deadline.
     // On communication failure, attempt one kernel restart and retry.
-    let timeout_secs = cell.timeout_secs.unwrap_or(DEFAULT_EXECUTION_TIMEOUT_SECS);
     let stream_tx = event_tx.clone();
     let stream_execution_id = execution_id.clone();
     let stream_node_id = Scheduler::node_id_for_cell(cell);
@@ -855,31 +846,23 @@ async fn execute_cell(
         });
     };
     let mut result = match kernel_mgr
-        .execute_tree_code_with_timeout_and_stream(
-            &branch.tree_id,
-            &cell.code.source,
-            timeout_secs,
-            &mut emit_live_stream,
-        )
+        .execute_tree_code_with_stream(&branch.tree_id, &cell.code.source, &mut emit_live_stream)
         .await
     {
         Ok(r) => r,
-        Err(TineError::ExecutionTimedOut { timeout_secs }) => {
-            return Err(TineError::ExecutionTimedOut { timeout_secs });
-        }
         Err(tine_core::TineError::KernelComm(_)) => {
             warn!(
                 node = %Scheduler::node_id_for_cell(cell),
                 "kernel communication failed, attempting restart and retry"
             );
+            let _ = event_tx.send(ExecutionEvent::FallbackRestartTriggered {
+                tree_id: branch.tree_id.clone(),
+                branch_id: branch_id.clone().unwrap_or_else(|| branch.branch_id.clone()),
+                reason: "Kernel communication lost; restarting runtime".to_string(),
+            });
             kernel_mgr.restart_tree_kernel(&branch.tree_id).await?;
             kernel_mgr
-                .execute_tree_code_with_timeout_and_stream(
-                    &branch.tree_id,
-                    &cell.code.source,
-                    timeout_secs,
-                    &mut emit_live_stream,
-                )
+                .execute_tree_code_with_stream(&branch.tree_id, &cell.code.source, &mut emit_live_stream)
                 .await?
         }
         Err(e) => return Err(e),
@@ -1120,7 +1103,6 @@ mod tests {
                     "cache": true,
                     "map_over": null,
                     "map_concurrency": null,
-                    "timeout_secs": null,
                     "tags": {},
                     "revision_id": null
                 },
@@ -1140,7 +1122,6 @@ mod tests {
                     "cache": false,
                     "map_over": null,
                     "map_concurrency": null,
-                    "timeout_secs": 30,
                     "tags": { "stage": "eval" },
                     "revision_id": null
                 }

@@ -196,7 +196,6 @@ impl PyWorkspace {
                     cache: node.cache,
                     map_over: node.map_over,
                     map_concurrency: node.map_concurrency,
-                    timeout_secs: node.timeout_secs,
                     tags: node.tags,
                     revision_id: None,
                     state: CellRuntimeState::Clean,
@@ -464,7 +463,6 @@ fn py_list_to_node_defs(list: &Bound<'_, PyList>) -> PyResult<Vec<NodeDef>> {
             map_over,
             map_concurrency,
             cache: true,
-            timeout_secs: None,
             tags: HashMap::new(),
         });
     }

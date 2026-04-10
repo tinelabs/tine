@@ -72,7 +72,7 @@ impl ArtifactStore for MemoryArtifactStore {
             key: key.clone(),
             size_bytes: data.len() as u64,
             schema: None,
-            created_at: Utc::now(),
+            created_at: chrono::Utc::now(),
             content_hash: *blake3::hash(&data).as_bytes(),
         })
     }
@@ -88,23 +88,7 @@ impl ArtifactStore for MemoryArtifactStore {
 
 #[tokio::test]
 #[serial]
-async fn test_save_and_load_experiment_tree() {
-    let (_tmp, ws) = open_temp_workspace().await;
-    let tree = trivial_tree();
-
-    let id = ws.save_experiment_tree(&tree).await.unwrap().id;
-    let loaded = ws.get_experiment_tree(&id).await.unwrap();
-
-    assert_eq!(loaded.id, tree.id);
-    assert_eq!(loaded.name, tree.name);
-    assert_eq!(loaded.root_branch_id, tree.root_branch_id);
-    assert_eq!(loaded.branches.len(), 1);
-    assert_eq!(loaded.cells.len(), tree.cells.len());
-}
-
-#[tokio::test]
-#[serial]
-async fn test_list_experiment_trees_returns_saved_entries() {
+async fn test_list_experiment_trees() {
     let (_tmp, ws) = open_temp_workspace().await;
 
     let tree1 = trivial_tree();
@@ -161,7 +145,6 @@ async fn test_runtime_branch_materializations_are_hidden_from_experiment_lists()
                 cache: false,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -222,7 +205,6 @@ async fn test_create_branch_in_experiment_tree() {
                 cache: false,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -282,7 +264,6 @@ fn test_descendant_cell_ids_compat() {
         cache: false,
         map_over: None,
         map_concurrency: None,
-        timeout_secs: None,
         tags: HashMap::new(),
         revision_id: None,
         state: CellRuntimeState::Clean,
@@ -321,7 +302,6 @@ async fn test_mark_stale_descendants_compat() {
             cache: false,
             map_over: None,
             map_concurrency: None,
-            timeout_secs: None,
             tags: HashMap::new(),
             revision_id: None,
             state: CellRuntimeState::Clean,
@@ -497,7 +477,6 @@ fn trivial_tree() -> ExperimentTreeDef {
             cache: false,
             map_over: None,
             map_concurrency: None,
-            timeout_secs: None,
             tags: HashMap::new(),
             revision_id: None,
             state: CellRuntimeState::Clean,
@@ -542,7 +521,6 @@ fn slow_single_cell_tree() -> ExperimentTreeDef {
             cache: false,
             map_over: None,
             map_concurrency: None,
-            timeout_secs: None,
             tags: HashMap::new(),
             revision_id: None,
             state: CellRuntimeState::Clean,
@@ -587,7 +565,6 @@ fn two_cell_tree() -> ExperimentTreeDef {
                 cache: false,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -606,7 +583,6 @@ fn two_cell_tree() -> ExperimentTreeDef {
                 cache: false,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -691,7 +667,6 @@ async fn test_notebook_bang_pip_install_uses_tree_environment() {
             cache: false,
             map_over: None,
             map_concurrency: None,
-            timeout_secs: None,
             tags: HashMap::new(),
             revision_id: None,
             state: CellRuntimeState::Clean,
@@ -755,7 +730,6 @@ async fn test_execute_branch_path_persists_target_metadata_and_tree_logs() {
                 cache: false,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -821,7 +795,6 @@ async fn test_execute_all_branches_exposes_queued_lifecycle_status() {
                 cache: false,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -851,7 +824,6 @@ async fn test_execute_all_branches_exposes_queued_lifecycle_status() {
                 cache: false,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -901,6 +873,96 @@ async fn test_execute_all_branches_exposes_queued_lifecycle_status() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_execute_all_branches_stops_after_first_branch_failure() {
+    let (_tmp, ws) = open_temp_workspace().await;
+    let tree = two_cell_tree();
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+    let root_branch_id = tree.root_branch_id.clone();
+
+    let failing_branch_id = ws
+        .create_branch_in_experiment_tree(
+            &tree_id,
+            &root_branch_id,
+            "branch-fail".to_string(),
+            &CellId::new("step1"),
+            CellDef {
+                id: CellId::new("branch_fail_step"),
+                tree_id: tree_id.clone(),
+                branch_id: root_branch_id.clone(),
+                name: "branch fail step".to_string(),
+                code: NodeCode {
+                    source: "raise RuntimeError('branch failed on purpose')\n".to_string(),
+                    language: "python".to_string(),
+                },
+                upstream_cell_ids: vec![CellId::new("step1")],
+                declared_outputs: vec![SlotName::new("branch_fail_value")],
+                cache: false,
+                map_over: None,
+                map_concurrency: None,
+                tags: HashMap::new(),
+                revision_id: None,
+                state: CellRuntimeState::Clean,
+            },
+        )
+        .await
+        .unwrap();
+
+    let skipped_branch_id = ws
+        .create_branch_in_experiment_tree(
+            &tree_id,
+            &root_branch_id,
+            "branch-skipped".to_string(),
+            &CellId::new("step1"),
+            CellDef {
+                id: CellId::new("branch_skipped_step"),
+                tree_id: tree_id.clone(),
+                branch_id: root_branch_id.clone(),
+                name: "branch skipped step".to_string(),
+                code: NodeCode {
+                    source: "print('branch skipped should not execute', flush=True)\nbranch_skipped_value = step1 + 99\n".to_string(),
+                    language: "python".to_string(),
+                },
+                upstream_cell_ids: vec![CellId::new("step1")],
+                declared_outputs: vec![SlotName::new("branch_skipped_value")],
+                cache: false,
+                map_over: None,
+                map_concurrency: None,
+                tags: HashMap::new(),
+                revision_id: None,
+                state: CellRuntimeState::Clean,
+            },
+        )
+        .await
+        .unwrap();
+
+    let execution_ids: HashMap<_, _> = ws
+        .execute_all_branches_in_experiment_tree(&tree_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+
+    let root_status = wait_for_execution_finished(&ws, execution_ids.get(&root_branch_id).unwrap()).await;
+    let failing_status = wait_for_execution_finished(&ws, execution_ids.get(&failing_branch_id).unwrap()).await;
+    let skipped_status = wait_for_execution_finished(&ws, execution_ids.get(&skipped_branch_id).unwrap()).await;
+
+    assert_eq!(root_status.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(failing_status.status, ExecutionLifecycleStatus::Failed);
+    assert_eq!(skipped_status.status, ExecutionLifecycleStatus::Failed);
+
+    let skipped_logs = ws
+        .logs_for_tree_cell(&tree_id, &skipped_branch_id, &CellId::new("branch_skipped_step"))
+        .await
+        .unwrap();
+    assert!(
+        !skipped_logs.stdout.contains("branch skipped should not execute"),
+        "later branch unexpectedly executed: {:?}",
+        skipped_logs.stdout
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 9. Event subscription
 // ---------------------------------------------------------------------------
@@ -940,7 +1002,6 @@ async fn test_namespace_guarded_run_all_emits_success_events() {
                 cache: false,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -1113,7 +1174,6 @@ async fn test_namespace_guarded_queued_run_all_avoids_contamination_fallback() {
                 cache: false,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -1397,7 +1457,6 @@ async fn test_add_cell_to_experiment_tree_branch_updates_branch_order() {
                 cache: true,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -1423,7 +1482,6 @@ async fn test_add_cell_to_experiment_tree_branch_updates_branch_order() {
             cache: true,
             map_over: None,
             map_concurrency: None,
-            timeout_secs: None,
             tags: HashMap::new(),
             revision_id: None,
             state: CellRuntimeState::Clean,
@@ -1481,7 +1539,6 @@ async fn test_branch_cell_mutations_persist() {
                 cache: true,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -1507,7 +1564,6 @@ async fn test_branch_cell_mutations_persist() {
             cache: true,
             map_over: None,
             map_concurrency: None,
-            timeout_secs: None,
             tags: HashMap::new(),
             revision_id: None,
             state: CellRuntimeState::Clean,
@@ -1588,7 +1644,6 @@ async fn test_branch_scoped_cell_routes_reject_membership_mismatch() {
                 cache: true,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -1648,7 +1703,6 @@ async fn test_tree_runtime_state_helpers_track_materialization() {
                 cache: true,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -1791,7 +1845,6 @@ async fn test_tree_mutations_force_runtime_replay() {
                 cache: true,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -1828,7 +1881,6 @@ async fn test_tree_mutations_force_runtime_replay() {
             cache: true,
             map_over: None,
             map_concurrency: None,
-            timeout_secs: None,
             tags: HashMap::new(),
             revision_id: None,
             state: CellRuntimeState::Clean,
@@ -2004,7 +2056,6 @@ async fn test_root_branch_add_edit_and_execute_through_tree_api() {
             cache: false,
             map_over: None,
             map_concurrency: None,
-            timeout_secs: None,
             tags: HashMap::new(),
             revision_id: None,
             state: CellRuntimeState::Clean,
@@ -2081,7 +2132,6 @@ async fn test_child_branch_single_cell_execute_replays_and_branch_switch_advance
                 cache: false,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -2110,7 +2160,6 @@ async fn test_child_branch_single_cell_execute_replays_and_branch_switch_advance
                 cache: false,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -2190,7 +2239,6 @@ async fn test_run_all_branches_replays_root_variables_for_branch_cells() {
                 cache: false,
                 map_over: None,
                 map_concurrency: None,
-                timeout_secs: None,
                 tags: HashMap::new(),
                 revision_id: None,
                 state: CellRuntimeState::Clean,
@@ -2348,7 +2396,6 @@ async fn test_move_cell_in_experiment_tree_branch() {
             cache: true,
             map_over: None,
             map_concurrency: None,
-            timeout_secs: None,
             tags: HashMap::new(),
             revision_id: None,
             state: CellRuntimeState::Clean,
@@ -2376,7 +2423,6 @@ async fn test_move_cell_in_experiment_tree_branch() {
             cache: true,
             map_over: None,
             map_concurrency: None,
-            timeout_secs: None,
             tags: HashMap::new(),
             revision_id: None,
             state: CellRuntimeState::Clean,
@@ -2452,7 +2498,6 @@ async fn test_delete_cell_from_experiment_tree_branch() {
             cache: true,
             map_over: None,
             map_concurrency: None,
-            timeout_secs: None,
             tags: HashMap::new(),
             revision_id: None,
             state: CellRuntimeState::Clean,
@@ -2505,80 +2550,6 @@ async fn test_delete_cell_from_experiment_tree_branch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn test_workspace_branch_execution_times_out_and_preserves_timeout_status() {
-    let (_tmp, ws) = open_temp_workspace().await;
-    let tree_id = ExperimentTreeId::new("timeout-api-tree");
-    let branch_id = BranchId::new("main");
-    let cell_id = CellId::new("step1");
-    let tree = ExperimentTreeDef {
-        id: tree_id.clone(),
-        name: "timeout-api-tree".to_string(),
-        project_id: None,
-        root_branch_id: branch_id.clone(),
-        branches: vec![BranchDef {
-            id: branch_id.clone(),
-            name: "main".to_string(),
-            parent_branch_id: None,
-            branch_point_cell_id: None,
-            cell_order: vec![cell_id.clone()],
-            display: HashMap::new(),
-        }],
-        cells: vec![CellDef {
-            id: cell_id.clone(),
-            tree_id: tree_id.clone(),
-            branch_id: branch_id.clone(),
-            name: "step1".to_string(),
-            code: NodeCode {
-                source: "import time\nprint('starting timeout api test', flush=True)\ntime.sleep(5)\nprint('should not reach timeout api end', flush=True)\nstep1 = 42\n".to_string(),
-                language: "python".to_string(),
-            },
-            upstream_cell_ids: vec![],
-            declared_outputs: vec![SlotName::new("step1")],
-            cache: false,
-            map_over: None,
-            map_concurrency: None,
-            timeout_secs: Some(1),
-            tags: HashMap::new(),
-            revision_id: None,
-            state: CellRuntimeState::Clean,
-        }],
-        environment: Default::default(),
-        execution_mode: ExecutionMode::Parallel,
-        budget: None,
-        created_at: chrono::Utc::now(),
-    };
-    ws.save_experiment_tree(&tree).await.unwrap();
-
-    let execution_id = ws
-        .execute_branch_in_experiment_tree(&tree_id, &branch_id)
-        .await
-        .unwrap();
-
-    let final_status = wait_for_execution_finished(&ws, &execution_id).await;
-    assert_eq!(final_status.tree_id.as_ref(), Some(&tree_id));
-    assert_eq!(final_status.status, ExecutionLifecycleStatus::TimedOut);
-    assert_eq!(final_status.phase, tine_core::ExecutionPhase::TimedOut);
-    assert_eq!(
-        final_status.node_statuses.get(&NodeId::new("step1")),
-        Some(&NodeStatus::Failed)
-    );
-
-    let logs = ws
-        .logs_for_tree_cell(&tree_id, &branch_id, &cell_id)
-        .await
-        .unwrap();
-    assert!(
-        !logs.stdout.contains("should not reach timeout api end"),
-        "unexpected post-timeout stdout in {:?}",
-        logs.stdout
-    );
-    let error = logs.error.expect("expected timeout error details");
-    assert_eq!(error.ename, "ExecutionTimedOut");
-    assert!(error.evalue.contains("timed out after 1s"));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
 async fn test_workspace_cancel_interrupts_running_branch_and_preserves_partial_logs() {
     let (_tmp, ws) = open_temp_workspace().await;
     let tree_id = ExperimentTreeId::new("cancel-api-tree");
@@ -2611,7 +2582,6 @@ async fn test_workspace_cancel_interrupts_running_branch_and_preserves_partial_l
             cache: false,
             map_over: None,
             map_concurrency: None,
-            timeout_secs: None,
             tags: HashMap::new(),
             revision_id: None,
             state: CellRuntimeState::Clean,
@@ -2708,7 +2678,6 @@ async fn test_mark_tree_kernel_lost_fails_running_branch_execution() {
             cache: false,
             map_over: None,
             map_concurrency: None,
-            timeout_secs: None,
             tags: HashMap::new(),
             revision_id: None,
             state: CellRuntimeState::Clean,

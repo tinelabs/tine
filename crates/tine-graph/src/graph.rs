@@ -224,7 +224,6 @@ mod tests {
             cache: true,
             map_over: None,
             map_concurrency: None,
-            timeout_secs: None,
             tags: HashMap::new(),
             revision_id: None,
         }
