@@ -136,6 +136,9 @@ jobs:
       - name: Fetch bundled Python runtime
         run: python scripts/release/fetch_app_runtime.py --target ${{ matrix.label }}
 
+      - name: Render tauri.conf.json from template
+        run: python scripts/release/verify_version_alignment.py --repo-root . --tauri-template crates/tine-app/tauri.conf.template.json --tauri-config crates/tine-app/tauri.conf.json --write-tauri-config
+
       - name: Build desktop bundle
         shell: bash
         run: |
