@@ -15,6 +15,15 @@ import { h, render } from "preact";
 import { useState, useEffect, useRef, useCallback } from "preact/hooks";
 import htm from "htm";
 import DOMPurify from "dompurify";
+import { EditorSelection, EditorState } from "https://esm.sh/@codemirror/state@6.4.1";
+import {
+  EditorView,
+  drawSelection,
+  keymap,
+  placeholder as cmPlaceholder,
+} from "https://esm.sh/@codemirror/view@6.36.1";
+import { defaultHighlightStyle, syntaxHighlighting } from "https://esm.sh/@codemirror/language@6.10.8";
+import { python } from "https://esm.sh/@codemirror/lang-python@6.1.6";
 import hljs from "https://esm.sh/highlight.js@11.11.1/lib/core";
 import pythonLanguage from "https://esm.sh/highlight.js@11.11.1/lib/languages/python";
 import {
@@ -37,8 +46,12 @@ import {
   activeBranchPathCellIds,
   describeExecutionProgress,
   fileQuery,
+  hasHttpOrigin,
   normalizeFileTreePath,
   pickActiveBranchId,
+  resolveApiBaseUrl,
+  resolveApiUrl,
+  resolveWebSocketUrl,
   watchedDirForPath,
 } from "./app-helpers.js";
 
@@ -181,7 +194,7 @@ async function fetchJSON(method, url, body) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
   }
-  const res = await fetch(url, opts);
+  const res = await apiFetch(url, opts);
   if (!res.ok) {
     const text = await res.text();
     let data = null;
@@ -317,6 +330,34 @@ function hasDesktopBridge() {
   return typeof resolveDesktopInvoke() === "function";
 }
 
+let desktopApiBaseUrlPromise = null;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function currentApiBaseUrl() {
+  if (!hasDesktopBridge()) {
+    return hasHttpOrigin(location) ? `${location.protocol}//${location.host}` : "";
+  }
+  if (!desktopApiBaseUrlPromise) {
+    desktopApiBaseUrlPromise = resolveApiBaseUrl({
+      locationLike: location,
+      hasDesktopBridge: hasDesktopBridge(),
+      invoke: tauriInvoke,
+      sleep,
+    }).catch((error) => {
+      desktopApiBaseUrlPromise = null;
+      throw error;
+    });
+  }
+  return desktopApiBaseUrlPromise;
+}
+
+async function apiFetch(path, opts) {
+  return fetch(resolveApiUrl(path, await currentApiBaseUrl()), opts);
+}
+
 function previewTypeForPath(path) {
   const ext = String(path || "")
     .split(".")
@@ -395,7 +436,7 @@ const api = {
       initial_dir: initialDir || null,
     }),
   readFile: async (path, projectId) => {
-    const r = await fetch(`/api/files/read?${fileQuery(path, projectId)}`);
+    const r = await apiFetch(`/api/files/read?${fileQuery(path, projectId)}`);
     if (!r.ok) throw new Error(`${r.status}`);
     return r.text();
   },
@@ -1036,49 +1077,55 @@ const WS_MAX_DELAY = 30000;
 let wsInstance = null;
 
 function connectWS() {
-  const ws = new WebSocket(
-    `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`,
-  );
-  wsInstance = ws;
-  ws.onopen = () => {
-    wsRetryDelay = 2000;
-    store.set((s) => ({ ...s, wsConnected: true }));
-    termLog({
-      kind: "system",
-      status: "connected",
-      message: "WebSocket connected",
-    });
-  };
-  ws.onclose = () => {
-    store.set((s) => ({ ...s, wsConnected: false }));
-    termLog({
-      kind: "system",
-      status: "disconnected",
-      message: `WebSocket disconnected, retrying in ${wsRetryDelay / 1000}s`,
-    });
-    setTimeout(connectWS, wsRetryDelay);
-    wsRetryDelay = Math.min(wsRetryDelay * 2, WS_MAX_DELAY);
-  };
-  ws.onerror = () => {};
-  ws.onmessage = (e) => {
-    try {
-      handleEvent(JSON.parse(e.data));
-    } catch (err) {
-      termLog(
-        {
+  currentApiBaseUrl()
+    .then((baseUrl) => {
+      const ws = new WebSocket(resolveWebSocketUrl(location, baseUrl));
+      wsInstance = ws;
+      ws.onopen = () => {
+        wsRetryDelay = 2000;
+        store.set((s) => ({ ...s, wsConnected: true }));
+        termLog({
           kind: "system",
-          status: "parse_error",
-          message: `WebSocket parse error: ${err}`,
-          error: {
-            ename: "WebSocketParseError",
-            evalue: String(err),
-            traceback: [],
-          },
-        },
-        "error",
-      );
-    }
-  };
+          status: "connected",
+          message: "WebSocket connected",
+        });
+      };
+      ws.onclose = () => {
+        store.set((s) => ({ ...s, wsConnected: false }));
+        termLog({
+          kind: "system",
+          status: "disconnected",
+          message: `WebSocket disconnected, retrying in ${wsRetryDelay / 1000}s`,
+        });
+        setTimeout(connectWS, wsRetryDelay);
+        wsRetryDelay = Math.min(wsRetryDelay * 2, WS_MAX_DELAY);
+      };
+      ws.onerror = () => {};
+      ws.onmessage = (e) => {
+        try {
+          handleEvent(JSON.parse(e.data));
+        } catch (err) {
+          termLog(
+            {
+              kind: "system",
+              status: "parse_error",
+              message: `WebSocket parse error: ${err}`,
+              error: {
+                ename: "WebSocketParseError",
+                evalue: String(err),
+                traceback: [],
+              },
+            },
+            "error",
+          );
+        }
+      };
+    })
+    .catch(() => {
+      store.set((s) => ({ ...s, wsConnected: false }));
+      setTimeout(connectWS, wsRetryDelay);
+      wsRetryDelay = Math.min(wsRetryDelay * 2, WS_MAX_DELAY);
+    });
 }
 
 function handleEvent(evt) {
@@ -1542,21 +1589,85 @@ async function cancelExecutionById(execId) {
 }
 
 // ── Cell Component ────────────────────────────────────────────
-function highlightCode(source = "", language = "python") {
-  const code = String(source || "");
-  if (!code) return "";
-  try {
-    return hljs.highlight(code, { language }).value;
-  } catch {
-    return hljs.highlightAuto(code).value;
-  }
-}
 
-function syncEditorHeight(textarea) {
-  if (!textarea) return;
-  textarea.style.height = "0px";
-  const nextHeight = Math.max(textarea.scrollHeight, 88);
-  textarea.style.height = `${nextHeight}px`;
+const cmTheme = EditorView.theme({
+  "&": {
+    minHeight: "88px",
+    backgroundColor: "transparent",
+    color: "var(--fg)",
+    fontFamily: "var(--font-mono)",
+    fontSize: "14px",
+    lineHeight: "1.5",
+  },
+  ".cm-scroller": {
+    overflow: "auto",
+    fontFamily: "inherit",
+  },
+  ".cm-content": {
+    padding: "0",
+    caretColor: "var(--cm-cursor)",
+    fontFamily: "inherit",
+    tabSize: "4",
+    fontVariantLigatures: "none",
+  },
+  ".cm-line": {
+    padding: "0",
+  },
+  ".cm-selectionBackground": {
+    backgroundColor: "var(--cm-selection)",
+  },
+  ".cm-cursor": {
+    borderLeftColor: "var(--cm-cursor)",
+  },
+  ".cm-activeLine": {
+    backgroundColor: "var(--cm-line-hl)",
+  },
+  ".cm-placeholder": {
+    color: "var(--fg-3)",
+  },
+  ".cm-focused": {
+    outline: "none",
+  },
+});
+
+function codeEditorExtensions({ readOnly, placeholder, language, onChange, onShiftEnter }) {
+  const extensions = [
+    EditorView.lineWrapping,
+    drawSelection(),
+    syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+    cmTheme,
+    EditorView.updateListener.of((update) => {
+      if (update.docChanged) onChange?.(update.state.doc.toString());
+    }),
+    keymap.of([
+      {
+        key: "Tab",
+        run: (view) => {
+          const changes = view.state.changeByRange((range) => ({
+            changes: { from: range.from, to: range.to, insert: "    " },
+            range: EditorSelection.cursor(range.from + 4),
+          }));
+          view.dispatch(changes);
+          return true;
+        },
+      },
+      {
+        key: "Shift-Enter",
+        run: () => {
+          if (readOnly) return true;
+          onShiftEnter?.();
+          return true;
+        },
+      },
+    ]),
+    EditorState.readOnly.of(readOnly),
+    EditorView.editable.of(!readOnly),
+  ];
+
+  if (placeholder) extensions.push(cmPlaceholder(placeholder));
+  if (language === "python") extensions.push(python());
+
+  return extensions;
 }
 
 function HighlightEditor({
@@ -1568,86 +1679,76 @@ function HighlightEditor({
   textareaRef = null,
   language = "python",
 }) {
-  const inputRef = useRef(null);
-  const highlightWrapRef = useRef(null);
-  const highlightCodeRef = useRef(null);
+  const hostRef = useRef(null);
+  const editorViewRef = useRef(null);
+  const onChangeRef = useRef(onChange);
+  const onKeyDownRef = useRef(onKeyDown);
 
-  const setTextareaNode = useCallback(
-    (node) => {
-      inputRef.current = node;
-      if (!textareaRef) return;
-      if (typeof textareaRef === "function") {
-        textareaRef(node);
-        return;
+  useEffect(() => {
+    onChangeRef.current = onChange;
+  }, [onChange]);
+
+  useEffect(() => {
+    onKeyDownRef.current = onKeyDown;
+  }, [onKeyDown]);
+
+  useEffect(() => {
+    if (!hostRef.current) return undefined;
+
+    const view = new EditorView({
+      state: EditorState.create({
+        doc: value,
+        extensions: codeEditorExtensions({
+          readOnly,
+          placeholder,
+          language,
+          onChange: (nextValue) => onChangeRef.current?.(nextValue),
+          onShiftEnter: onKeyDownRef.current
+            ? () =>
+                onKeyDownRef.current({
+                  key: "Enter",
+                  shiftKey: true,
+                  preventDefault() {},
+                  stopPropagation() {},
+                })
+            : null,
+        }),
+      }),
+      parent: hostRef.current,
+    });
+
+    editorViewRef.current = view;
+    if (textareaRef) {
+      const focusHandle = { focus: () => view.focus() };
+      if (typeof textareaRef === "function") textareaRef(focusHandle);
+      else textareaRef.current = focusHandle;
+    }
+
+    return () => {
+      if (textareaRef && typeof textareaRef !== "function") {
+        textareaRef.current = null;
       }
-      textareaRef.current = node;
-    },
-    [textareaRef],
-  );
-
-  const syncScroll = useCallback(() => {
-    if (!inputRef.current || !highlightWrapRef.current) return;
-    highlightWrapRef.current.scrollTop = inputRef.current.scrollTop;
-    highlightWrapRef.current.scrollLeft = inputRef.current.scrollLeft;
-  }, []);
+      editorViewRef.current = null;
+      view.destroy();
+    };
+  }, [language, placeholder, readOnly, textareaRef]);
 
   useEffect(() => {
-    if (!highlightCodeRef.current) return;
-    const highlighted = highlightCode(value, language);
-    highlightCodeRef.current.innerHTML =
-      highlighted + (value.endsWith("\n") ? "\n" : "");
-    syncEditorHeight(inputRef.current);
-    syncScroll();
-  }, [value, language, syncScroll]);
-
-  useEffect(() => {
-    syncEditorHeight(inputRef.current);
-    syncScroll();
-  }, [syncScroll]);
+    const view = editorViewRef.current;
+    if (!view) return;
+    const currentValue = view.state.doc.toString();
+    if (currentValue === value) return;
+    view.dispatch({
+      changes: { from: 0, to: currentValue.length, insert: value },
+    });
+  }, [value]);
 
   return html`
     <div
       class="cell-editor-shell ${!value.trim() ? "empty" : ""}"
       data-placeholder=${placeholder}
     >
-      <pre
-        ref=${highlightWrapRef}
-        class="cell-editor-highlight"
-        aria-hidden="true"
-      ><code ref=${highlightCodeRef} class="hljs language-${language}"></code></pre>
-      <textarea
-        ref=${setTextareaNode}
-        class="cell-textarea cell-editor-input"
-        value=${value}
-        readonly=${readOnly}
-        spellcheck="false"
-        autocapitalize="off"
-        autocomplete="off"
-        autocorrect="off"
-        onInput=${(e) => {
-          syncEditorHeight(e.target);
-          syncScroll();
-          if (!readOnly) onChange?.(e.target.value);
-        }}
-        onScroll=${syncScroll}
-        onClick=${(e) => e.stopPropagation()}
-        onKeyDown=${(e) => {
-          e.stopPropagation();
-          if (e.key === "Tab") {
-            e.preventDefault();
-            const el = e.target;
-            const start = el.selectionStart;
-            const end = el.selectionEnd;
-            el.value =
-              el.value.substring(0, start) + "    " + el.value.substring(end);
-            el.selectionStart = el.selectionEnd = start + 4;
-            if (!readOnly) onChange?.(el.value);
-            return;
-          }
-          onKeyDown?.(e);
-        }}
-        placeholder=${placeholder}
-      />
+      <div ref=${hostRef} class="cell-editor-input cm-editor-host"></div>
     </div>
   `;
 }

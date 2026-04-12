@@ -12,6 +12,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+import zipfile
 from pathlib import Path
 
 try:
@@ -71,6 +72,8 @@ def extract_tar_gz(archive_path: Path, destination: Path) -> None:
 
 
 def bundled_python_path(runtime_dir: Path, rust_target: str) -> Path:
+    if "windows" in rust_target:
+        return runtime_dir / "python" / "python.exe"
     return runtime_dir / "python" / "bin" / "python3"
 
 
@@ -95,6 +98,13 @@ def upgrade_bundled_pip(runtime_dir: Path, rust_target: str) -> None:
 
 
 def build_archive(staging_dir: Path, archive_path: Path) -> None:
+    if archive_path.suffix == ".zip":
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for file_path in staging_dir.rglob("*"):
+                if file_path.is_file():
+                    archive.write(file_path, arcname=file_path.relative_to(staging_dir))
+        return
+
     with tarfile.open(archive_path, "w:gz") as archive:
         for file_path in staging_dir.rglob("*"):
             if file_path.is_file():

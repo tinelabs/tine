@@ -5,6 +5,60 @@ export function fileQuery(path, projectId) {
   return params.toString();
 }
 
+export function hasHttpOrigin(locationLike) {
+  const protocol = String(locationLike?.protocol || "");
+  return protocol === "http:" || protocol === "https:";
+}
+
+export async function resolveApiBaseUrl({
+  locationLike,
+  hasDesktopBridge,
+  invoke,
+  retryDelayMs = 250,
+  retryLimit = 20,
+  desktopHost = "127.0.0.1",
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}) {
+  if (hasHttpOrigin(locationLike) && locationLike?.host) {
+    return `${locationLike.protocol}//${locationLike.host}`;
+  }
+
+  if (!hasDesktopBridge || typeof invoke !== "function") {
+    return "";
+  }
+
+  let lastError = null;
+  for (let attempt = 0; attempt < retryLimit; attempt += 1) {
+    try {
+      const port = await invoke("server_port");
+      if (port) {
+        return `http://${desktopHost}:${port}`;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+    await sleep(retryDelayMs);
+  }
+
+  throw lastError || new Error("embedded server port unavailable");
+}
+
+export function resolveApiUrl(path, baseUrl) {
+  return baseUrl ? new URL(path, `${baseUrl}/`).toString() : path;
+}
+
+export function resolveWebSocketUrl(locationLike, baseUrl) {
+  if (baseUrl) {
+    const url = new URL(baseUrl);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    url.pathname = "/ws";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  }
+  return `${locationLike?.protocol === "https:" ? "wss" : "ws"}://${locationLike?.host || ""}/ws`;
+}
+
 export function normalizeFileTreePath(path) {
   if (!path || path === "/" || path === ".") return "";
   return String(path).replace(/^\/+/, "").replace(/\/+$/, "");

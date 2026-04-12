@@ -9,6 +9,7 @@ name = "tine-app"
 path = "src/main.rs"
 
 [build-dependencies]
+image = { version = "0.24.9", default-features = false, features = ["png"] }
 tauri-build = { version = "2", features = [] }
 
 [dependencies]

@@ -92,6 +92,34 @@ Supported release targets today:
 | Linux | x86_64, arm64 |
 | Windows | x86_64 |
 
+## Desktop app
+
+Tine also ships desktop app bundles through GitHub Releases for users who want a native installer instead of the Python wrapper.
+
+Current desktop bundle targets are:
+
+- macOS: `.dmg` for Apple Silicon and Intel
+- Windows: `.msi` for x86_64
+- Linux: `.AppImage` for x86_64
+
+Desktop bundles include a private Python runtime inside the app, so they do not depend on system Python to launch the local notebook experience.
+
+Desktop app downloads live on GitHub Releases:
+
+```text
+https://github.com/tinelabs/tine/releases
+```
+
+Artifact names use the `tine-app-<version>-<platform>` prefix so they stay distinct from the wrapper runtime archives.
+
+The desktop app and `pip install tine` use the same local backend and UI. The difference is only the distribution wrapper.
+
+Current release note:
+
+- desktop bundles are published through the desktop workflow
+- checksum files are attached alongside each bundle
+- macOS and Windows code signing are being phased in separately from artifact publication
+
 The server is the canonical local backend. Both the web UI and MCP connect to that same API.
 
 If you do not want the browser to open automatically:

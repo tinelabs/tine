@@ -33,6 +33,18 @@ class WrapperTests(unittest.TestCase):
                 ],
             )
 
+    def test_expected_release_artifacts_match_windows_contract(self) -> None:
+        with mock.patch("platform.system", return_value="Windows"), mock.patch(
+            "platform.machine", return_value="AMD64"
+        ), mock.patch.object(runtime, "package_version", return_value="0.1.0"):
+            self.assertEqual(
+                runtime.expected_release_artifacts(),
+                [
+                    "tine-0.1.0-x86_64-pc-windows-msvc.zip",
+                    "tine-0.1.0-x86_64-pc-windows-msvc.zip.sha256",
+                ],
+            )
+
     def test_wrapper_execs_compatible_binary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             binary = Path(tmpdir) / "tine"
@@ -134,6 +146,37 @@ class WrapperTests(unittest.TestCase):
             self.assertEqual(
                 resolved.bundled_python_path,
                 resolved.runtime_root / "runtime" / "python" / "bin" / "python3",
+            )
+
+    def test_fetches_windows_binary_from_zip_release_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as release_dir, tempfile.TemporaryDirectory() as cache_dir:
+            release_root = Path(release_dir)
+            self._write_release_artifact_set(
+                release_root,
+                version="0.1.0",
+                target="x86_64-pc-windows-msvc",
+                binary_filename="tine.exe",
+                include_runtime_python=True,
+            )
+
+            with mock.patch("platform.system", return_value="Windows"), mock.patch(
+                "platform.machine", return_value="AMD64"
+            ), mock.patch.dict(
+                os.environ,
+                {
+                    "TINE_PACKAGE_VERSION": "0.1.0",
+                    "TINE_RELEASE_BASE_URL": release_root.as_uri() + "/",
+                    "TINE_CACHE_DIR": cache_dir,
+                },
+                clear=False,
+            ), mock.patch.object(runtime, "source_checkout_binary_candidates", return_value=[]):
+                resolved = runtime.ensure_compatible_runtime()
+
+            self.assertTrue(resolved.binary_path.is_file())
+            self.assertEqual(resolved.binary_path.name, "tine.exe")
+            self.assertEqual(
+                resolved.bundled_python_path,
+                resolved.runtime_root / "runtime" / "python" / "python.exe",
             )
 
     def test_reuses_cached_binary_without_redownloading(self) -> None:
@@ -418,17 +461,27 @@ class WrapperTests(unittest.TestCase):
         binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
 
         if include_runtime_python:
-            python_rel = Path("runtime") / "python" / "bin" / "python3"
+            python_rel = (
+                Path("runtime") / "python" / "python.exe"
+                if target == "x86_64-pc-windows-msvc"
+                else Path("runtime") / "python" / "bin" / "python3"
+            )
             bundled_python = staging / python_rel
             bundled_python.parent.mkdir(parents=True, exist_ok=True)
             bundled_python.write_text("#!/bin/sh\n")
             bundled_python.chmod(bundled_python.stat().st_mode | stat.S_IEXEC)
 
         archive_path = release_root / archive_name
-        with tarfile.open(archive_path, "w:gz") as archive:
-            for file_path in staging.rglob("*"):
-                if file_path.is_file():
-                    archive.add(file_path, arcname=file_path.relative_to(staging))
+        if archive_name.endswith(".zip"):
+            with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for file_path in staging.rglob("*"):
+                    if file_path.is_file():
+                        archive.write(file_path, arcname=file_path.relative_to(staging))
+        else:
+            with tarfile.open(archive_path, "w:gz") as archive:
+                for file_path in staging.rglob("*"):
+                    if file_path.is_file():
+                        archive.add(file_path, arcname=file_path.relative_to(staging))
 
         checksum = hashlib.sha256(archive_path.read_bytes()).hexdigest()
         (release_root / checksum_name).write_text(f"{checksum}  {archive_name}\n")

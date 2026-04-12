@@ -50,6 +50,8 @@ _SUPPORTED_TARGETS: dict[tuple[str, str], SupportedTarget] = {
     ("Linux", "x86_64"): SupportedTarget("Linux", "x86_64", "x86_64-unknown-linux-gnu"),
     ("Linux", "arm64"): SupportedTarget("Linux", "arm64", "aarch64-unknown-linux-gnu"),
     ("Linux", "aarch64"): SupportedTarget("Linux", "arm64", "aarch64-unknown-linux-gnu"),
+    ("Windows", "AMD64"): SupportedTarget("Windows", "x86_64", "x86_64-pc-windows-msvc", ".zip"),
+    ("Windows", "x86_64"): SupportedTarget("Windows", "x86_64", "x86_64-pc-windows-msvc", ".zip"),
 }
 
 
@@ -81,15 +83,28 @@ def supported_target() -> SupportedTarget:
 
 
 def binary_name() -> str:
-    return "tine"
+    return "tine.exe" if platform.system() == "Windows" else "tine"
 
 
 def bundled_python_relative_path() -> Path:
+    if platform.system() == "Windows":
+        return Path("runtime") / "python" / "python.exe"
     return Path("runtime") / "python" / "bin" / "python3"
 
 
 def bundled_python_path_for_root(runtime_root: Path) -> Path:
-    return runtime_root / bundled_python_relative_path()
+    preferred = runtime_root / bundled_python_relative_path()
+    if preferred.is_file():
+        return preferred
+
+    for candidate in (
+        runtime_root / "runtime" / "python" / "bin" / "python3",
+        runtime_root / "runtime" / "python" / "python.exe",
+    ):
+        if candidate.is_file():
+            return candidate
+
+    return preferred
 
 
 def release_base_url(version: str | None = None) -> str:

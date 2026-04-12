@@ -1,0 +1,284 @@
+name: Release Desktop App
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Target platform to build
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - macos-aarch64
+          - macos-x86_64
+          - linux-x86_64
+          - windows-x86_64
+      publish_to_release:
+        description: Upload desktop bundles to a GitHub Release after the matrix passes
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: Release tag to use when publishing from workflow_dispatch (for example v0.2.2)
+        required: false
+        default: ""
+        type: string
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  version-alignment:
+    name: Verify app version alignment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Render and verify workspace and Tauri config versions align
+        run: python scripts/release/verify_version_alignment.py --repo-root . --tauri-template crates/tine-app/tauri.conf.template.json --tauri-config crates/tine-app/tauri.conf.json --write-tauri-config
+
+  build-bundle:
+    name: Build desktop app (${{ matrix.label }})
+    needs: version-alignment
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos-aarch64
+            runner: macos-14
+            artifact_glob: target/release/bundle/dmg/*.dmg
+            app_glob: target/release/bundle/macos/*.app
+            smoke: true
+            smoke_command: python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH"
+          - label: macos-x86_64
+            runner: macos-13
+            artifact_glob: target/release/bundle/dmg/*.dmg
+            app_glob: target/release/bundle/macos/*.app
+            smoke: true
+            smoke_command: python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH"
+          - label: linux-x86_64
+            runner: ubuntu-22.04
+            artifact_glob: target/release/bundle/appimage/*.AppImage
+            app_glob: target/release/bundle/appimage/*.AppImage
+            smoke: true
+            smoke_command: xvfb-run -a python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH"
+          - label: windows-x86_64
+            runner: windows-latest
+            artifact_glob: target/release/bundle/msi/*.msi
+            app_glob: ""
+            smoke: true
+            smoke_command: ""
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Decide whether this matrix target should run
+        id: selector
+        shell: bash
+        run: |
+          if [[ "${{ github.event.inputs.target || 'all' }}" == "all" || "${{ github.event.inputs.target || 'all' }}" == "${{ matrix.label }}" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.selector.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        if: steps.selector.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux build dependencies
+        if: steps.selector.outputs.run == 'true' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            webkit2gtk-4.1 \
+            libwebkit2gtk-4.1-dev \
+            xvfb
+
+      - name: Install Tauri CLI
+        if: steps.selector.outputs.run == 'true'
+        run: cargo install tauri-cli --version '^2' --locked
+
+      - name: Fetch bundled Python runtime
+        if: steps.selector.outputs.run == 'true'
+        run: python scripts/release/fetch_app_runtime.py --target ${{ matrix.label }}
+
+      - name: Build desktop bundle
+        if: steps.selector.outputs.run == 'true'
+        run: cargo tauri build --config crates/tine-app/tauri.conf.json
+
+      - name: Resolve version and built bundle paths
+        id: bundle
+        if: steps.selector.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(python - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path('packaging/python/pyproject.toml').read_text()
+          print(re.search(r'(?m)^\[project\]\s*(?:.*\n)*?version = "([^"]+)"', text).group(1))
+          PY
+          )"
+          BUNDLE_PATH="$(compgen -G '${{ matrix.artifact_glob }}' | head -n 1)"
+          if [[ -z "$BUNDLE_PATH" ]]; then
+            echo "expected bundle matching ${{ matrix.artifact_glob }}" >&2
+            exit 1
+          fi
+          EXT="${BUNDLE_PATH##*.}"
+          CANONICAL_PATH="release-artifacts/tine-app-${VERSION}-${{ matrix.label }}.${EXT}"
+          mkdir -p release-artifacts
+          cp "$BUNDLE_PATH" "$CANONICAL_PATH"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "bundle_path=$CANONICAL_PATH" >> "$GITHUB_OUTPUT"
+
+          if [[ '${{ matrix.smoke }}' == 'true' && '${{ runner.os }}' != 'Windows' ]]; then
+            APP_PATH="$(compgen -G '${{ matrix.app_glob }}' | head -n 1)"
+            if [[ -z "$APP_PATH" ]]; then
+              echo "expected app matching ${{ matrix.app_glob }}" >&2
+              exit 1
+            fi
+            if [[ "$APP_PATH" == *.app ]]; then
+              LAUNCH_PATH="$(find "$APP_PATH/Contents/MacOS" -type f | head -n 1)"
+            else
+              LAUNCH_PATH="$APP_PATH"
+              chmod +x "$LAUNCH_PATH" || true
+            fi
+            echo "launch_path=$LAUNCH_PATH" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract Windows MSI for smoke
+        id: windows_msi
+        if: steps.selector.outputs.run == 'true' && matrix.smoke && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installRoot = Join-Path $PWD 'target\msi-smoke'
+          if (Test-Path $installRoot) {
+            Remove-Item -Path $installRoot -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $installRoot | Out-Null
+
+          $msiPath = (Resolve-Path '${{ steps.bundle.outputs.bundle_path }}').Path
+          $targetDir = (Resolve-Path $installRoot).Path
+
+          Start-Process msiexec.exe -ArgumentList @('/a', $msiPath, '/qn', "TARGETDIR=$targetDir") -Wait -NoNewWindow
+
+          $exe = Get-ChildItem -Path $targetDir -Filter 'tine-app.exe' -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $exe) {
+            throw "expected installed tine-app.exe under $targetDir"
+          }
+
+          "launch_path=$exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Smoke desktop app (macOS/Linux)
+        if: steps.selector.outputs.run == 'true' && matrix.smoke && runner.os != 'Windows'
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
+          LAUNCH_PATH: ${{ steps.bundle.outputs.launch_path }}
+        run: python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH" --require-bundled-python
+
+      - name: Smoke desktop app (Windows)
+        if: steps.selector.outputs.run == 'true' && matrix.smoke && runner.os == 'Windows'
+        shell: pwsh
+        env:
+          BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
+          LAUNCH_PATH: ${{ steps.windows_msi.outputs.launch_path }}
+        run: python scripts/release/smoke_app.py --bundle-path "$env:BUNDLE_PATH" --launch-path "$env:LAUNCH_PATH" --require-bundled-python
+
+      - name: Generate checksum
+        if: steps.selector.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY' "${{ steps.bundle.outputs.bundle_path }}"
+          import hashlib
+          import sys
+          from pathlib import Path
+
+          bundle_path = Path(sys.argv[1])
+          digest = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+          bundle_path.with_suffix(bundle_path.suffix + ".sha256").write_text(
+              f"{digest}  {bundle_path.name}\n"
+          )
+          PY
+
+      - name: Upload bundle artifact
+        if: steps.selector.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-app-${{ matrix.label }}
+          path: |
+            ${{ steps.bundle.outputs.bundle_path }}
+            ${{ steps.bundle.outputs.bundle_path }}.sha256
+
+  upload-release-assets:
+    name: Upload desktop release assets
+    needs: build-bundle
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_to_release == 'true')
+    steps:
+      - name: Resolve release metadata
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "tag_name=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+            echo "release_name=${{ github.event.release.name || github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+            echo "draft=false" >> "$GITHUB_OUTPUT"
+            echo "prerelease=${{ github.event.release.prerelease }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          TAG="${{ github.event.inputs.release_tag }}"
+          if [[ -z "$TAG" ]]; then
+            echo "workflow_dispatch publishing requires release_tag" >&2
+            exit 1
+          fi
+
+          echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release_name=Desktop App $TAG" >> "$GITHUB_OUTPUT"
+          echo "draft=true" >> "$GITHUB_OUTPUT"
+          echo "prerelease=true" >> "$GITHUB_OUTPUT"
+
+      - name: Download desktop bundle artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          pattern: desktop-app-*
+          merge-multiple: true
+
+      - name: Upload desktop release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.tag_name }}
+          name: ${{ steps.release_meta.outputs.release_name }}
+          target_commitish: ${{ github.sha }}
+          draft: ${{ steps.release_meta.outputs.draft }}
+          prerelease: ${{ steps.release_meta.outputs.prerelease }}
+          files: |
+            release-artifacts/*

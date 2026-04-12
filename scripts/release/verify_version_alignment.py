@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -38,6 +39,27 @@ def read_binary_version(binary_path: Path) -> str:
     return output.split()[-1]
 
 
+def read_tauri_config_version(config_path: Path) -> str:
+    payload = json.loads(config_path.read_text())
+    version = payload.get("version")
+    if not isinstance(version, str) or not version:
+        raise RuntimeError(f"failed to locate version in {config_path}")
+    return version
+
+
+def render_tauri_config(template_path: Path, version: str) -> str:
+    template = template_path.read_text()
+    return template.replace("{{VERSION}}", version)
+
+
+def read_tauri_config_version_from_text(payload_text: str, source: str) -> str:
+    payload = json.loads(payload_text)
+    version = payload.get("version")
+    if not isinstance(version, str) or not version:
+        raise RuntimeError(f"failed to locate version in {source}")
+    return version
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Verify Python wrapper, workspace, and optional binary versions align."
@@ -46,6 +68,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--binary",
         help="Optional path to a built `tine` binary whose version should also match.",
+    )
+    parser.add_argument(
+        "--tauri-config",
+        help="Optional path to a rendered tine-app tauri.conf.json whose version should also match.",
+    )
+    parser.add_argument(
+        "--tauri-template",
+        help="Optional path to tine-app tauri.conf.template.json to render for validation.",
+    )
+    parser.add_argument(
+        "--write-tauri-config",
+        action="store_true",
+        help="When used with --tauri-template and --tauri-config, write the rendered config to disk.",
     )
     args = parser.parse_args(argv)
 
@@ -64,6 +99,31 @@ def main(argv: list[str] | None = None) -> int:
         if binary_version != python_version:
             print(
                 f"version mismatch: packaging/python={python_version} binary={binary_version}",
+                file=sys.stderr,
+            )
+            return 1
+
+    if args.tauri_template:
+        template_path = Path(args.tauri_template).resolve()
+        rendered = render_tauri_config(template_path, workspace_version)
+        rendered_version = read_tauri_config_version_from_text(rendered, str(template_path))
+        if rendered_version != workspace_version:
+            print(
+                f"version mismatch: workspace Cargo.toml={workspace_version} tauri-template-rendered={rendered_version}",
+                file=sys.stderr,
+            )
+            return 1
+
+        if args.write_tauri_config:
+            if not args.tauri_config:
+                raise RuntimeError("--write-tauri-config requires --tauri-config")
+            Path(args.tauri_config).resolve().write_text(rendered)
+
+    if args.tauri_config:
+        tauri_version = read_tauri_config_version(Path(args.tauri_config).resolve())
+        if tauri_version != workspace_version:
+            print(
+                f"version mismatch: workspace Cargo.toml={workspace_version} tauri-config={tauri_version}",
                 file=sys.stderr,
             )
             return 1

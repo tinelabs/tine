@@ -15,6 +15,10 @@ import { h, render } from "preact";
 import { useState, useEffect, useRef, useCallback } from "preact/hooks";
 import htm from "htm";
 import DOMPurify from "dompurify";
+import CodeMirror from "https://esm.sh/@uiw/react-codemirror@4.23.6?alias=react:preact/compat,react-dom:preact/compat&deps=preact@10.25.4";
+import { python } from "https://esm.sh/@codemirror/lang-python@6.1.6";
+import { createTheme } from "https://esm.sh/@uiw/codemirror-themes@4.23.6";
+import { tags as t } from "https://esm.sh/@lezer/highlight@1.2.1";
 import hljs from "https://esm.sh/highlight.js@11.11.1/lib/core";
 import pythonLanguage from "https://esm.sh/highlight.js@11.11.1/lib/languages/python";
 import {
@@ -37,8 +41,12 @@ import {
   activeBranchPathCellIds,
   describeExecutionProgress,
   fileQuery,
+  hasHttpOrigin,
   normalizeFileTreePath,
   pickActiveBranchId,
+  resolveApiBaseUrl,
+  resolveApiUrl,
+  resolveWebSocketUrl,
   watchedDirForPath,
 } from "./app-helpers.js";
 
@@ -47,8 +55,64 @@ const MAX_TERMINAL_EVENTS = 400;
 const TEXT_PREVIEW_LIMIT_BYTES = 512 * 1024;
 let terminalEventCounter = 0;
 
+const CODEMIRROR_THEME_SETTINGS = {
+  background: "var(--cm-bg)",
+  backgroundImage: "none",
+  foreground: "var(--fg)",
+  caret: "var(--cm-cursor)",
+  selection: "var(--cm-selection)",
+  selectionMatch: "var(--cm-selection)",
+  lineHighlight: "transparent",
+  gutterBackground: "var(--cm-bg)",
+  gutterForeground: "var(--fg-2)",
+};
+
+const CODEMIRROR_THEME_STYLES = [
+  { tag: t.comment, color: "var(--fg-3)", fontStyle: "italic" },
+  { tag: [t.string, t.special(t.string)], color: "var(--green)" },
+  { tag: [t.number, t.integer, t.float, t.bool, t.null], color: "var(--yellow)" },
+  { tag: [t.keyword, t.operatorKeyword, t.modifier], color: "var(--purple)" },
+  { tag: [t.definitionKeyword, t.controlKeyword], color: "var(--purple)" },
+  { tag: [t.variableName, t.name], color: "var(--fg)" },
+  { tag: [t.definition(t.variableName), t.function(t.variableName)], color: "var(--blue)" },
+  { tag: [t.typeName, t.className, t.namespace], color: "var(--blue)" },
+  { tag: [t.propertyName, t.attributeName], color: "var(--accent-dim)" },
+  { tag: [t.punctuation, t.separator, t.bracket], color: "var(--fg-2)" },
+  { tag: [t.meta, t.annotation], color: "var(--accent-dim)" },
+];
+
+const CM_LIGHT_THEME = createTheme({
+  theme: "light",
+  settings: CODEMIRROR_THEME_SETTINGS,
+  styles: CODEMIRROR_THEME_STYLES,
+});
+
+const CM_DARK_THEME = createTheme({
+  theme: "dark",
+  settings: CODEMIRROR_THEME_SETTINGS,
+  styles: CODEMIRROR_THEME_STYLES,
+});
+
 if (!hljs.getLanguage("python")) {
   hljs.registerLanguage("python", pythonLanguage);
+}
+
+function currentThemeMode() {
+  if (typeof document !== "undefined") {
+    const attr = document.documentElement.getAttribute("data-theme");
+    if (attr === "dark" || attr === "light") return attr;
+  }
+  try {
+    if (typeof localStorage !== "undefined") {
+      const saved = localStorage.getItem("tine-theme");
+      if (saved === "dark" || saved === "light") return saved;
+    }
+  } catch {}
+  return "light";
+}
+
+if (typeof document !== "undefined") {
+  document.documentElement.setAttribute("data-theme", currentThemeMode());
 }
 
 function loadSidebarCollapsed() {
@@ -181,7 +245,7 @@ async function fetchJSON(method, url, body) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
   }
-  const res = await fetch(url, opts);
+  const res = await apiFetch(url, opts);
   if (!res.ok) {
     const text = await res.text();
     let data = null;
@@ -317,6 +381,34 @@ function hasDesktopBridge() {
   return typeof resolveDesktopInvoke() === "function";
 }
 
+let desktopApiBaseUrlPromise = null;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function currentApiBaseUrl() {
+  if (!hasDesktopBridge()) {
+    return hasHttpOrigin(location) ? `${location.protocol}//${location.host}` : "";
+  }
+  if (!desktopApiBaseUrlPromise) {
+    desktopApiBaseUrlPromise = resolveApiBaseUrl({
+      locationLike: location,
+      hasDesktopBridge: hasDesktopBridge(),
+      invoke: tauriInvoke,
+      sleep,
+    }).catch((error) => {
+      desktopApiBaseUrlPromise = null;
+      throw error;
+    });
+  }
+  return desktopApiBaseUrlPromise;
+}
+
+async function apiFetch(path, opts) {
+  return fetch(resolveApiUrl(path, await currentApiBaseUrl()), opts);
+}
+
 function previewTypeForPath(path) {
   const ext = String(path || "")
     .split(".")
@@ -395,7 +487,7 @@ const api = {
       initial_dir: initialDir || null,
     }),
   readFile: async (path, projectId) => {
-    const r = await fetch(`/api/files/read?${fileQuery(path, projectId)}`);
+    const r = await apiFetch(`/api/files/read?${fileQuery(path, projectId)}`);
     if (!r.ok) throw new Error(`${r.status}`);
     return r.text();
   },
@@ -940,7 +1032,8 @@ function buildTreeBranchColumns(tree, activePipeline, activeBranchId) {
       .filter(Boolean)
       .map(cellDefToNode);
     const selectedBranchId = activeBranchId || tree.root_branch_id;
-    const runtimeBacked = branch.id === selectedBranchId && !!activePipeline;
+    const isSelected = branch.id === selectedBranchId;
+    const runtimeBacked = isSelected && !!activePipeline;
     return {
       key: `tree-branch-${branch.id}`,
       mode: "tree",
@@ -963,9 +1056,11 @@ function buildTreeBranchColumns(tree, activePipeline, activeBranchId) {
       subtitle: parentBranch
         ? `Branch from ${branch.branch_point_cell_id || "selected cell"}`
         : "Main experiment",
-      readOnly: !runtimeBacked,
+      // The selected branch is always editable — you need to type code before
+      // a kernel is running.  Non-selected branches stay read-only.
+      readOnly: !isSelected,
       deletable: branch.id !== tree.root_branch_id,
-      active: runtimeBacked,
+      active: isSelected,
     };
   });
 }
@@ -1036,49 +1131,55 @@ const WS_MAX_DELAY = 30000;
 let wsInstance = null;
 
 function connectWS() {
-  const ws = new WebSocket(
-    `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`,
-  );
-  wsInstance = ws;
-  ws.onopen = () => {
-    wsRetryDelay = 2000;
-    store.set((s) => ({ ...s, wsConnected: true }));
-    termLog({
-      kind: "system",
-      status: "connected",
-      message: "WebSocket connected",
-    });
-  };
-  ws.onclose = () => {
-    store.set((s) => ({ ...s, wsConnected: false }));
-    termLog({
-      kind: "system",
-      status: "disconnected",
-      message: `WebSocket disconnected, retrying in ${wsRetryDelay / 1000}s`,
-    });
-    setTimeout(connectWS, wsRetryDelay);
-    wsRetryDelay = Math.min(wsRetryDelay * 2, WS_MAX_DELAY);
-  };
-  ws.onerror = () => {};
-  ws.onmessage = (e) => {
-    try {
-      handleEvent(JSON.parse(e.data));
-    } catch (err) {
-      termLog(
-        {
+  currentApiBaseUrl()
+    .then((baseUrl) => {
+      const ws = new WebSocket(resolveWebSocketUrl(location, baseUrl));
+      wsInstance = ws;
+      ws.onopen = () => {
+        wsRetryDelay = 2000;
+        store.set((s) => ({ ...s, wsConnected: true }));
+        termLog({
           kind: "system",
-          status: "parse_error",
-          message: `WebSocket parse error: ${err}`,
-          error: {
-            ename: "WebSocketParseError",
-            evalue: String(err),
-            traceback: [],
-          },
-        },
-        "error",
-      );
-    }
-  };
+          status: "connected",
+          message: "WebSocket connected",
+        });
+      };
+      ws.onclose = () => {
+        store.set((s) => ({ ...s, wsConnected: false }));
+        termLog({
+          kind: "system",
+          status: "disconnected",
+          message: `WebSocket disconnected, retrying in ${wsRetryDelay / 1000}s`,
+        });
+        setTimeout(connectWS, wsRetryDelay);
+        wsRetryDelay = Math.min(wsRetryDelay * 2, WS_MAX_DELAY);
+      };
+      ws.onerror = () => {};
+      ws.onmessage = (e) => {
+        try {
+          handleEvent(JSON.parse(e.data));
+        } catch (err) {
+          termLog(
+            {
+              kind: "system",
+              status: "parse_error",
+              message: `WebSocket parse error: ${err}`,
+              error: {
+                ename: "WebSocketParseError",
+                evalue: String(err),
+                traceback: [],
+              },
+            },
+            "error",
+          );
+        }
+      };
+    })
+    .catch(() => {
+      store.set((s) => ({ ...s, wsConnected: false }));
+      setTimeout(connectWS, wsRetryDelay);
+      wsRetryDelay = Math.min(wsRetryDelay * 2, WS_MAX_DELAY);
+    });
 }
 
 function handleEvent(evt) {
@@ -1548,22 +1649,8 @@ async function cancelExecutionById(execId) {
 }
 
 // ── Cell Component ────────────────────────────────────────────
-function highlightCode(source = "", language = "python") {
-  const code = String(source || "");
-  if (!code) return "";
-  try {
-    return hljs.highlight(code, { language }).value;
-  } catch {
-    return hljs.highlightAuto(code).value;
-  }
-}
 
-function syncEditorHeight(textarea) {
-  if (!textarea) return;
-  textarea.style.height = "0px";
-  const nextHeight = Math.max(textarea.scrollHeight, 88);
-  textarea.style.height = `${nextHeight}px`;
-}
+const PYTHON_EXTENSIONS = [python()];
 
 function HighlightEditor({
   value,
@@ -1574,85 +1661,86 @@ function HighlightEditor({
   textareaRef = null,
   language = "python",
 }) {
-  const inputRef = useRef(null);
-  const highlightWrapRef = useRef(null);
-  const highlightCodeRef = useRef(null);
+  const viewRef = useRef(null);
+  const [editorTheme, setEditorTheme] = useState(() => currentThemeMode());
 
-  const setTextareaNode = useCallback(
-    (node) => {
-      inputRef.current = node;
+  const handleCreateEditor = useCallback(
+    (view) => {
+      viewRef.current = view;
       if (!textareaRef) return;
-      if (typeof textareaRef === "function") {
-        textareaRef(node);
-        return;
-      }
-      textareaRef.current = node;
+      const focusHandle = { focus: () => view.focus() };
+      if (typeof textareaRef === "function") textareaRef(focusHandle);
+      else textareaRef.current = focusHandle;
     },
     [textareaRef],
   );
 
-  const syncScroll = useCallback(() => {
-    if (!inputRef.current || !highlightWrapRef.current) return;
-    highlightWrapRef.current.scrollTop = inputRef.current.scrollTop;
-    highlightWrapRef.current.scrollLeft = inputRef.current.scrollLeft;
+  useEffect(() => {
+    return () => {
+      if (textareaRef && typeof textareaRef !== "function") {
+        textareaRef.current = null;
+      }
+      viewRef.current = null;
+    };
+  }, [textareaRef]);
+
+  useEffect(() => {
+    if (typeof document === "undefined") return undefined;
+    const root = document.documentElement;
+    const syncTheme = () => setEditorTheme(currentThemeMode());
+    syncTheme();
+    const observer = new MutationObserver(syncTheme);
+    observer.observe(root, {
+      attributes: true,
+      attributeFilter: ["data-theme"],
+    });
+    return () => observer.disconnect();
   }, []);
 
-  useEffect(() => {
-    if (!highlightCodeRef.current) return;
-    const highlighted = highlightCode(value, language);
-    highlightCodeRef.current.innerHTML =
-      highlighted + (value.endsWith("\n") ? "\n" : "");
-    syncEditorHeight(inputRef.current);
-    syncScroll();
-  }, [value, language, syncScroll]);
+  const handleChange = useCallback(
+    (next) => {
+      onChange?.(next);
+    },
+    [onChange],
+  );
 
-  useEffect(() => {
-    syncEditorHeight(inputRef.current);
-    syncScroll();
-  }, [syncScroll]);
+  const handleKeyDown = useCallback(
+    (event) => {
+      if (!readOnly && event.shiftKey && event.key === "Enter") {
+        event.preventDefault();
+        onKeyDown?.(event);
+      }
+    },
+    [onKeyDown, readOnly],
+  );
+
+  const extensions = language === "python" ? PYTHON_EXTENSIONS : [];
 
   return html`
     <div
-      class="cell-editor-shell ${!value.trim() ? "empty" : ""}"
+      class="cell-editor-shell ${!(value || "").trim() ? "empty" : ""}"
       data-placeholder=${placeholder}
+      onKeyDown=${handleKeyDown}
     >
-      <pre
-        ref=${highlightWrapRef}
-        class="cell-editor-highlight"
-        aria-hidden="true"
-      ><code ref=${highlightCodeRef} class="hljs language-${language}"></code></pre>
-      <textarea
-        ref=${setTextareaNode}
-        class="cell-textarea cell-editor-input"
-        value=${value}
-        readonly=${readOnly}
-        spellcheck="false"
-        autocapitalize="off"
-        autocomplete="off"
-        autocorrect="off"
-        onInput=${(e) => {
-          syncEditorHeight(e.target);
-          syncScroll();
-          if (!readOnly) onChange?.(e.target.value);
-        }}
-        onScroll=${syncScroll}
-        onClick=${(e) => e.stopPropagation()}
-        onKeyDown=${(e) => {
-          e.stopPropagation();
-          if (e.key === "Tab") {
-            e.preventDefault();
-            const el = e.target;
-            const start = el.selectionStart;
-            const end = el.selectionEnd;
-            el.value =
-              el.value.substring(0, start) + "    " + el.value.substring(end);
-            el.selectionStart = el.selectionEnd = start + 4;
-            if (!readOnly) onChange?.(el.value);
-            return;
-          }
-          onKeyDown?.(e);
-        }}
+      <${CodeMirror}
+        value=${value || ""}
+        height="auto"
+        theme=${editorTheme === "dark" ? CM_DARK_THEME : CM_LIGHT_THEME}
+        extensions=${extensions}
+        readOnly=${readOnly}
+        editable=${!readOnly}
         placeholder=${placeholder}
+        basicSetup=${{
+          lineNumbers: false,
+          foldGutter: false,
+          highlightActiveLineGutter: false,
+          highlightActiveLine: false,
+          bracketMatching: true,
+          autocompletion: false,
+          indentOnInput: true,
+        }}
+        onCreateEditor=${handleCreateEditor}
+        onChange=${(nextValue) => handleChange(nextValue)}
       />
     </div>
   `;
@@ -1707,11 +1795,26 @@ function Cell({
       (tree) => tree.id === (activeTreeId || runtimePid),
     ) || null;
 
+  // Hard reset when the cell identity changes (e.g. switching to a different
+  // notebook cell).
   useEffect(() => {
-    setCode(node.code?.source || "");
-    latestCode.current = node.code?.source || "";
+    const incoming = node.code?.source || "";
+    setCode(incoming);
+    latestCode.current = incoming;
     setUnsaved(false);
-  }, [node.id, node.code?.source]);
+  }, [nid]);
+
+  // Soft sync when only the server-side source changes for the *same* cell.
+  // This fires on every experiments-heartbeat refresh, so we must not clobber
+  // local edits that are still being typed or are mid-save.
+  useEffect(() => {
+    const incoming = node.code?.source || "";
+    if (unsaved) return;
+    if (saveInFlight.current) return;
+    if (incoming === latestCode.current) return;
+    setCode(incoming);
+    latestCode.current = incoming;
+  }, [node.code?.source]);
 
   const commitSave = useCallback(
     async (source) => {

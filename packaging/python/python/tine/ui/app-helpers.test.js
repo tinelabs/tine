@@ -3,16 +3,91 @@ import assert from "node:assert/strict";
 
 import {
   activeBranchPathCellIds,
+  describeExecutionProgress,
   fileQuery,
+  hasHttpOrigin,
   normalizeFileTreePath,
   normalizeSavedExperimentTreePayload,
   pickActiveBranchId,
+  resolveApiBaseUrl,
+  resolveApiUrl,
+  resolveWebSocketUrl,
   watchedDirForPath,
 } from "./app-helpers.js";
 
 test("fileQuery includes project scope when present", () => {
   assert.equal(fileQuery("nested/file.txt", "project-1"), "path=nested%2Ffile.txt&project_id=project-1");
   assert.equal(fileQuery("", null), "path=");
+});
+
+test("hasHttpOrigin only accepts normal browser origins", () => {
+  assert.equal(hasHttpOrigin({ protocol: "http:" }), true);
+  assert.equal(hasHttpOrigin({ protocol: "https:" }), true);
+  assert.equal(hasHttpOrigin({ protocol: "tauri:" }), false);
+  assert.equal(hasHttpOrigin({ protocol: "" }), false);
+});
+
+test("resolveApiBaseUrl preserves the browser origin unchanged", async () => {
+  const baseUrl = await resolveApiBaseUrl({
+    locationLike: { protocol: "http:", host: "127.0.0.1:9473" },
+    hasDesktopBridge: true,
+    invoke: async () => 9999,
+  });
+
+  assert.equal(baseUrl, "http://127.0.0.1:9473");
+});
+
+test("resolveApiBaseUrl falls back to the embedded desktop server port", async () => {
+  let attempts = 0;
+  const baseUrl = await resolveApiBaseUrl({
+    locationLike: { protocol: "tauri:", host: "tauri.localhost" },
+    hasDesktopBridge: true,
+    invoke: async () => {
+      attempts += 1;
+      return attempts >= 2 ? 63125 : null;
+    },
+    retryDelayMs: 0,
+    retryLimit: 3,
+    sleep: async () => {},
+  });
+
+  assert.equal(baseUrl, "http://127.0.0.1:63125");
+  assert.equal(attempts, 2);
+});
+
+test("resolveApiBaseUrl fails after retrying desktop bootstrap", async () => {
+  await assert.rejects(
+    resolveApiBaseUrl({
+      locationLike: { protocol: "tauri:", host: "tauri.localhost" },
+      hasDesktopBridge: true,
+      invoke: async () => {
+        throw new Error("bridge not ready");
+      },
+      retryDelayMs: 0,
+      retryLimit: 2,
+      sleep: async () => {},
+    }),
+    /bridge not ready/,
+  );
+});
+
+test("resolveApiUrl builds absolute API URLs from a desktop base", () => {
+  assert.equal(
+    resolveApiUrl("/api/projects", "http://127.0.0.1:63125"),
+    "http://127.0.0.1:63125/api/projects",
+  );
+  assert.equal(resolveApiUrl("/api/projects", ""), "/api/projects");
+});
+
+test("resolveWebSocketUrl preserves browser ws and desktop absolute ws behavior", () => {
+  assert.equal(
+    resolveWebSocketUrl({ protocol: "http:", host: "127.0.0.1:9473" }, ""),
+    "ws://127.0.0.1:9473/ws",
+  );
+  assert.equal(
+    resolveWebSocketUrl({ protocol: "tauri:", host: "tauri.localhost" }, "http://127.0.0.1:63125"),
+    "ws://127.0.0.1:63125/ws",
+  );
 });
 
 test("normalizeFileTreePath keeps root keys stable", () => {
@@ -93,4 +168,84 @@ test("normalizeSavedExperimentTreePayload preserves legacy id-only compatibility
       id: "tree_1",
     },
   );
+});
+
+test("describeExecutionProgress surfaces queue positions for queued executions", () => {
+  assert.deepEqual(
+    describeExecutionProgress({ phase: "queued", queue_position: 3 }, "queued"),
+    {
+      label: "Queued #3",
+      message: "Queued. Position 3.",
+      active: true,
+    },
+  );
+});
+
+test("describeExecutionProgress prefers detailed lifecycle phases over generic running", () => {
+  assert.deepEqual(
+    describeExecutionProgress({ phase: "preparing_environment", status: "running" }, "running"),
+    {
+      label: "Preparing environment",
+      message: "Preparing environment…",
+      active: true,
+    },
+  );
+});
+
+test("describeExecutionProgress treats cancellation_requested as active work", () => {
+  assert.deepEqual(
+    describeExecutionProgress(
+      { phase: "cancellation_requested", status: "running" },
+      "running",
+    ),
+    {
+      label: "Cancelling",
+      message: "Cancelling…",
+      active: true,
+    },
+  );
+});
+
+test("describeExecutionProgress treats serializing_artifacts as active work", () => {
+  assert.deepEqual(
+    describeExecutionProgress(
+      { phase: "serializing_artifacts", status: "running" },
+      "running",
+    ),
+    {
+      label: "Serializing artifacts",
+      message: "Serializing artifacts…",
+      active: true,
+    },
+  );
+});
+
+test("describeExecutionProgress renders retrying as active work", () => {
+  assert.deepEqual(
+    describeExecutionProgress({ phase: "retrying", status: "running" }, "running"),
+    {
+      label: "Retrying",
+      message: "Retrying…",
+      active: true,
+    },
+  );
+});
+
+test("describeExecutionProgress renders timed_out as terminal work", () => {
+  assert.deepEqual(
+    describeExecutionProgress({ phase: "timed_out", status: "timed_out" }, "running"),
+    {
+      label: "Timed out",
+      message: "Timed out",
+      active: false,
+    },
+  );
+});
+
+test("describeExecutionProgress falls back to simple cell status when no snapshot exists", () => {
+  assert.deepEqual(describeExecutionProgress(null, "failed"), {
+    label: "Failed",
+    message: "Failed",
+    active: false,
+  });
 });

@@ -78,6 +78,7 @@
 }
 
 :root {
+  color-scheme: light dark;
   --font:       -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", sans-serif;
   --font-mono:  "SF Mono", "Fira Code", "JetBrains Mono", "Cascadia Code", monospace;
   --radius:     8px;
@@ -829,7 +830,7 @@ html, body, #root {
 }
 
 .cell-code:focus-within {
-  background: var(--accent-bg);
+  background: transparent;
 }
 
 .cell-editor-shell {
@@ -838,123 +839,72 @@ html, body, #root {
   border-radius: var(--radius-sm);
 }
 
-.cell-editor-shell.empty::before {
-  content: attr(data-placeholder);
-  position: absolute;
-  top: 0;
-  left: 0;
-  color: var(--fg-3);
-  font-family: var(--font-mono);
-  font-size: 14px;
-  line-height: 1.5;
-  pointer-events: none;
-  z-index: 0;
-}
-
-.cell-editor-highlight {
-  position: absolute;
-  inset: 0;
-  margin: 0;
-  overflow: auto;
-  pointer-events: none;
-  scrollbar-width: none;
-}
-
-.cell-editor-highlight::-webkit-scrollbar {
-  display: none;
-}
-
-.cell-editor-highlight code {
-  display: block;
-  min-height: 88px;
-  color: var(--fg);
-  font-family: var(--font-mono);
-  font-size: 14px;
-  line-height: 1.5;
-  tab-size: 4;
-  font-variant-ligatures: none;
-  white-space: pre-wrap;
-  word-break: normal;
-  overflow-wrap: anywhere;
-}
-
 .cell-editor-input {
   position: relative;
   z-index: 1;
-  color: transparent;
-  caret-color: var(--fg);
-  -webkit-text-fill-color: transparent;
-}
-
-.cell-textarea {
-   display: block;
-   width: 100%;
-   min-height: 88px;
-   max-height: 520px;
-   padding: 0;
-   border: none;
-   background: transparent;
-   font-family: var(--font-mono);
-   font-size: 14px;
-   line-height: 1.5;
-   tab-size: 4;
-   font-variant-ligatures: none;
-   resize: none;
-   overflow: auto;
-}
-
-.cell-textarea:focus {
-   outline: none;
-}
-
-.cell-textarea::placeholder {
-   color: transparent;
+  width: 100%;
 }
 
 .cell-editor-input::selection {
-  background: var(--cm-selection);
-}
-
-.cell-editor-highlight .hljs {
   background: transparent;
-  color: var(--fg);
 }
 
-.cell-editor-highlight .hljs-comment,
-.cell-editor-highlight .hljs-quote {
-  color: var(--fg-3);
+.cm-editor-host ::selection {
+  background: transparent;
 }
 
-.cell-editor-highlight .hljs-keyword,
-.cell-editor-highlight .hljs-built_in,
-.cell-editor-highlight .hljs-literal,
-.cell-editor-highlight .hljs-type {
-  color: var(--purple);
+.cm-editor-host .cm-selectionBackground {
+  background: var(--cm-selection) !important;
 }
 
-.cell-editor-highlight .hljs-title,
-.cell-editor-highlight .hljs-title.function_,
-.cell-editor-highlight .hljs-title.class_ {
-  color: var(--blue);
+.cm-editor-host .cm-editor {
+  background: var(--cm-bg) !important;
+  background-color: var(--cm-bg) !important;
 }
 
-.cell-editor-highlight .hljs-string,
-.cell-editor-highlight .hljs-regexp {
-  color: var(--green);
+.cm-editor-host .cm-editor.cm-light,
+.cm-editor-host .cm-editor.cm-focused,
+.cm-editor-host .cm-editor.cm-light.cm-focused {
+  background: var(--cm-bg) !important;
+  background-color: var(--cm-bg) !important;
 }
 
-.cell-editor-highlight .hljs-number,
-.cell-editor-highlight .hljs-symbol,
-.cell-editor-highlight .hljs-bullet {
-  color: var(--yellow);
+.cm-editor-host .cm-scroller {
+  min-height: 88px;
+  max-height: 520px;
+  background: var(--cm-bg) !important;
 }
 
-.cell-editor-highlight .hljs-meta,
-.cell-editor-highlight .hljs-attr,
-.cell-editor-highlight .hljs-attribute,
-.cell-editor-highlight .hljs-variable,
-.cell-editor-highlight .hljs-template-variable {
-  color: var(--accent-dim);
+.cm-editor-host .cm-content,
+.cm-editor-host .cm-gutter {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  background: var(--cm-bg) !important;
+  color: var(--fg) !important;
+}
+
+.cm-editor-host .cm-content,
+.cm-editor-host .cm-line {
+  background: var(--cm-bg) !important;
+  color: var(--fg) !important;
+}
+
+.cm-editor-host .cm-scroller,
+.cm-editor-host .cm-content,
+.cm-editor-host .cm-gutters {
+  background-color: transparent !important;
+}
+
+.cm-editor-host .cm-gutters {
+  display: none;
+}
+
+.cm-editor-host .cm-activeLine {
+  background: transparent;
+}
+
+.cm-editor-host .cm-focused {
+  outline: none;
 }
 
 .cell-toolbar {
