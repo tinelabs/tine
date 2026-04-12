@@ -136,11 +136,13 @@ def run_server_e2e(python: str, env: dict[str, str]) -> None:
                 server.kill()
                 server.wait(timeout=10)
 
-            output = ""
-            if server.stdout is not None:
-                output = server.stdout.read()
-
             if failure is not None:
+                output = ""
+                if server.stdout is not None:
+                    try:
+                        _, output = server.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        output = "<timed out while collecting server output>"
                 detail = f"{failure}\n\n--- server output ---\n{output}" if output else str(failure)
                 raise RuntimeError(detail) from failure
 
