@@ -137,8 +137,10 @@ jobs:
         run: python scripts/release/fetch_app_runtime.py --target ${{ matrix.label }}
 
       - name: Build desktop bundle
-        working-directory: crates/tine-app
-        run: cargo tauri build --config tauri.conf.json
+        shell: bash
+        run: |
+          cd crates/tine-app
+          cargo tauri build --config tauri.conf.json
 
       - name: Resolve version and built bundle paths
         id: bundle

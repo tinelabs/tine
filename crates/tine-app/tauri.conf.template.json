@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/nickel-org/tauri/refs/heads/v2/crates/tauri-cli/schema.json",
   "productName": "tine",
   "version": "{{VERSION}}",
-  "identifier": "dev.tine.app",
+  "identifier": "dev.tine.desktop",
   "build": {
     "frontendDist": "../../ui",
     "devUrl": "http://localhost:1420"
