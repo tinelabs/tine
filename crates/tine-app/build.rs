@@ -1,35 +1,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use image::{DynamicImage, ImageBuffer, Rgba, RgbaImage};
-
-fn repo_root(manifest_dir: &Path) -> &Path {
-    manifest_dir
-        .ancestors()
-        .nth(2)
-        .unwrap_or_else(|| panic!("failed to resolve repo root from {}", manifest_dir.display()))
-}
-
-fn render_white_backed_png(source_path: &Path, output_path: &Path) {
-    let source = image::open(source_path)
-        .unwrap_or_else(|e| panic!("failed to decode {}: {}", source_path.display(), e))
-        .to_rgba8();
-    let (width, height) = source.dimensions();
-
-    let mut flattened: RgbaImage = ImageBuffer::from_pixel(width, height, Rgba([255, 255, 255, 255]));
-    image::imageops::overlay(&mut flattened, &DynamicImage::ImageRgba8(source).to_rgba8(), 0, 0);
-
-    let mut encoded = Vec::new();
-    DynamicImage::ImageRgba8(flattened)
-        .write_to(&mut std::io::Cursor::new(&mut encoded), image::ImageFormat::Png)
-        .unwrap_or_else(|e| panic!("failed to encode {}: {}", output_path.display(), e));
+fn sync_png(source_path: &Path, output_path: &Path) {
+    let source = fs::read(source_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {}", source_path.display(), e));
 
     let needs_write = match fs::read(output_path) {
-        Ok(existing) => existing != encoded,
+        Ok(existing) => existing != source,
         Err(_) => true,
     };
     if needs_write {
-        fs::write(output_path, encoded).unwrap_or_else(|e| {
+        fs::write(output_path, source).unwrap_or_else(|e| {
             panic!("failed to write {}: {}", output_path.display(), e)
         });
     }
@@ -46,13 +27,7 @@ fn main() {
     let config_path = manifest_dir.join("tauri.conf.json");
     let runtime_dir = manifest_dir.join("resources").join("runtime");
     let icons_dir = manifest_dir.join("icons");
-    let source_png_path = repo_root(&manifest_dir)
-        .join("packaging")
-        .join("python")
-        .join("python")
-        .join("tine")
-        .join("ui")
-        .join("browser.png");
+    let source_png_path = icons_dir.join("128x128@2x.png");
     let icns_icon_path = icons_dir.join("icon.icns");
     let png_icon_path = icons_dir.join("icon.png");
     let ico_icon_path = icons_dir.join("icon.ico");
@@ -65,7 +40,7 @@ fn main() {
         )
     });
 
-    render_white_backed_png(&source_png_path, &png_icon_path);
+    sync_png(&source_png_path, &png_icon_path);
     if !icns_icon_path.exists() {
         panic!("expected macOS icon at {}", icns_icon_path.display());
     }

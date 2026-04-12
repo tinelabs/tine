@@ -169,7 +169,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "bundle_path=$CANONICAL_PATH" >> "$GITHUB_OUTPUT"
 
-          if [[ '${{ matrix.smoke }}' == 'true' && '${{ runner.os }}' != 'Windows' ]]; then
+          if [[ '${{ matrix.smoke }}' == 'true' && '${{ runner.os }}' == 'Linux' ]]; then
             APP_PATH="$(compgen -G '${{ matrix.app_glob }}' | head -n 1)"
             if [[ -z "$APP_PATH" ]]; then
               echo "expected app matching ${{ matrix.app_glob }}" >&2
@@ -207,8 +207,15 @@ jobs:
 
           "launch_path=$exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-      - name: Smoke desktop app (macOS/Linux)
-        if: matrix.smoke && runner.os != 'Windows'
+      - name: Smoke desktop app bundle (macOS)
+        if: matrix.smoke && runner.os == 'macOS'
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
+        run: python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH"
+
+      - name: Smoke desktop app (Linux)
+        if: matrix.smoke && runner.os == 'Linux'
         shell: bash
         env:
           BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
