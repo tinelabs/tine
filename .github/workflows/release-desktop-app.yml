@@ -11,7 +11,6 @@ on:
         options:
           - all
           - macos-aarch64
-          - macos-x86_64
           - linux-x86_64
           - windows-x86_64
       publish_to_release:
@@ -31,6 +30,53 @@ permissions:
   contents: write
 
 jobs:
+  resolve-build-matrix:
+    name: Resolve desktop build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.matrix.outputs.include }}
+    steps:
+      - name: Resolve requested matrix entries
+        id: matrix
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_TARGET: ${{ github.event.inputs.target || 'all' }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+
+          include = [
+              {
+                  "label": "macos-aarch64",
+                  "runner": "macos-14",
+                  "artifact_glob": "target/release/bundle/dmg/*.dmg",
+                  "app_glob": "target/release/bundle/macos/*.app",
+                  "smoke": True,
+              },
+              {
+                  "label": "linux-x86_64",
+                  "runner": "ubuntu-22.04",
+                  "artifact_glob": "target/release/bundle/appimage/*.AppImage",
+                  "app_glob": "target/release/bundle/appimage/*.AppImage",
+                  "smoke": True,
+              },
+              {
+                  "label": "windows-x86_64",
+                  "runner": "windows-latest",
+                  "artifact_glob": "target/release/bundle/msi/*.msi",
+                  "app_glob": "",
+                  "smoke": True,
+              },
+          ]
+
+          if os.environ["EVENT_NAME"] == "workflow_dispatch" and os.environ["REQUESTED_TARGET"] != "all":
+              include = [item for item in include if item["label"] == os.environ["REQUESTED_TARGET"]]
+
+          print(f"include={json.dumps(include)}")
+          PY
+
   version-alignment:
     name: Verify app version alignment
     runs-on: ubuntu-latest
@@ -51,62 +97,28 @@ jobs:
 
   build-bundle:
     name: Build desktop app (${{ matrix.label }})
-    needs: version-alignment
+    needs:
+      - resolve-build-matrix
+      - version-alignment
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - label: macos-aarch64
-            runner: macos-14
-            artifact_glob: target/release/bundle/dmg/*.dmg
-            app_glob: target/release/bundle/macos/*.app
-            smoke: true
-            smoke_command: python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH"
-          - label: macos-x86_64
-            runner: macos-13
-            artifact_glob: target/release/bundle/dmg/*.dmg
-            app_glob: target/release/bundle/macos/*.app
-            smoke: true
-            smoke_command: python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH"
-          - label: linux-x86_64
-            runner: ubuntu-22.04
-            artifact_glob: target/release/bundle/appimage/*.AppImage
-            app_glob: target/release/bundle/appimage/*.AppImage
-            smoke: true
-            smoke_command: xvfb-run -a python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH"
-          - label: windows-x86_64
-            runner: windows-latest
-            artifact_glob: target/release/bundle/msi/*.msi
-            app_glob: ""
-            smoke: true
-            smoke_command: ""
+        include: ${{ fromJson(needs.resolve-build-matrix.outputs.include) }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Decide whether this matrix target should run
-        id: selector
-        shell: bash
-        run: |
-          if [[ "${{ github.event.inputs.target || 'all' }}" == "all" || "${{ github.event.inputs.target || 'all' }}" == "${{ matrix.label }}" ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Set up Python
-        if: steps.selector.outputs.run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Set up Rust
-        if: steps.selector.outputs.run == 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Linux build dependencies
-        if: steps.selector.outputs.run == 'true' && runner.os == 'Linux'
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -119,20 +131,17 @@ jobs:
             xvfb
 
       - name: Install Tauri CLI
-        if: steps.selector.outputs.run == 'true'
         run: cargo install tauri-cli --version '^2' --locked
 
       - name: Fetch bundled Python runtime
-        if: steps.selector.outputs.run == 'true'
         run: python scripts/release/fetch_app_runtime.py --target ${{ matrix.label }}
 
       - name: Build desktop bundle
-        if: steps.selector.outputs.run == 'true'
-        run: cargo tauri build --config crates/tine-app/tauri.conf.json
+        working-directory: crates/tine-app
+        run: cargo tauri build --config tauri.conf.json
 
       - name: Resolve version and built bundle paths
         id: bundle
-        if: steps.selector.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -172,7 +181,7 @@ jobs:
 
       - name: Extract Windows MSI for smoke
         id: windows_msi
-        if: steps.selector.outputs.run == 'true' && matrix.smoke && runner.os == 'Windows'
+        if: matrix.smoke && runner.os == 'Windows'
         shell: pwsh
         run: |
           $installRoot = Join-Path $PWD 'target\msi-smoke'
@@ -194,7 +203,7 @@ jobs:
           "launch_path=$exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Smoke desktop app (macOS/Linux)
-        if: steps.selector.outputs.run == 'true' && matrix.smoke && runner.os != 'Windows'
+        if: matrix.smoke && runner.os != 'Windows'
         shell: bash
         env:
           BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
@@ -202,7 +211,7 @@ jobs:
         run: python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH" --require-bundled-python
 
       - name: Smoke desktop app (Windows)
-        if: steps.selector.outputs.run == 'true' && matrix.smoke && runner.os == 'Windows'
+        if: matrix.smoke && runner.os == 'Windows'
         shell: pwsh
         env:
           BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
@@ -210,7 +219,6 @@ jobs:
         run: python scripts/release/smoke_app.py --bundle-path "$env:BUNDLE_PATH" --launch-path "$env:LAUNCH_PATH" --require-bundled-python
 
       - name: Generate checksum
-        if: steps.selector.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -227,7 +235,6 @@ jobs:
           PY
 
       - name: Upload bundle artifact
-        if: steps.selector.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: desktop-app-${{ matrix.label }}
