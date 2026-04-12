@@ -15,6 +15,9 @@ from pathlib import Path
 from urllib import request
 
 
+REQUEST_TIMEOUT_SECONDS = 5.0
+
+
 def package_version(repo_root: Path) -> str:
     text = (repo_root / "packaging/python/pyproject.toml").read_text()
     match = re.search(r"(?m)^\[project\]\s*(?:.*\n)*?version = \"([^\"]+)\"", text)
@@ -38,59 +41,82 @@ def run_server_e2e(python: str, env: dict[str, str]) -> None:
 
     with tempfile.TemporaryDirectory(**temp_dir_kwargs) as temp_root:
         workspace = Path(temp_root) / "workspace"
+        log_path = Path(temp_root) / "server.log"
         workspace.mkdir()
         bind = f"127.0.0.1:{pick_free_port()}"
-        server = subprocess.Popen(
-            [python, "-m", "tine.cli", "serve", "--workspace", workspace.as_posix(), "--bind", bind],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        failure: Exception | None = None
-        try:
-            base = f"http://{bind}"
-            for _ in range(80):
-                try:
-                    with request.urlopen(base + "/healthz") as response:
-                        if response.read().decode().strip() == "ok":
-                            break
-                except Exception:
-                    pass
-                time.sleep(0.5)
-            else:
-                raise RuntimeError("wrapper smoke server did not become ready")
+        with log_path.open("w+", encoding="utf-8") as server_log:
+            server = subprocess.Popen(
+                [python, "-m", "tine.cli", "serve", "--workspace", workspace.as_posix(), "--bind", bind],
+                env=env,
+                stdout=server_log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            failure: Exception | None = None
+            try:
+                base = f"http://{bind}"
+                for _ in range(80):
+                    try:
+                        with request.urlopen(base + "/healthz", timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                            if response.read().decode().strip() == "ok":
+                                break
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+                else:
+                    raise RuntimeError("wrapper smoke server did not become ready")
 
-            project_id = json.loads(
-                http_post(base + "/api/projects", {"name": "smoke-project", "workspace_dir": "project-a"})
-            )["id"]
-            tree = json.loads(
-                http_post(base + "/api/experiment-trees", {"name": "smoke-experiment", "project_id": project_id})
-            )
-            tree_id = tree["id"]
-            http_post(
-                base + f"/api/experiment-trees/{tree_id}/branches/main/cells/cell_1/code",
-                {"source": 'print("smoke")\ncell_1 = 1\n'},
-            )
-            execution_id = json.loads(
-                http_post(base + f"/api/experiment-trees/{tree_id}/branches/main/execute", None)
-            )["execution_id"]
-            status = wait_for_execution(base, execution_id)
-            if status["status"] != "completed":
-                raise RuntimeError(f"main branch execution failed during smoke: {status}")
-            branch_id = json.loads(
+                project_id = json.loads(
+                    http_post(base + "/api/projects", {"name": "smoke-project", "workspace_dir": "project-a"})
+                )["id"]
+                tree = json.loads(
+                    http_post(base + "/api/experiment-trees", {"name": "smoke-experiment", "project_id": project_id})
+                )
+                tree_id = tree["id"]
                 http_post(
-                    base + f"/api/experiment-trees/{tree_id}/branches",
+                    base + f"/api/experiment-trees/{tree_id}/branches/main/cells/cell_1/code",
+                    {"source": 'print("smoke")\ncell_1 = 1\n'},
+                )
+                execution_id = json.loads(
+                    http_post(base + f"/api/experiment-trees/{tree_id}/branches/main/execute", None)
+                )["execution_id"]
+                status = wait_for_execution(base, execution_id)
+                if status["status"] != "completed":
+                    raise RuntimeError(f"main branch execution failed during smoke: {status}")
+                branch_id = json.loads(
+                    http_post(
+                        base + f"/api/experiment-trees/{tree_id}/branches",
+                        {
+                            "parent_branch_id": "main",
+                            "name": "branch-a",
+                            "branch_point_cell_id": "cell_1",
+                            "first_cell": {
+                                "id": "branch_cell_1",
+                                "tree_id": tree_id,
+                                "branch_id": "ignored",
+                                "name": "branch_cell_1",
+                                "code": {"source": "branch_value = 2\n", "language": "python"},
+                                "upstream_cell_ids": [],
+                                "declared_outputs": [],
+                                "cache": False,
+                                "map_over": None,
+                                "map_concurrency": None,
+                                "tags": {},
+                                "revision_id": None,
+                                "state": "clean",
+                            },
+                        },
+                    )
+                )
+                http_post(
+                    base + f"/api/experiment-trees/{tree_id}/branches/{branch_id}/cells",
                     {
-                        "parent_branch_id": "main",
-                        "name": "branch-a",
-                        "branch_point_cell_id": "cell_1",
-                        "first_cell": {
-                            "id": "branch_cell_1",
+                        "cell": {
+                            "id": "branch_cell_2",
                             "tree_id": tree_id,
-                            "branch_id": "ignored",
-                            "name": "branch_cell_1",
-                            "code": {"source": "branch_value = 2\n", "language": "python"},
+                            "branch_id": branch_id,
+                            "name": "branch_cell_2",
+                            "code": {"source": "branch_value_2 = branch_value + 1\n", "language": "python"},
                             "upstream_cell_ids": [],
                             "declared_outputs": [],
                             "cache": False,
@@ -100,55 +126,31 @@ def run_server_e2e(python: str, env: dict[str, str]) -> None:
                             "revision_id": None,
                             "state": "clean",
                         },
+                        "after_cell_id": "branch_cell_1",
                     },
                 )
-            )
-            http_post(
-                base + f"/api/experiment-trees/{tree_id}/branches/{branch_id}/cells",
-                {
-                    "cell": {
-                        "id": "branch_cell_2",
-                        "tree_id": tree_id,
-                        "branch_id": branch_id,
-                        "name": "branch_cell_2",
-                        "code": {"source": "branch_value_2 = branch_value + 1\n", "language": "python"},
-                        "upstream_cell_ids": [],
-                        "declared_outputs": [],
-                        "cache": False,
-                        "map_over": None,
-                        "map_concurrency": None,
-                        "tags": {},
-                        "revision_id": None,
-                        "state": "clean",
-                    },
-                    "after_cell_id": "branch_cell_1",
-                },
-            )
-            branch_execution_id = json.loads(
-                http_post(base + f"/api/experiment-trees/{tree_id}/branches/{branch_id}/execute", None)
-            )["execution_id"]
-            branch_status = wait_for_execution(base, branch_execution_id)
-            if branch_status["status"] != "completed":
-                raise RuntimeError(f"branch execution failed during smoke: {branch_status}")
-        except Exception as exc:
-            failure = exc
-        finally:
-            server.terminate()
-            try:
-                server.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                server.kill()
-                server.wait(timeout=10)
+                branch_execution_id = json.loads(
+                    http_post(base + f"/api/experiment-trees/{tree_id}/branches/{branch_id}/execute", None)
+                )["execution_id"]
+                branch_status = wait_for_execution(base, branch_execution_id)
+                if branch_status["status"] != "completed":
+                    raise RuntimeError(f"branch execution failed during smoke: {branch_status}")
+            except Exception as exc:
+                failure = exc
+            finally:
+                server.terminate()
+                try:
+                    server.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait(timeout=10)
 
-            if failure is not None:
-                output = ""
-                if server.stdout is not None:
-                    try:
-                        _, output = server.communicate(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        output = "<timed out while collecting server output>"
-                detail = f"{failure}\n\n--- server output ---\n{output}" if output else str(failure)
-                raise RuntimeError(detail) from failure
+                if failure is not None:
+                    server_log.flush()
+                    server_log.seek(0)
+                    output = server_log.read()
+                    detail = f"{failure}\n\n--- server output ---\n{output}" if output else str(failure)
+                    raise RuntimeError(detail) from failure
 
 
 def pick_free_port() -> int:
@@ -161,13 +163,15 @@ def http_post(url: str, payload: dict | None) -> str:
     data = None if payload is None else json.dumps(payload).encode()
     headers = {} if payload is None else {"Content-Type": "application/json"}
     request_obj = request.Request(url, data=data, headers=headers, method="POST")
-    with request.urlopen(request_obj) as response:
+    with request.urlopen(request_obj, timeout=REQUEST_TIMEOUT_SECONDS) as response:
         return response.read().decode()
 
 
 def wait_for_execution(base: str, execution_id: str) -> dict:
     for _ in range(160):
-        with request.urlopen(base + f"/api/executions/{execution_id}") as response:
+        with request.urlopen(
+            base + f"/api/executions/{execution_id}", timeout=REQUEST_TIMEOUT_SECONDS
+        ) as response:
             payload = json.loads(response.read().decode())
         if payload.get("finished_at"):
             return payload
