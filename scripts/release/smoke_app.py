@@ -227,6 +227,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Fail if the app logs do not confirm bundled Python was activated.",
     )
+    parser.add_argument(
+        "--health-only",
+        action="store_true",
+        help="Only verify the app launches and serves healthz; skip execution smoke.",
+    )
     args = parser.parse_args(argv)
 
     bundle_path = Path(args.bundle_path).resolve()
@@ -247,7 +252,8 @@ def main(argv: list[str] | None = None) -> int:
         failure: Exception | None = None
         try:
             base_url = wait_for_health(process)
-            run_execution_smoke(base_url)
+            if not args.health_only:
+                run_execution_smoke(base_url)
         except Exception as exc:
             failure = exc
         finally:

@@ -212,7 +212,7 @@ jobs:
         shell: bash
         env:
           BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
-        run: python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH"
+        run: python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --health-only
 
       - name: Smoke desktop app (Linux)
         if: matrix.smoke && runner.os == 'Linux'
@@ -220,7 +220,7 @@ jobs:
         env:
           BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
           LAUNCH_PATH: ${{ steps.bundle.outputs.launch_path }}
-        run: python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH"
+        run: xvfb-run -a python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH" --health-only
 
       - name: Smoke desktop app (Windows)
         if: matrix.smoke && runner.os == 'Windows'
@@ -228,7 +228,7 @@ jobs:
         env:
           BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
           LAUNCH_PATH: ${{ steps.windows_msi.outputs.launch_path }}
-        run: python scripts/release/smoke_app.py --bundle-path "$env:BUNDLE_PATH" --launch-path "$env:LAUNCH_PATH" --require-bundled-python
+        run: python scripts/release/smoke_app.py --bundle-path "$env:BUNDLE_PATH" --launch-path "$env:LAUNCH_PATH" --require-bundled-python --health-only
 
       - name: Generate checksum
         shell: bash
