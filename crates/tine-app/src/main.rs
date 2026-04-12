@@ -306,8 +306,10 @@ async fn start_embedded_server(
         Arc::new(LocalArtifactStore::new(tine_dir.join("artifacts")));
     let workspace = Arc::new(Workspace::open(workspace_dir.to_path_buf(), store, 8).await?);
 
-    // Bind to port 0 to get a random free port
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    // Release smoke can override the bind address to avoid brittle port discovery.
+    let bind_addr = std::env::var("TINE_EMBEDDED_SERVER_BIND")
+        .unwrap_or_else(|_| "127.0.0.1:0".to_string());
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     let port = listener.local_addr()?.port();
 
     let ui_dir = resolve_ui_dir(workspace_dir)?;

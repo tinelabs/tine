@@ -17,6 +17,7 @@ from urllib import request
 
 REQUEST_TIMEOUT_SECONDS = 5.0
 EXECUTION_TIMEOUT_SECONDS = 180.0
+EMBEDDED_SERVER_BIND_ENV = "TINE_EMBEDDED_SERVER_BIND"
 
 
 def run_capture(command: list[str]) -> str:
@@ -26,6 +27,32 @@ def run_capture(command: list[str]) -> str:
 def verify_bundle_exists(bundle_path: Path) -> None:
     if not bundle_path.exists():
         raise RuntimeError(f"bundle not found at {bundle_path}")
+
+
+def candidate_pids(pid: int) -> set[int]:
+    pids = {pid}
+    if sys.platform == "win32":
+        return pids
+
+    pending = [pid]
+    while pending:
+        parent_pid = pending.pop()
+        try:
+            output = run_capture(["pgrep", "-P", str(parent_pid)])
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            continue
+
+        for line in output.splitlines():
+            child_pid = line.strip()
+            if not child_pid.isdigit():
+                continue
+            child = int(child_pid)
+            if child in pids:
+                continue
+            pids.add(child)
+            pending.append(child)
+
+    return pids
 
 
 def listening_ports(pid: int) -> set[int]:
@@ -45,7 +72,9 @@ def listening_ports(pid: int) -> set[int]:
             return set()
         return {int(line.strip()) for line in output.splitlines() if line.strip().isdigit()}
 
-    command = ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", str(pid)]
+    command = ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-a"]
+    for candidate_pid in sorted(candidate_pids(pid)):
+        command.extend(["-p", str(candidate_pid)])
     try:
         output = run_capture(command)
     except subprocess.CalledProcessError:
@@ -83,6 +112,23 @@ def wait_for_health(process: subprocess.Popen[str], timeout_seconds: int = 60) -
         time.sleep(0.5)
 
     raise RuntimeError("app did not expose a healthy embedded server in time")
+
+
+def wait_for_health_at(base_url: str, process: subprocess.Popen[str], timeout_seconds: int = 60) -> str:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"app exited before becoming healthy with code {process.returncode}")
+
+        try:
+            with request.urlopen(base_url + "/healthz", timeout=1) as response:
+                if response.read().decode().strip() == "ok":
+                    return base_url
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    raise RuntimeError(f"app did not expose a healthy embedded server at {base_url} in time")
 
 
 def http_post(url: str, payload: dict | None) -> str:
@@ -202,8 +248,10 @@ def assert_bundled_python(output: str) -> None:
         raise RuntimeError("smoke run fell back to host Python discovery")
 
 
-def launch_app(launch_path: Path, workspace_dir: Path) -> subprocess.Popen[str]:
+def launch_app(launch_path: Path, workspace_dir: Path, server_port: int | None) -> subprocess.Popen[str]:
     env = os.environ.copy()
+    if server_port is not None:
+        env[EMBEDDED_SERVER_BIND_ENV] = f"127.0.0.1:{server_port}"
     return subprocess.Popen(
         [str(launch_path), str(workspace_dir)],
         stdout=subprocess.PIPE,
@@ -232,6 +280,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Only verify the app launches and serves healthz; skip execution smoke.",
     )
+    parser.add_argument(
+        "--server-port",
+        type=int,
+        help="Fixed embedded server port to request from the app and probe directly.",
+    )
     args = parser.parse_args(argv)
 
     bundle_path = Path(args.bundle_path).resolve()
@@ -248,10 +301,13 @@ def main(argv: list[str] | None = None) -> int:
     with tempfile.TemporaryDirectory(prefix="tine-app-smoke-") as temp_root:
         workspace_dir = Path(temp_root) / "workspace"
         workspace_dir.mkdir()
-        process = launch_app(launch_path, workspace_dir)
+        process = launch_app(launch_path, workspace_dir, args.server_port)
         failure: Exception | None = None
         try:
-            base_url = wait_for_health(process)
+            if args.server_port is not None:
+                base_url = wait_for_health_at(f"http://127.0.0.1:{args.server_port}", process)
+            else:
+                base_url = wait_for_health(process)
             if not args.health_only:
                 run_execution_smoke(base_url)
         except Exception as exc:
