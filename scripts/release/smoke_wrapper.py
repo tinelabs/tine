@@ -32,12 +32,16 @@ def run_capture(command: list[str], env: dict[str, str]) -> str:
 
 
 def run_server_e2e(python: str, env: dict[str, str]) -> None:
-    with tempfile.TemporaryDirectory(prefix="tine-wrapper-smoke-") as temp_root:
+    temp_dir_kwargs: dict[str, object] = {"prefix": "tine-wrapper-smoke-"}
+    if sys.version_info >= (3, 10):
+        temp_dir_kwargs["ignore_cleanup_errors"] = True
+
+    with tempfile.TemporaryDirectory(**temp_dir_kwargs) as temp_root:
         workspace = Path(temp_root) / "workspace"
         workspace.mkdir()
         bind = f"127.0.0.1:{pick_free_port()}"
         server = subprocess.Popen(
-            [python, "-m", "tine.cli", "serve", "--workspace", str(workspace), "--bind", bind],
+            [python, "-m", "tine.cli", "serve", "--workspace", workspace.as_posix(), "--bind", bind],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
