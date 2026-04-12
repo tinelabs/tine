@@ -15,6 +15,10 @@ from pathlib import Path
 from urllib import request
 
 
+REQUEST_TIMEOUT_SECONDS = 5.0
+EXECUTION_TIMEOUT_SECONDS = 180.0
+
+
 def run_capture(command: list[str]) -> str:
     return subprocess.check_output(command, text=True)
 
@@ -89,9 +93,12 @@ def http_post(url: str, payload: dict | None) -> str:
         return response.read().decode()
 
 
-def wait_for_execution(base_url: str, execution_id: str) -> dict:
-    for _ in range(160):
-        with request.urlopen(base_url + f"/api/executions/{execution_id}") as response:
+def wait_for_execution(base_url: str, execution_id: str, timeout_seconds: float = EXECUTION_TIMEOUT_SECONDS) -> dict:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        with request.urlopen(
+            base_url + f"/api/executions/{execution_id}", timeout=REQUEST_TIMEOUT_SECONDS
+        ) as response:
             payload = json.loads(response.read().decode())
         if payload.get("finished_at"):
             return payload

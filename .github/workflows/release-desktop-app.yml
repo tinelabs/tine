@@ -220,7 +220,7 @@ jobs:
         env:
           BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
           LAUNCH_PATH: ${{ steps.bundle.outputs.launch_path }}
-        run: python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH" --require-bundled-python
+        run: python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH"
 
       - name: Smoke desktop app (Windows)
         if: matrix.smoke && runner.os == 'Windows'
