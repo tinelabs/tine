@@ -122,6 +122,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            gnupg2 \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
@@ -139,9 +140,59 @@ jobs:
       - name: Render tauri.conf.json from template
         run: python scripts/release/verify_version_alignment.py --repo-root . --tauri-template crates/tine-app/tauri.conf.template.json --tauri-config crates/tine-app/tauri.conf.json --write-tauri-config
 
+      - name: Prepare Linux AppImage signing key
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          LINUX_SIGNING_KEY: ${{ secrets.LINUX_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${LINUX_SIGNING_KEY}" ]]; then
+            exit 0
+          fi
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$LINUX_SIGNING_KEY" | base64 --decode | gpg --batch --import
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+
+      - name: Prepare macOS notarization key
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${APPLE_API_KEY_CONTENT}" ]]; then
+            exit 0
+          fi
+          KEY_PATH="$RUNNER_TEMP/app-store-connect-auth-key.p8"
+          printf '%s' "$APPLE_API_KEY_CONTENT" > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
       - name: Build desktop bundle
         shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ runner.os == 'macOS' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ runner.os == 'macOS' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_ID: ${{ runner.os == 'macOS' && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ runner.os == 'macOS' && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ runner.os == 'macOS' && secrets.APPLE_TEAM_ID || '' }}
+          APPLE_API_ISSUER: ${{ runner.os == 'macOS' && secrets.APPLE_API_ISSUER || '' }}
+          APPLE_API_KEY: ${{ runner.os == 'macOS' && secrets.APPLE_API_KEY || '' }}
+          LINUX_SIGNING_KEY_ID: ${{ runner.os == 'Linux' && secrets.LINUX_SIGNING_KEY_ID || '' }}
+          LINUX_SIGNING_KEY_PASSPHRASE: ${{ runner.os == 'Linux' && secrets.LINUX_SIGNING_KEY_PASSPHRASE || '' }}
         run: |
+          if [[ "$RUNNER_OS" == "Linux" && -n "${LINUX_SIGNING_KEY_PASSPHRASE}" ]]; then
+            export SIGN=1
+            export APPIMAGETOOL_FORCE_SIGN=1
+            export APPIMAGETOOL_SIGN_PASSPHRASE="$LINUX_SIGNING_KEY_PASSPHRASE"
+            if [[ -n "${LINUX_SIGNING_KEY_ID}" ]]; then
+              export SIGN_KEY="$LINUX_SIGNING_KEY_ID"
+            fi
+          fi
           cd crates/tine-app
           cargo tauri build --config tauri.conf.json
 

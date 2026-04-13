@@ -30,6 +30,14 @@ __pycache__/
 *.tmp
 *.swp
 
+# Local Apple signing artifacts
+*.certSigningRequest
+*.p12
+*.p8
+
+# Local Linux signing artifacts
+/crates/tine-app/linux-signing-private.asc
+
 # Generated packaging outputs
 /packaging/python/build/
 /packaging/python/python/*.egg-info/
