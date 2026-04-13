@@ -171,6 +171,20 @@ jobs:
           chmod 600 "$KEY_PATH"
           echo "APPLE_API_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
 
+      - name: Sign bundled macOS runtime binaries
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${APPLE_SIGNING_IDENTITY}" ]]; then
+            exit 0
+          fi
+          python scripts/release/sign_macos_runtime.py \
+            --root crates/tine-app/resources/runtime/python \
+            --identity "$APPLE_SIGNING_IDENTITY"
+
       - name: Build desktop bundle
         shell: bash
         env:
