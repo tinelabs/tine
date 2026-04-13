@@ -48,10 +48,15 @@ def sign_binary(path: Path, identity: str, hardened_runtime: bool) -> None:
         identity,
         "--timestamp",
     ]
+    if KEYCHAIN_PATH is not None:
+        command.extend(["--keychain", str(KEYCHAIN_PATH)])
     if hardened_runtime:
         command.extend(["--options", "runtime"])
     command.append(str(path))
     subprocess.run(command, check=True)
+
+
+KEYCHAIN_PATH: Path | None = None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -60,7 +65,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--root", required=True, help="Root directory containing bundled runtime files.")
     parser.add_argument("--identity", required=True, help="Developer ID signing identity.")
+    parser.add_argument("--keychain", help="Optional keychain to use for codesign lookup.")
     args = parser.parse_args(argv)
+
+    global KEYCHAIN_PATH
+    KEYCHAIN_PATH = Path(args.keychain).resolve() if args.keychain else None
 
     root = Path(args.root).resolve()
     if not root.is_dir():
