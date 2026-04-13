@@ -185,6 +185,9 @@ jobs:
           LINUX_SIGNING_KEY_ID: ${{ runner.os == 'Linux' && secrets.LINUX_SIGNING_KEY_ID || '' }}
           LINUX_SIGNING_KEY_PASSPHRASE: ${{ runner.os == 'Linux' && secrets.LINUX_SIGNING_KEY_PASSPHRASE || '' }}
         run: |
+          if [[ "$RUNNER_OS" == "macOS" && -n "${APPLE_ID}" && -n "${APPLE_PASSWORD}" ]]; then
+            unset APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH
+          fi
           if [[ "$RUNNER_OS" == "Linux" && -n "${LINUX_SIGNING_KEY_PASSPHRASE}" ]]; then
             export SIGN=1
             export APPIMAGETOOL_FORCE_SIGN=1
