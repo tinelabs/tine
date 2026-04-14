@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import ssl
@@ -26,6 +27,22 @@ PYTHON_STANDALONE_VERSION = "3.11.15"
 PYTHON_STANDALONE_BASE_URL = (
     f"https://github.com/astral-sh/python-build-standalone/releases/download/{PYTHON_STANDALONE_RELEASE}/"
 )
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def runtime_pins_path() -> Path:
+    return repo_root() / "scripts" / "release" / "runtime_pins.json"
+
+
+def baseline_package_specs() -> list[str]:
+    payload = json.loads(runtime_pins_path().read_text())
+    return [
+        f"{pin['package']}=={pin['version']}"
+        for pin in payload["desktop_runtime"]["baseline_packages"]
+    ]
 
 
 def python_asset_name(rust_target: str) -> str:
@@ -97,6 +114,17 @@ def upgrade_bundled_pip(runtime_dir: Path, rust_target: str) -> None:
     )
 
 
+def seed_baseline_packages(runtime_dir: Path, rust_target: str) -> None:
+    python_path = bundled_python_path(runtime_dir, rust_target)
+    subprocess.run(
+        [str(python_path), "-m", "pip", "install", *baseline_package_specs()],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**dict(os.environ), "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
+    )
+
+
 def build_archive(staging_dir: Path, archive_path: Path) -> None:
     if archive_path.suffix == ".zip":
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -151,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
         verify_download(asset_path, sha256_path)
         extract_tar_gz(asset_path, runtime_dir)
         upgrade_bundled_pip(runtime_dir, args.rust_target)
+        seed_baseline_packages(runtime_dir, args.rust_target)
 
         archive_path.parent.mkdir(parents=True, exist_ok=True)
         build_archive(staging_dir, archive_path)
