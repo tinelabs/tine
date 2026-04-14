@@ -3,21 +3,16 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import shutil
-import ssl
-import subprocess
-import sys
-import tarfile
-import tempfile
-import urllib.request
 from pathlib import Path
 
-try:
-    import certifi
-except ImportError:  # pragma: no cover - falls back to system cert store
-    certifi = None
+from standalone_python import (
+    load_runtime_pins,
+    python_executable,
+    repo_root,
+    seed_baseline_packages,
+    stage_python_runtime as stage_bundled_python_runtime,
+)
 
 
 SUPPORTED_TARGETS = {
@@ -26,10 +21,6 @@ SUPPORTED_TARGETS = {
     "linux-x86_64",
     "windows-x86_64",
 }
-
-
-def repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
 
 
 def pins_path() -> Path:
@@ -41,7 +32,7 @@ def runtime_dir() -> Path:
 
 
 def load_pins() -> dict:
-    return json.loads(pins_path().read_text())
+    return load_runtime_pins()
 
 
 def python_pins() -> dict:
@@ -54,62 +45,6 @@ def baseline_package_pins() -> list[dict[str, str]]:
 
 def baseline_package_specs() -> list[str]:
     return [f"{pin['package']}=={pin['version']}" for pin in baseline_package_pins()]
-
-
-def download_ssl_context() -> ssl.SSLContext:
-    if certifi is not None:
-        return ssl.create_default_context(cafile=certifi.where())
-    return ssl.create_default_context()
-
-
-def download(url: str, destination: Path) -> None:
-    with urllib.request.urlopen(url, context=download_ssl_context()) as response, destination.open(
-        "wb"
-    ) as handle:
-        shutil.copyfileobj(response, handle)
-
-
-def verify_sha256(path: Path, expected_sha256: str) -> None:
-    actual = hashlib.sha256(path.read_bytes()).hexdigest()
-    if actual != expected_sha256:
-        raise RuntimeError(
-            f"checksum mismatch for {path.name}: expected {expected_sha256}, got {actual}"
-        )
-
-
-def extract_tar_gz(archive_path: Path, destination: Path) -> None:
-    with tarfile.open(archive_path, "r:gz") as archive:
-        extract_kwargs = {"filter": "data"} if sys.version_info >= (3, 12) else {}
-        archive.extractall(destination, **extract_kwargs)
-
-
-def is_python_runtime_root(path: Path) -> bool:
-    return (path / "bin" / "python3").is_file() or (path / "python.exe").is_file()
-
-
-def locate_python_root(extracted_root: Path) -> Path:
-    direct = extracted_root / "python"
-    if is_python_runtime_root(direct):
-        return direct
-
-    matches = []
-    for candidate in extracted_root.rglob("*"):
-        if candidate.is_dir() and is_python_runtime_root(candidate):
-            matches.append(candidate)
-
-    if len(matches) != 1:
-        raise RuntimeError(
-            f"expected exactly one extracted python runtime under {extracted_root}, found {len(matches)}"
-        )
-    return matches[0]
-
-
-def python_executable(path: Path) -> Path:
-    if (path / "bin" / "python3").is_file():
-        return path / "bin" / "python3"
-    if (path / "python.exe").is_file():
-        return path / "python.exe"
-    raise RuntimeError(f"python executable missing from extracted runtime at {path}")
 
 
 def sentinel_payload(target: str, artifact: dict, python_root: Path) -> dict:
@@ -142,50 +77,14 @@ def has_matching_runtime(target: str, artifact: dict) -> bool:
     return current == expected and python_executable(python_root).is_file()
 
 
-def seed_baseline_packages(python_root: Path) -> None:
-    python = python_executable(python_root)
-    command = [
-        str(python),
-        "-m",
-        "pip",
-        "install",
-        *baseline_package_specs(),
-    ]
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode == 0:
-        return
-
-    detail = result.stderr.strip() or result.stdout.strip() or "pip install failed"
-    raise RuntimeError(f"failed to seed bundled runtime packages: {detail}")
-
-
-def stage_python_runtime(target: str, artifact: dict) -> None:
+def stage_desktop_runtime(target: str, artifact: dict) -> None:
     output_root = runtime_dir()
     output_root.mkdir(parents=True, exist_ok=True)
-
-    with tempfile.TemporaryDirectory(prefix="tine-app-runtime-") as tmpdir:
-        temp_root = Path(tmpdir)
-        archive_path = temp_root / "python-runtime.tar.gz"
-        extract_root = temp_root / "extract"
-        extract_root.mkdir()
-
-        download(artifact["url"], archive_path)
-        verify_sha256(archive_path, artifact["sha256"])
-        extract_tar_gz(archive_path, extract_root)
-
-        extracted_python_root = locate_python_root(extract_root)
-        staged_python_root = temp_root / "python"
-        shutil.move(str(extracted_python_root), staged_python_root)
-
-        destination = output_root / "python"
-        if destination.exists():
-            shutil.rmtree(destination)
-        shutil.move(str(staged_python_root), destination)
-        seed_baseline_packages(destination)
-
-        sentinel_path().write_text(
-            json.dumps(sentinel_payload(target, artifact, destination), indent=2) + "\n"
-        )
+    destination = stage_bundled_python_runtime(output_root, artifact["url"], artifact["sha256"])
+    seed_baseline_packages(destination)
+    sentinel_path().write_text(
+        json.dumps(sentinel_payload(target, artifact, destination), indent=2) + "\n"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -211,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"desktop app runtime already present for {args.target}: {runtime_dir() / 'python'}")
         return 0
 
-    stage_python_runtime(args.target, artifact)
+    stage_desktop_runtime(args.target, artifact)
     print(f"fetched desktop app runtime for {args.target}: {runtime_dir() / 'python'}")
     return 0
 

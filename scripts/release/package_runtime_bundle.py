@@ -4,22 +4,17 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
-import os
 import shutil
-import ssl
-import subprocess
-import sys
 import tarfile
 import tempfile
-import urllib.request
 import zipfile
 from pathlib import Path
 
-try:
-    import certifi
-except ImportError:  # pragma: no cover - falls back to system cert store
-    certifi = None
+from standalone_python import (
+    seed_baseline_packages,
+    stage_python_runtime_from_checksum_file,
+    upgrade_pip,
+)
 
 
 PYTHON_STANDALONE_RELEASE = "20260408"
@@ -29,99 +24,10 @@ PYTHON_STANDALONE_BASE_URL = (
 )
 
 
-def repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
-def runtime_pins_path() -> Path:
-    return repo_root() / "scripts" / "release" / "runtime_pins.json"
-
-
-def baseline_package_specs() -> list[str]:
-    payload = json.loads(runtime_pins_path().read_text())
-    return [
-        f"{pin['package']}=={pin['version']}"
-        for pin in payload["desktop_runtime"]["baseline_packages"]
-    ]
-
-
 def python_asset_name(rust_target: str) -> str:
     return (
         f"cpython-{PYTHON_STANDALONE_VERSION}+{PYTHON_STANDALONE_RELEASE}-"
         f"{rust_target}-install_only.tar.gz"
-    )
-
-
-def download(url: str, destination: Path) -> None:
-    with urllib.request.urlopen(url, context=download_ssl_context()) as response, destination.open(
-        "wb"
-    ) as handle:
-        shutil.copyfileobj(response, handle)
-
-
-def download_ssl_context() -> ssl.SSLContext:
-    if certifi is not None:
-        return ssl.create_default_context(cafile=certifi.where())
-    return ssl.create_default_context()
-
-
-def verify_download(asset_path: Path, sha256_path: Path) -> None:
-    expected = None
-    for line in sha256_path.read_text().splitlines():
-        parts = line.strip().split()
-        if len(parts) >= 2 and parts[-1] == asset_path.name:
-            expected = parts[0]
-            break
-    if expected is None:
-        raise RuntimeError(f"missing checksum entry for {asset_path.name} in {sha256_path.name}")
-
-    actual = hashlib.sha256(asset_path.read_bytes()).hexdigest()
-    if actual != expected:
-        raise RuntimeError(
-            f"checksum mismatch for {asset_path.name}: expected {expected}, got {actual}"
-        )
-
-
-def extract_tar_gz(archive_path: Path, destination: Path) -> None:
-    with tarfile.open(archive_path, "r:gz") as archive:
-        extract_kwargs = {"filter": "data"} if sys.version_info >= (3, 12) else {}
-        archive.extractall(destination, **extract_kwargs)
-
-
-def bundled_python_path(runtime_dir: Path, rust_target: str) -> Path:
-    if "windows" in rust_target:
-        return runtime_dir / "python" / "python.exe"
-    return runtime_dir / "python" / "bin" / "python3"
-
-
-def upgrade_bundled_pip(runtime_dir: Path, rust_target: str) -> None:
-    python_path = bundled_python_path(runtime_dir, rust_target)
-    if not python_path.is_file():
-        raise RuntimeError(f"bundled runtime is missing its Python executable at {python_path}")
-
-    subprocess.run(
-        [str(python_path), "-m", "ensurepip", "--upgrade"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        [str(python_path), "-m", "pip", "install", "--upgrade", "pip"],
-        check=True,
-        capture_output=True,
-        text=True,
-        env={**dict(os.environ), "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
-    )
-
-
-def seed_baseline_packages(runtime_dir: Path, rust_target: str) -> None:
-    python_path = bundled_python_path(runtime_dir, rust_target)
-    subprocess.run(
-        [str(python_path), "-m", "pip", "install", *baseline_package_specs()],
-        check=True,
-        capture_output=True,
-        text=True,
-        env={**dict(os.environ), "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
     )
 
 
@@ -172,14 +78,13 @@ def main(argv: list[str] | None = None) -> int:
         shutil.copy2(binary_path, staging_dir / args.binary_name)
 
         asset_name = python_asset_name(args.rust_target)
-        asset_path = temp_root / asset_name
-        sha256_path = temp_root / "SHA256SUMS"
-        download(PYTHON_STANDALONE_BASE_URL + asset_name, asset_path)
-        download(PYTHON_STANDALONE_BASE_URL + "SHA256SUMS", sha256_path)
-        verify_download(asset_path, sha256_path)
-        extract_tar_gz(asset_path, runtime_dir)
-        upgrade_bundled_pip(runtime_dir, args.rust_target)
-        seed_baseline_packages(runtime_dir, args.rust_target)
+        python_root = stage_python_runtime_from_checksum_file(
+            runtime_dir,
+            PYTHON_STANDALONE_BASE_URL + asset_name,
+            PYTHON_STANDALONE_BASE_URL + "SHA256SUMS",
+        )
+        upgrade_pip(python_root)
+        seed_baseline_packages(python_root)
 
         archive_path.parent.mkdir(parents=True, exist_ok=True)
         build_archive(staging_dir, archive_path)

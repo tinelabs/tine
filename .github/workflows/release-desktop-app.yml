@@ -23,8 +23,20 @@ on:
         required: false
         default: ""
         type: string
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      target:
+        required: false
+        default: all
+        type: string
+      publish_to_release:
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -40,8 +52,7 @@ jobs:
         id: matrix
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          REQUESTED_TARGET: ${{ github.event.inputs.target || 'all' }}
+          REQUESTED_TARGET: ${{ inputs.target || 'all' }}
         run: |
           python - <<'PY' >> "$GITHUB_OUTPUT"
           import json
@@ -71,7 +82,7 @@ jobs:
               },
           ]
 
-          if os.environ["EVENT_NAME"] == "workflow_dispatch" and os.environ["REQUESTED_TARGET"] != "all":
+          if os.environ["REQUESTED_TARGET"] != "all":
               include = [item for item in include if item["label"] == os.environ["REQUESTED_TARGET"]]
 
           print(f"include={json.dumps(include)}")
@@ -264,8 +275,12 @@ jobs:
           if [[ '${{ matrix.smoke }}' == 'true' && '${{ runner.os }}' != 'Windows' ]]; then
             APP_PATH="$(compgen -G '${{ matrix.app_glob }}' | head -n 1)"
             if [[ -z "$APP_PATH" ]]; then
-              echo "expected app matching ${{ matrix.app_glob }}" >&2
-              exit 1
+              if [[ '${{ runner.os }}' == 'macOS' && -x 'target/release/tine-app' ]]; then
+                APP_PATH='target/release/tine-app'
+              else
+                echo "expected app matching ${{ matrix.app_glob }}" >&2
+                exit 1
+              fi
             fi
             if [[ "$APP_PATH" == *.app ]]; then
               LAUNCH_PATH="$(find "$APP_PATH/Contents/MacOS" -type f | head -n 1)"
@@ -351,24 +366,16 @@ jobs:
     name: Upload desktop release assets
     needs: build-bundle
     runs-on: ubuntu-latest
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_to_release == 'true')
+    if: inputs.publish_to_release
     steps:
       - name: Resolve release metadata
         id: release_meta
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            echo "tag_name=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
-            echo "release_name=${{ github.event.release.name || github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
-            echo "draft=false" >> "$GITHUB_OUTPUT"
-            echo "prerelease=${{ github.event.release.prerelease }}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          TAG="${{ github.event.inputs.release_tag }}"
+          TAG="${{ inputs.release_tag }}"
           if [[ -z "$TAG" ]]; then
-            echo "workflow_dispatch publishing requires release_tag" >&2
+            echo "publish_to_release requires release_tag" >&2
             exit 1
           fi
 

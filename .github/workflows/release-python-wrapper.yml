@@ -2,8 +2,36 @@ name: Release Python Wrapper
 
 on:
   workflow_dispatch:
-  release:
-    types: [published]
+    inputs:
+      publish_to_release:
+        description: Upload wrapper artifacts to a GitHub Release after validation passes
+        required: false
+        default: false
+        type: boolean
+      publish_to_pypi:
+        description: Publish the built Python package to PyPI after validation passes
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: Release tag to publish to when publish_to_release is enabled
+        required: false
+        default: ""
+        type: string
+  workflow_call:
+    inputs:
+      publish_to_release:
+        required: false
+        default: false
+        type: boolean
+      publish_to_pypi:
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -205,12 +233,32 @@ jobs:
           name: python-wrapper-dist
           path: python-dist/*
 
+  resolve-release-metadata:
+    name: Resolve wrapper release metadata
+    needs: build-python-package
+    runs-on: ubuntu-latest
+    if: inputs.publish_to_release
+    outputs:
+      tag_name: ${{ steps.meta.outputs.tag_name }}
+    steps:
+      - name: Validate requested release tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.release_tag }}"
+          if [[ -z "$TAG" ]]; then
+            echo "publish_to_release requires release_tag" >&2
+            exit 1
+          fi
+          echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
+
   upload-release-assets:
     name: Upload release assets
     needs:
-      - build-python-package
+      - resolve-release-metadata
     runs-on: ubuntu-latest
-    if: github.event_name == 'release'
+    if: inputs.publish_to_release
     steps:
       - name: Download all Rust binary artifacts
         uses: actions/download-artifact@v4
@@ -227,17 +275,19 @@ jobs:
       - name: Upload Rust release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.resolve-release-metadata.outputs.tag_name }}
+          target_commitish: ${{ github.sha }}
           files: |
             release-artifacts/*
             python-dist/*
 
   publish-pypi:
     name: Publish to PyPI
-    needs: upload-release-assets
+    needs: build-python-package
     runs-on: ubuntu-latest
     permissions:
       id-token: write
-    if: github.event_name == 'release'
+    if: inputs.publish_to_pypi
     environment:
       name: any
     steps:

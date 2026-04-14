@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Git tag and GitHub Release name to create after validation passes
+        required: true
+        type: string
+      publish_release:
+        description: Create the GitHub Release and upload validated artifacts
+        required: false
+        default: true
+        type: boolean
+      publish_to_pypi:
+        description: Publish the Python package to PyPI after the GitHub Release is created
+        required: false
+        default: true
+        type: boolean
+      prerelease:
+        description: Mark the created GitHub Release as a prerelease
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  validate-wrapper:
+    name: Validate wrapper release
+    uses: ./.github/workflows/release-python-wrapper.yml
+    with:
+      publish_to_release: false
+      publish_to_pypi: false
+      release_tag: ${{ inputs.release_tag }}
+    secrets: inherit
+
+  validate-desktop:
+    name: Validate desktop release
+    needs: validate-wrapper
+    uses: ./.github/workflows/release-desktop-app.yml
+    with:
+      target: all
+      publish_to_release: false
+      release_tag: ${{ inputs.release_tag }}
+    secrets: inherit
+
+  publish-release:
+    name: Publish GitHub release
+    needs:
+      - validate-wrapper
+      - validate-desktop
+    runs-on: ubuntu-latest
+    if: inputs.publish_release
+    steps:
+      - name: Download wrapper runtime artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          pattern: rust-binary-*
+          merge-multiple: true
+
+      - name: Download Python package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-wrapper-dist
+          path: python-dist
+
+      - name: Download desktop bundle artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: desktop-artifacts
+          pattern: desktop-app-*
+          merge-multiple: true
+
+      - name: Create release and upload validated assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          files: |
+            release-artifacts/*
+            python-dist/*
+            desktop-artifacts/*
+
+  publish-pypi:
+    name: Publish Python package to PyPI
+    needs: publish-release
+    runs-on: ubuntu-latest
+    if: inputs.publish_release && inputs.publish_to_pypi
+    permissions:
+      id-token: write
+    environment:
+      name: any
+    steps:
+      - name: Download Python package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-wrapper-dist
+          path: python-dist
+
+      - name: Publish package to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python-dist
