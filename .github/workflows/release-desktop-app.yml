@@ -234,6 +234,7 @@ jobs:
           LINUX_SIGNING_KEY_ID: ${{ runner.os == 'Linux' && secrets.LINUX_SIGNING_KEY_ID || '' }}
           LINUX_SIGNING_KEY_PASSPHRASE: ${{ runner.os == 'Linux' && secrets.LINUX_SIGNING_KEY_PASSPHRASE || '' }}
         run: |
+          set -euo pipefail
           if [[ "$RUNNER_OS" == "macOS" && -n "${APPLE_ID}" && -n "${APPLE_PASSWORD}" ]]; then
             unset APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH
           fi
@@ -246,7 +247,25 @@ jobs:
             fi
           fi
           cd crates/tine-app
-          cargo tauri build --config tauri.conf.json
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            set +e
+            cargo tauri build -vv --config tauri.conf.json 2>&1 | tee "$RUNNER_TEMP/tauri-build.log"
+            status=${PIPESTATUS[0]}
+            set -e
+            if [[ $status -ne 0 ]]; then
+              echo "::group::Linux desktop bundle diagnostics"
+              du -sh resources/runtime resources/runtime/python 2>/dev/null || true
+              find resources/runtime -maxdepth 3 | sort | head -n 200 || true
+              find target/release/bundle -maxdepth 3 | sort | head -n 200 || true
+              if [[ -f resources/runtime/.fetched-runtime.json ]]; then
+                cat resources/runtime/.fetched-runtime.json
+              fi
+              echo "::endgroup::"
+              exit $status
+            fi
+          else
+            cargo tauri build -vv --config tauri.conf.json
+          fi
 
       - name: Resolve version and built bundle paths
         id: bundle
