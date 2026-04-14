@@ -262,7 +262,7 @@ jobs:
           cd crates/tine-app
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             set +e
-            cargo tauri build -vv --config tauri.conf.json 2>&1 | tee "$RUNNER_TEMP/tauri-build.log"
+            cargo tauri build --config tauri.conf.json 2>&1 | tee "$RUNNER_TEMP/tauri-build.log"
             status=${PIPESTATUS[0]}
             set -e
             if [[ $status -ne 0 ]]; then

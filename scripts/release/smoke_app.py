@@ -17,6 +17,7 @@ from urllib import request
 
 REQUEST_TIMEOUT_SECONDS = 5.0
 EXECUTION_TIMEOUT_SECONDS = 180.0
+DOCTOR_REQUEST_TIMEOUT_SECONDS = 300.0
 EMBEDDED_SERVER_BIND_ENV = "TINE_EMBEDDED_SERVER_BIND"
 
 
@@ -139,8 +140,8 @@ def http_post(url: str, payload: dict | None) -> str:
         return response.read().decode()
 
 
-def http_get_json(url: str) -> dict:
-    with request.urlopen(url, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+def http_get_json(url: str, timeout_seconds: float = REQUEST_TIMEOUT_SECONDS) -> dict:
+    with request.urlopen(url, timeout=timeout_seconds) as response:
         return json.loads(response.read().decode())
 
 
@@ -234,7 +235,10 @@ def run_execution_smoke(base_url: str) -> None:
 
 
 def run_doctor_smoke(base_url: str) -> None:
-    payload = http_get_json(base_url + "/api/system/doctor")
+    payload = http_get_json(
+        base_url + "/api/system/doctor",
+        timeout_seconds=DOCTOR_REQUEST_TIMEOUT_SECONDS,
+    )
     if payload.get("ok"):
         return
 
