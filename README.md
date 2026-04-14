@@ -110,15 +110,7 @@ Desktop app downloads live on GitHub Releases:
 https://github.com/tinelabs/tine/releases
 ```
 
-Artifact names use the `tine-app-<version>-<platform>` prefix so they stay distinct from the wrapper runtime archives.
-
 The desktop app and `pip install tine` use the same local backend and UI. The difference is only the distribution wrapper.
-
-Current release note:
-
-- desktop bundles are published through the desktop workflow
-- checksum files are attached alongside each bundle
-- macOS and Windows code signing are being phased in separately from artifact publication
 
 The server is the canonical local backend. Both the web UI and MCP connect to that same API.
 
@@ -132,26 +124,10 @@ tine serve --workspace . --bind 127.0.0.1:9473
 
 Tine supports agent workflows through MCP.
 
-The intended flow is:
-
-1. start the local Tine server
-2. configure a host to launch `tine mcp serve`
-3. let the MCP adapter talk to the same local API used by the UI
-
-The standard MCP stdio command is:
-
-```bash
-tine mcp serve --api-url http://127.0.0.1:9473
-```
-
-`tine-mcp --api-url http://127.0.0.1:9473` is also supported, but `tine mcp serve` is the preferred public form.
-
-### MCP config generation
-
 Generate an MCP config document for a supported host:
 
 ```bash
-tine mcp print-config --host vscode
+tine mcp print-config --host vscode --api-url http://127.0.0.1:9473
 ```
 
 Supported hosts:
@@ -160,12 +136,6 @@ Supported hosts:
 - `cursor`
 - `claude`
 - `generic`
-
-If your Tine server uses a non-default API URL, include it explicitly:
-
-```bash
-tine mcp print-config --host vscode --api-url http://127.0.0.1:9473
-```
 
 Example VS Code config output:
 

@@ -10,6 +10,13 @@ import sys
 from pathlib import Path
 
 
+def read_repo_version(repo_root: Path) -> str:
+    version = (repo_root / "VERSION").read_text().strip()
+    if not version:
+        raise RuntimeError("failed to locate repo version in VERSION")
+    return version
+
+
 def read_workspace_version(repo_root: Path) -> str:
     text = (repo_root / "Cargo.toml").read_text()
     match = re.search(r"(?m)^\[workspace\.package\]\s*(?:.*\n)*?version = \"([^\"]+)\"", text)
@@ -85,31 +92,39 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     repo_root = Path(args.repo_root).resolve()
+    repo_version = read_repo_version(repo_root)
     workspace_version = read_workspace_version(repo_root)
-    python_version = read_python_version(repo_root)
-    if workspace_version != python_version:
+    if repo_version != workspace_version:
         print(
-            f"version mismatch: workspace Cargo.toml={workspace_version} packaging/python={python_version}",
+            f"version mismatch: VERSION={repo_version} workspace Cargo.toml={workspace_version}",
+            file=sys.stderr,
+        )
+        return 1
+
+    python_version = read_python_version(repo_root)
+    if repo_version != python_version:
+        print(
+            f"version mismatch: VERSION={repo_version} packaging/python={python_version}",
             file=sys.stderr,
         )
         return 1
 
     if args.binary:
         binary_version = read_binary_version(Path(args.binary).resolve())
-        if binary_version != python_version:
+        if binary_version != repo_version:
             print(
-                f"version mismatch: packaging/python={python_version} binary={binary_version}",
+                f"version mismatch: VERSION={repo_version} binary={binary_version}",
                 file=sys.stderr,
             )
             return 1
 
     if args.tauri_template:
         template_path = Path(args.tauri_template).resolve()
-        rendered = render_tauri_config(template_path, workspace_version)
+        rendered = render_tauri_config(template_path, repo_version)
         rendered_version = read_tauri_config_version_from_text(rendered, str(template_path))
-        if rendered_version != workspace_version:
+        if rendered_version != repo_version:
             print(
-                f"version mismatch: workspace Cargo.toml={workspace_version} tauri-template-rendered={rendered_version}",
+                f"version mismatch: VERSION={repo_version} tauri-template-rendered={rendered_version}",
                 file=sys.stderr,
             )
             return 1
@@ -121,14 +136,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.tauri_config:
         tauri_version = read_tauri_config_version(Path(args.tauri_config).resolve())
-        if tauri_version != workspace_version:
+        if tauri_version != repo_version:
             print(
-                f"version mismatch: workspace Cargo.toml={workspace_version} tauri-config={tauri_version}",
+                f"version mismatch: VERSION={repo_version} tauri-config={tauri_version}",
                 file=sys.stderr,
             )
             return 1
 
-    print(f"version alignment ok: {python_version}")
+    print(f"version alignment ok: {repo_version}")
     return 0
 
 

@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
+import tine.mcp as mcp_module
 from tine.mcp import (
     McpServer,
     _handle_request,
@@ -24,6 +25,7 @@ class _Handler(BaseHTTPRequestHandler):
     last_move_cell_payload: dict[str, object] | None = None
     deleted_path: str | None = None
     cancel_requested = False
+    restart_requested = False
     wait_status_requests = 0
 
     def do_GET(self) -> None:  # noqa: N802
@@ -57,6 +59,19 @@ class _Handler(BaseHTTPRequestHandler):
                     "replay_from_idx": 0,
                     "replay_cell_ids": [],
                     "replay_prefix_before_target": [],
+                },
+            )
+            return
+        if self.path == "/api/experiment-trees/tree_1/inspect-kernel":
+            self._json(
+                200,
+                {
+                    "tree_id": "tree_1",
+                    "has_live_kernel": type(self).restart_requested,
+                    "tree_kernel_state": "needs_replay" if type(self).restart_requested else "ready",
+                    "replay_required": type(self).restart_requested,
+                    "active_branch_id": "main",
+                    "runtime_epoch": 4,
                 },
             )
             return
@@ -110,6 +125,42 @@ class _Handler(BaseHTTPRequestHandler):
                     "cancellation_requested_at": None,
                     "node_statuses": {"step1": "running"},
                     "finished_at": None,
+                },
+            )
+            return
+        if self.path == "/api/executions/exec_queued":
+            self._json(
+                200,
+                {
+                    "execution_id": "exec_queued",
+                    "status": "queued",
+                    "phase": "queued",
+                    "queue_position": 2,
+                    "queue": {
+                        "pending_ahead": 1,
+                        "pending_total": 2,
+                        "active_executions": 1,
+                        "max_concurrent_executions": 1,
+                        "max_queue_depth": 32,
+                        "queue_head": False,
+                        "queued_reason": "waiting_for_earlier_executions",
+                    },
+                    "cancellation_requested_at": None,
+                    "node_statuses": {},
+                    "finished_at": None,
+                },
+            )
+            return
+        if self.path == "/api/experiment-trees/tree_1/branches/main/cells/cell_1/logs":
+            self._json(
+                200,
+                {
+                    "stdout": "line1\nline2\nline3\n",
+                    "stderr": "warn1\nwarn2\n",
+                    "outputs": [],
+                    "error": None,
+                    "duration_ms": 12,
+                    "metrics": {},
                 },
             )
             return
@@ -211,6 +262,11 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             return
+        if self.path == "/api/experiment-trees/tree_1/restart-kernel":
+            type(self).restart_requested = True
+            self.send_response(200)
+            self.end_headers()
+            return
         self._json(404, {"error": "not found"})
 
     def do_PUT(self) -> None:  # noqa: N802
@@ -261,6 +317,7 @@ class McpPythonTests(unittest.TestCase):
         _Handler.last_move_cell_payload = None
         _Handler.deleted_path = None
         _Handler.cancel_requested = False
+        _Handler.restart_requested = False
         _Handler.wait_status_requests = 0
 
     @classmethod
@@ -277,6 +334,8 @@ class McpPythonTests(unittest.TestCase):
         self.assertIn("delete_cell", names)
         self.assertIn("delete_branch", names)
         self.assertIn("inspect_cell", names)
+        self.assertIn("inspect_kernel", names)
+        self.assertIn("restart_kernel", names)
         self.assertIn("execute_branch", names)
         self.assertIn("logs", names)
         self.assertIn("get_experiment_summary", names)
@@ -316,14 +375,14 @@ class McpPythonTests(unittest.TestCase):
         )
         self.assertEqual(
             created_payload["agent_context"]["environment"]["required_runtime_packages"],
-            ["ipykernel", "cloudpickle"],
+            ["ipykernel==7.2.0", "cloudpickle==3.1.2"],
         )
         self.assertIn(
-            "numpy>=1.26",
+            "numpy==2.4.4",
             created_payload["agent_context"]["environment"]["always_available_packages"],
         )
         self.assertIn(
-            "scikit-learn>=1.4",
+            "scikit-learn==1.8.0",
             created_payload["agent_context"]["environment"]["effective_packages"],
         )
         self.assertIn(
@@ -375,6 +434,33 @@ class McpPythonTests(unittest.TestCase):
         self.assertFalse(summary.is_error)
         summary_payload = json.loads(summary.content[0]["text"])
         self.assertEqual(summary_payload["experiment_id"], "tree_1")
+
+        kernel_inspection = self.server.call_tool(
+            "inspect_kernel", {"experiment_id": "tree_1"}
+        )
+        self.assertFalse(kernel_inspection.is_error)
+        kernel_inspection_payload = json.loads(kernel_inspection.content[0]["text"])
+        self.assertEqual(kernel_inspection_payload["tree_id"], "tree_1")
+        self.assertFalse(kernel_inspection_payload["has_live_kernel"])
+        self.assertEqual(kernel_inspection_payload["tree_kernel_state"], "ready")
+
+        restart_kernel = self.server.call_tool(
+            "restart_kernel", {"experiment_id": "tree_1"}
+        )
+        self.assertFalse(restart_kernel.is_error)
+        self.assertEqual(
+            restart_kernel.content[0]["text"],
+            "Kernel restart requested for experiment tree_1",
+        )
+
+        post_restart_inspection = self.server.call_tool(
+            "inspect_kernel", {"experiment_id": "tree_1"}
+        )
+        self.assertFalse(post_restart_inspection.is_error)
+        post_restart_payload = json.loads(post_restart_inspection.content[0]["text"])
+        self.assertTrue(post_restart_payload["has_live_kernel"])
+        self.assertTrue(post_restart_payload["replay_required"])
+        self.assertEqual(post_restart_payload["tree_kernel_state"], "needs_replay")
 
         saved = self.server.call_tool(
             "save_experiment",
@@ -480,6 +566,7 @@ class McpPythonTests(unittest.TestCase):
         self.assertEqual(waited_timed_out_payload["phase"], "timed_out")
         self.assertTrue(waited_timed_out_payload["terminal"])
         self.assertFalse(waited_timed_out_payload["wait_exhausted"])
+        self.assertEqual(waited_timed_out_payload["suggested_next_action"], "done")
 
         waited_running = self.server.call_tool(
             "wait_for_execution",
@@ -492,6 +579,8 @@ class McpPythonTests(unittest.TestCase):
         self.assertEqual(waited_running_payload["phase"], "running")
         self.assertFalse(waited_running_payload["terminal"])
         self.assertTrue(waited_running_payload["wait_exhausted"])
+        self.assertEqual(waited_running_payload["summary"], "Execution is running.")
+        self.assertEqual(waited_running_payload["suggested_next_action"], "wait")
         self.assertEqual(_Handler.wait_status_requests, 1)
 
         waited_legacy_alias = self.server.call_tool(
@@ -503,6 +592,40 @@ class McpPythonTests(unittest.TestCase):
         self.assertEqual(waited_legacy_alias_payload["execution_id"], "exec_wait")
         self.assertFalse(waited_legacy_alias_payload["terminal"])
         self.assertTrue(waited_legacy_alias_payload["wait_exhausted"])
+
+        waited_queued = self.server.call_tool(
+            "wait_for_execution",
+            {"execution_id": "exec_queued", "wait_timeout_secs": 0, "poll_interval_ms": 50},
+        )
+        self.assertFalse(waited_queued.is_error)
+        waited_queued_payload = json.loads(waited_queued.content[0]["text"])
+        self.assertEqual(waited_queued_payload["execution_id"], "exec_queued")
+        self.assertEqual(
+            waited_queued_payload["summary"],
+            "Execution is queued and waiting to start.",
+        )
+        self.assertEqual(waited_queued_payload["suggested_next_action"], "wait")
+        self.assertFalse(waited_queued_payload["terminal"])
+        self.assertTrue(waited_queued_payload["wait_exhausted"])
+
+        tailed_logs = self.server.call_tool(
+            "logs",
+            {
+                "experiment_id": "tree_1",
+                "branch_id": "main",
+                "cell_id": "cell_1",
+                "tail_lines": 1,
+            },
+        )
+        self.assertFalse(tailed_logs.is_error)
+        tailed_logs_payload = json.loads(tailed_logs.content[0]["text"])
+        self.assertEqual(tailed_logs_payload["stdout"], "line3\n")
+        self.assertEqual(tailed_logs_payload["stderr"], "warn2\n")
+        self.assertEqual(tailed_logs_payload["view"]["tail_lines"], 1)
+        self.assertEqual(tailed_logs_payload["view"]["stdout_total_lines"], 3)
+        self.assertEqual(tailed_logs_payload["view"]["stderr_total_lines"], 2)
+        self.assertTrue(tailed_logs_payload["view"]["stdout_truncated"])
+        self.assertTrue(tailed_logs_payload["view"]["stderr_truncated"])
 
     def test_create_experiment_populates_root_cell_and_saves_tree(self) -> None:
         created_tree = {
@@ -925,6 +1048,24 @@ class McpPythonTests(unittest.TestCase):
         with mock.patch("platform.system", return_value="Darwin"):
             path = resolve_config_path("claude")
         self.assertIn("Claude/claude_desktop_config.json", str(path))
+
+    def test_runtime_package_fallback_uses_embedded_pins_when_no_manifest_exists(self) -> None:
+        with mock.patch("tine.mcp._repo_runtime_pins_path", return_value=None), mock.patch(
+            "tine.mcp._packaged_runtime_pins_path", return_value=None
+        ):
+            baseline = mcp_module._desktop_runtime_baseline()
+            required = mcp_module._packages_for_category(mcp_module.CORE_RUNTIME_CATEGORY)
+            defaults = tuple(
+                mcp_module._package_spec(package, version)
+                for category, package, version in baseline
+                if category != mcp_module.CORE_RUNTIME_CATEGORY
+            )
+
+        self.assertEqual(baseline, mcp_module._EMBEDDED_DESKTOP_RUNTIME_BASELINE)
+        self.assertIn("ipykernel==7.2.0", required)
+        self.assertIn("cloudpickle==3.1.2", required)
+        self.assertIn("pandas==3.0.2", defaults)
+        self.assertIn("scikit-learn==1.8.0", defaults)
 
 
 if __name__ == "__main__":

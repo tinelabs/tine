@@ -14,10 +14,11 @@ use tine_core::{
     ArtifactKey, ArtifactStore, BranchDef, BranchId, BranchIsolationMode,
     BranchTargetInspection, CellDef, CellId, CellRuntimeState, ExecutableTreeBranch,
     ExecutableTreeCell, ExecutionAccepted, ExecutionEvent, ExecutionId,
-    ExecutionLifecycleStatus, ExecutionPhase, ExecutionStatus, ExecutionTargetKind,
+    ExecutionLifecycleStatus, ExecutionPhase, ExecutionQueueTelemetry, ExecutionStatus, ExecutionTargetKind,
     ExecutionTargetRef, ExperimentTreeDef, ExperimentTreeId, IsolationResult, NodeCacheKey,
     NodeCode, NodeError, NodeId, NodeLogs, NodeStatus, PreparedContext, ProjectDef, ProjectId,
-    SlotName, TineError, TineResult, TreeKernelState, TreeRuntimeState, WorkspaceApi,
+    RuntimeHealthSnapshot, SlotName, TineError, TineResult, TreeKernelState, TreeRuntimeState,
+    WorkspaceApi,
 };
 use tine_env::{EnvironmentManager, TreeEnvironmentDescriptor};
 use tine_kernel::{KernelIsolationOutcome, KernelLifecycleEvent, KernelManager};
@@ -471,6 +472,8 @@ impl Workspace {
             status: ExecutionLifecycleStatus::Queued,
             phase: ExecutionPhase::Queued,
             queue_position: None,
+            queue: None,
+            runtime: None,
             cancellation_requested_at: None,
             node_statuses: topo_order
                 .iter()
@@ -527,6 +530,8 @@ impl Workspace {
             status: terminal_status.clone(),
             phase: Self::terminal_phase_from_status(&terminal_status),
             queue_position: None,
+            queue: None,
+            runtime: None,
             cancellation_requested_at: None,
             node_statuses: outcome.node_statuses,
             started_at: Utc::now() - chrono::Duration::milliseconds(outcome.duration_ms as i64),
@@ -590,6 +595,8 @@ impl Workspace {
             status: ExecutionLifecycleStatus::Failed,
             phase: ExecutionPhase::Failed,
             queue_position: None,
+            queue: None,
+            runtime: None,
             cancellation_requested_at: None,
             node_statuses: HashMap::new(),
             started_at: Utc::now(),
@@ -665,6 +672,7 @@ impl Workspace {
             status.status = terminal_status.clone();
             status.phase = Self::terminal_phase_from_status(&terminal_status);
             status.queue_position = None;
+            status.queue = None;
             return status;
         }
 
@@ -688,6 +696,108 @@ impl Workspace {
         {
             status.status = ExecutionLifecycleStatus::Queued;
             status.phase = ExecutionPhase::Queued;
+        }
+
+        status
+    }
+
+    async fn runtime_health_snapshot(
+        &self,
+        tree_id: &ExperimentTreeId,
+    ) -> RuntimeHealthSnapshot {
+        let current_runtime_state = self.get_tree_runtime_state(tree_id).await;
+        let has_live_kernel = self.kernel_mgr.has_tree_kernel(tree_id);
+        let tree_kernel_state = current_runtime_state
+            .as_ref()
+            .map(|state| state.kernel_state.clone());
+
+        RuntimeHealthSnapshot {
+            tree_id: tree_id.clone(),
+            has_live_kernel,
+            tree_kernel_state: tree_kernel_state.clone(),
+            replay_required: matches!(
+                tree_kernel_state,
+                Some(TreeKernelState::NeedsReplay | TreeKernelState::KernelLost | TreeKernelState::Switching)
+            ),
+            active_branch_id: current_runtime_state
+                .as_ref()
+                .map(|state| state.active_branch_id.clone()),
+            runtime_epoch: current_runtime_state
+                .as_ref()
+                .map(|state| state.runtime_epoch),
+        }
+    }
+
+    async fn enrich_execution_status(&self, mut status: ExecutionStatus) -> ExecutionStatus {
+        status.runtime = match status.tree_id.clone() {
+            Some(tree_id) => Some(self.runtime_health_snapshot(&tree_id).await),
+            None => None,
+        };
+
+        if status.finished_at.is_some() {
+            status.queue = None;
+            return status;
+        }
+
+        let queue = self.execution_queue_state.lock().await;
+        let active_executions = queue.active.len() as u64;
+        let pending_total = queue.pending.len() as u64;
+        let pending_index = queue
+            .pending
+            .iter()
+            .position(|queued_id| queued_id == &status.execution_id);
+        let is_active = queue.active.contains(&status.execution_id);
+        drop(queue);
+
+        if matches!(status.status, ExecutionLifecycleStatus::Queued)
+            || matches!(status.phase, ExecutionPhase::Queued)
+        {
+            if let Some(index) = pending_index {
+                let queue_head = index == 0;
+                let queued_reason = if queue_head {
+                    if active_executions >= self.max_concurrent_executions as u64 {
+                        "waiting_for_execution_slot"
+                    } else {
+                        "awaiting_scheduler_dispatch"
+                    }
+                } else {
+                    "waiting_for_earlier_executions"
+                };
+                status.queue_position = Some((index + 1) as u64);
+                status.queue = Some(ExecutionQueueTelemetry {
+                    pending_ahead: index as u64,
+                    pending_total,
+                    active_executions,
+                    max_concurrent_executions: self.max_concurrent_executions as u64,
+                    max_queue_depth: self.max_queue_depth as u64,
+                    queue_head,
+                    queued_reason: queued_reason.to_string(),
+                });
+            } else if is_active {
+                Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+                status.queue_position = None;
+                status.queue = Some(ExecutionQueueTelemetry {
+                    pending_ahead: 0,
+                    pending_total,
+                    active_executions,
+                    max_concurrent_executions: self.max_concurrent_executions as u64,
+                    max_queue_depth: self.max_queue_depth as u64,
+                    queue_head: false,
+                    queued_reason: "transitioning_to_start".to_string(),
+                });
+            } else {
+                status.queue = Some(ExecutionQueueTelemetry {
+                    pending_ahead: 0,
+                    pending_total,
+                    active_executions,
+                    max_concurrent_executions: self.max_concurrent_executions as u64,
+                    max_queue_depth: self.max_queue_depth as u64,
+                    queue_head: false,
+                    queued_reason: "scheduler_state_unknown".to_string(),
+                });
+            }
+        } else {
+            status.queue = None;
         }
 
         status
@@ -1769,6 +1879,17 @@ impl Workspace {
         })
     }
 
+    pub async fn inspect_tree_kernel(
+        &self,
+        tree_id: &ExperimentTreeId,
+    ) -> TineResult<RuntimeHealthSnapshot> {
+        Ok(self.runtime_health_snapshot(tree_id).await)
+    }
+
+    pub async fn restart_tree_kernel(&self, tree_id: &ExperimentTreeId) -> TineResult<()> {
+        self.kernel_mgr.restart_tree_kernel(tree_id).await
+    }
+
     pub async fn add_cell_to_experiment_tree_branch(
         &self,
         tree_id: &ExperimentTreeId,
@@ -2094,6 +2215,8 @@ impl Workspace {
                 ExecutionPhase::Completed
             },
             queue_position: None,
+            queue: None,
+            runtime: None,
             cancellation_requested_at: None,
             node_statuses,
             started_at: Utc::now()
@@ -3870,7 +3993,9 @@ impl WorkspaceApi for Workspace {
         let (status_json,) =
             row.ok_or_else(|| TineError::ExecutionNotFound(execution_id.clone()))?;
         let status: ExecutionStatus = serde_json::from_str(&status_json)?;
-        Ok(Self::normalize_execution_status(status))
+        Ok(self
+            .enrich_execution_status(Self::normalize_execution_status(status))
+            .await)
     }
 
     async fn logs_for_tree_cell(
@@ -4196,6 +4321,8 @@ mod tests {
             status: ExecutionLifecycleStatus::Running,
             phase: ExecutionPhase::Running,
             queue_position: None,
+            queue: None,
+            runtime: None,
             cancellation_requested_at: None,
             node_statuses,
             started_at: Utc::now(),
@@ -4241,6 +4368,8 @@ mod tests {
             status: ExecutionLifecycleStatus::Running,
             phase: ExecutionPhase::Running,
             queue_position: None,
+            queue: None,
+            runtime: None,
             cancellation_requested_at: None,
             node_statuses,
             started_at: Utc::now(),

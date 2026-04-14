@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 tine-core.workspace = true
 tine-api.workspace = true
+tine-env.workspace = true
 tine-observe.workspace = true
 axum.workspace = true
 tower.workspace = true

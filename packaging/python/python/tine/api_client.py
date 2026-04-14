@@ -134,6 +134,12 @@ class TineApiClient:
             f"/api/experiment-trees/{experiment_id}/branches/{branch_id}/cells/{cell_id}/inspect"
         )
 
+    def inspect_experiment_tree_kernel(self, experiment_id: str) -> dict[str, Any]:
+        return self._get_json(f"/api/experiment-trees/{experiment_id}/inspect-kernel")
+
+    def restart_experiment_tree_kernel(self, experiment_id: str) -> None:
+        self._post_no_content(f"/api/experiment-trees/{experiment_id}/restart-kernel", None)
+
     def execute_branch_in_experiment_tree(
         self,
         experiment_id: str,

@@ -261,7 +261,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "bundle_path=$CANONICAL_PATH" >> "$GITHUB_OUTPUT"
 
-          if [[ '${{ matrix.smoke }}' == 'true' && '${{ runner.os }}' == 'Linux' ]]; then
+          if [[ '${{ matrix.smoke }}' == 'true' && '${{ runner.os }}' != 'Windows' ]]; then
             APP_PATH="$(compgen -G '${{ matrix.app_glob }}' | head -n 1)"
             if [[ -z "$APP_PATH" ]]; then
               echo "expected app matching ${{ matrix.app_glob }}" >&2
@@ -304,7 +304,8 @@ jobs:
         shell: bash
         env:
           BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
-        run: python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --health-only
+          LAUNCH_PATH: ${{ steps.bundle.outputs.launch_path }}
+        run: python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH" --server-port 40113 --require-bundled-python --doctor-runtime --health-only
 
       - name: Smoke desktop app (Linux)
         if: matrix.smoke && runner.os == 'Linux'
@@ -312,7 +313,7 @@ jobs:
         env:
           BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
           LAUNCH_PATH: ${{ steps.bundle.outputs.launch_path }}
-        run: xvfb-run -a python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH" --server-port 40113 --health-only
+        run: xvfb-run -a python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH" --server-port 40113 --require-bundled-python --doctor-runtime --health-only
 
       - name: Smoke desktop app (Windows)
         if: matrix.smoke && runner.os == 'Windows'
@@ -320,7 +321,7 @@ jobs:
         env:
           BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
           LAUNCH_PATH: ${{ steps.windows_msi.outputs.launch_path }}
-        run: python scripts/release/smoke_app.py --bundle-path "$env:BUNDLE_PATH" --launch-path "$env:LAUNCH_PATH" --server-port 40113 --require-bundled-python --health-only
+        run: python scripts/release/smoke_app.py --bundle-path "$env:BUNDLE_PATH" --launch-path "$env:LAUNCH_PATH" --server-port 40113 --require-bundled-python --doctor-runtime --health-only
 
       - name: Generate checksum
         shell: bash

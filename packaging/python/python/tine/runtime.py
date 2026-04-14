@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import platform
+import re
 import shutil
 import ssl
 import subprocess
@@ -66,10 +67,38 @@ def package_version() -> str:
     overridden = os.environ.get("TINE_PACKAGE_VERSION")
     if overridden:
         return overridden
+    source_version = source_checkout_version()
+    if source_version is not None:
+        return source_version
     try:
         return metadata.version("tine")
     except metadata.PackageNotFoundError:  # pragma: no cover - local source checkout
-        return "0.2.2-dev"
+        return "0.2.3-dev"
+
+
+def source_checkout_version(module_file: Path | None = None) -> str | None:
+    root = source_checkout_root(module_file)
+    if root is None:
+        return None
+
+    version_path = root / "VERSION"
+    try:
+        version_text = version_path.read_text().strip()
+    except OSError:
+        version_text = ""
+    if version_text:
+        return version_text
+
+    pyproject_path = root / "packaging" / "python" / "pyproject.toml"
+    try:
+        text = pyproject_path.read_text()
+    except OSError:
+        return None
+
+    match = re.search(r'(?m)^\[project\]\s*(?:.*\n)*?version = "([^"]+)"', text)
+    if match is None:
+        return None
+    return match.group(1)
 
 
 def supported_target() -> SupportedTarget:

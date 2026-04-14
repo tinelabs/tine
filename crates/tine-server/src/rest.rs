@@ -11,7 +11,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tower_http::{
     cors::{Any, CorsLayer},
     services::ServeDir,
@@ -24,8 +24,10 @@ use tine_api::{export_branch_as_ipynb, export_branch_as_python};
 use tine_core::{
     BranchId, BranchTargetInspection, CellDef, CellId, CellRuntimeState, ExecutionId,
     ExecutionAccepted, ExecutionStatus, ExperimentTreeDef, ExperimentTreeId, NodeCode,
-    NodeLogs, ProjectDef, ProjectId, RevisionId, SlotName, TreeRuntimeState, WorkspaceApi,
+    NodeLogs, ProjectDef, ProjectId, RevisionId, RuntimeHealthSnapshot, SlotName,
+    TreeRuntimeState, WorkspaceApi,
 };
+use tine_env::{EnvironmentManager, DEFAULT_PYTHON_VERSION};
 
 use crate::file_watcher::start_file_watcher;
 
@@ -152,6 +154,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(get_experiment_tree_runtime_state),
         )
         .route(
+            "/api/experiment-trees/{id}/inspect-kernel",
+            get(inspect_experiment_tree_kernel),
+        )
+        .route(
+            "/api/experiment-trees/{id}/restart-kernel",
+            post(restart_experiment_tree_kernel),
+        )
+        .route(
             "/api/experiment-trees/{id}/branches",
             post(create_experiment_tree_branch),
         )
@@ -218,6 +228,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/system/default-projects-dir",
             get(default_projects_dir_handler),
         )
+        .route("/api/system/doctor", get(system_doctor_handler))
         .route("/api/system/pick-directory", post(pick_directory_handler))
         // WebSocket
         .route("/ws", get(crate::websocket::ws_handler))
@@ -323,6 +334,28 @@ async fn get_experiment_tree_runtime_state(
         .get_tree_runtime_state(&ExperimentTreeId::new(id))
         .await;
     Ok(Json(runtime_state))
+}
+
+async fn inspect_experiment_tree_kernel(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<RuntimeHealthSnapshot>, AppError> {
+    let inspection = state
+        .workspace
+        .inspect_tree_kernel(&ExperimentTreeId::new(id))
+        .await?;
+    Ok(Json(inspection))
+}
+
+async fn restart_experiment_tree_kernel(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    state
+        .workspace
+        .restart_tree_kernel(&ExperimentTreeId::new(id))
+        .await?;
+    Ok(StatusCode::OK)
 }
 
 #[derive(Deserialize)]
@@ -846,6 +879,20 @@ struct DefaultProjectsDirResponse {
     native_picker_available: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct DoctorCheckResponse {
+    name: String,
+    ok: bool,
+    detail: String,
+    logs: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DoctorResponse {
+    ok: bool,
+    checks: Vec<DoctorCheckResponse>,
+}
+
 async fn default_projects_dir_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<DefaultProjectsDirResponse> {
@@ -855,6 +902,55 @@ async fn default_projects_dir_handler(
             .to_string(),
         native_picker_available: native_directory_picker_available(),
     })
+}
+
+async fn system_doctor_handler(State(state): State<Arc<AppState>>) -> Json<DoctorResponse> {
+    let env_manager = EnvironmentManager::new(state.workspace.workspace_root().to_path_buf());
+    let mut checks = Vec::new();
+    let mut ok = true;
+
+    match env_manager
+        .ensure_python_version_available(DEFAULT_PYTHON_VERSION)
+        .await
+    {
+        Ok(path) => checks.push(DoctorCheckResponse {
+            name: format!("python {}", DEFAULT_PYTHON_VERSION),
+            ok: true,
+            detail: path,
+            logs: None,
+        }),
+        Err(error) => {
+            ok = false;
+            checks.push(DoctorCheckResponse {
+                name: format!("python {}", DEFAULT_PYTHON_VERSION),
+                ok: false,
+                detail: error.to_string(),
+                logs: None,
+            });
+        }
+    }
+
+    if ok {
+        match env_manager.doctor_runtime_check().await {
+            Ok(logs) => checks.push(DoctorCheckResponse {
+                name: "runtime preflight".to_string(),
+                ok: true,
+                detail: "temporary kernel environment created successfully".to_string(),
+                logs: Some(logs),
+            }),
+            Err(error) => {
+                ok = false;
+                checks.push(DoctorCheckResponse {
+                    name: "runtime preflight".to_string(),
+                    ok: false,
+                    detail: error.to_string(),
+                    logs: None,
+                });
+            }
+        }
+    }
+
+    Json(DoctorResponse { ok, checks })
 }
 
 #[derive(Deserialize)]
@@ -2407,6 +2503,18 @@ mod tests {
             .as_str()
             .is_some_and(|value| !value.is_empty()));
         assert!(default_projects_dir_body["native_picker_available"].is_boolean());
+
+        let doctor = send_json(&app, Method::GET, "/api/system/doctor", None).await;
+        assert_eq!(doctor.status(), StatusCode::OK);
+        let doctor_body: DoctorResponse = read_json(doctor).await;
+        assert!(doctor_body
+            .checks
+            .iter()
+            .any(|check| check.name == format!("python {}", DEFAULT_PYTHON_VERSION)));
+        assert!(doctor_body
+            .checks
+            .iter()
+            .any(|check| check.name == "runtime preflight" || !check.ok));
     }
 
     #[tokio::test]

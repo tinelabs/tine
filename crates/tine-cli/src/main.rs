@@ -23,6 +23,8 @@ use tine_core::{
 };
 use tine_observe::{init_logging, init_metrics};
 
+const TINE_VERSION: &str = include_str!("../../../VERSION");
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -51,7 +53,7 @@ impl Default for TineConfig {
 #[derive(Parser)]
 #[command(
     name = "tine",
-    version,
+    version = TINE_VERSION,
     about = "Local operator shell for the Tine runtime"
 )]
 pub struct Cli {
@@ -378,7 +380,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Version => {
-            println!("tine {}", env!("CARGO_PKG_VERSION"));
+            println!("tine {}", TINE_VERSION);
         }
 
         Commands::Internal { command } => match command {

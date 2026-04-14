@@ -3,6 +3,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
@@ -18,36 +19,70 @@ use tine_core::{
 // what conda's `defaults` channel ships so that common data-science workflows
 // work out of the box without the user declaring any deps.
 //
-// Packages are pinned to major-version ranges for reproducibility while still
-// allowing patch updates.  Users can override any version by listing the same
-// package in their pipeline's `deps`.
+// Shipped desktop runtime packages are pinned exactly in the shared
+// runtime_pins.json manifest. Users can still override any version by listing
+// the same package in their pipeline's `deps`.
 
-/// Packages essential for tine's own plumbing (Arrow IPC serialization, kernel
-/// protocol, etc.).  These are non-negotiable.
-pub const TINE_REQUIRED_PACKAGES: &[&str] = &["ipykernel", "cloudpickle"];
+const CORE_RUNTIME_CATEGORY: &str = "Core Notebook / Runtime";
 
-/// The data-science "batteries included" set — modeled after conda defaults.
-pub const DEFAULT_PACKAGES: &[&str] = &[
-    // Arrow (needed for zero-copy DataFrames in cache)
-    "pyarrow>=14",
-    // Data wrangling
-    "numpy>=1.26",
-    "pandas>=2.1",
-    "polars>=0.20",
-    // Math / stats
-    "scipy>=1.12",
-    // Machine learning
-    "scikit-learn>=1.4",
-    // Visualization
-    "matplotlib>=3.8",
-    "seaborn>=0.13",
-    // Progress bars
-    "tqdm>=4.66",
-    // HTTP
-    "requests>=2.31",
-    // Image processing
-    "pillow>=10",
-];
+#[derive(Debug, Clone, Deserialize)]
+struct RuntimePackagePin {
+    category: String,
+    package: String,
+    version: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DesktopRuntimePins {
+    baseline_packages: Vec<RuntimePackagePin>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimePinsManifest {
+    desktop_runtime: DesktopRuntimePins,
+}
+
+fn runtime_package_pins() -> &'static [RuntimePackagePin] {
+    static PINS: OnceLock<Vec<RuntimePackagePin>> = OnceLock::new();
+    PINS.get_or_init(|| {
+        let manifest: RuntimePinsManifest = serde_json::from_str(include_str!(
+            "../../../scripts/release/runtime_pins.json"
+        ))
+        .expect("runtime_pins.json should be valid JSON");
+        manifest.desktop_runtime.baseline_packages
+    })
+    .as_slice()
+}
+
+fn package_pin_spec(pin: &RuntimePackagePin) -> String {
+    format!("{}=={}", pin.package, pin.version)
+}
+
+fn required_runtime_packages() -> &'static [String] {
+    static REQUIRED: OnceLock<Vec<String>> = OnceLock::new();
+    REQUIRED
+        .get_or_init(|| {
+            runtime_package_pins()
+                .iter()
+                .filter(|pin| pin.category == CORE_RUNTIME_CATEGORY)
+                .map(package_pin_spec)
+                .collect()
+        })
+        .as_slice()
+}
+
+fn default_runtime_packages() -> &'static [String] {
+    static DEFAULTS: OnceLock<Vec<String>> = OnceLock::new();
+    DEFAULTS
+        .get_or_init(|| {
+            runtime_package_pins()
+                .iter()
+                .filter(|pin| pin.category != CORE_RUNTIME_CATEGORY)
+                .map(package_pin_spec)
+                .collect()
+        })
+        .as_slice()
+}
 
 /// Merges required + default + user packages, deduplicating by package name
 /// (user deps take precedence over defaults).
@@ -56,15 +91,15 @@ pub fn resolve_packages(user_deps: &[String]) -> Vec<String> {
 
     // Start with required packages
     let mut by_name: HashMap<String, String> = HashMap::new();
-    for pkg in TINE_REQUIRED_PACKAGES {
+    for pkg in required_runtime_packages() {
         let name = package_name(pkg);
-        by_name.insert(name, pkg.to_string());
+        by_name.insert(name, pkg.clone());
     }
 
     // Layer defaults
-    for pkg in DEFAULT_PACKAGES {
+    for pkg in default_runtime_packages() {
         let name = package_name(pkg);
-        by_name.insert(name, pkg.to_string());
+        by_name.insert(name, pkg.clone());
     }
 
     // Layer user deps — these win over defaults
@@ -109,6 +144,10 @@ impl PythonCommand {
             display,
         }
     }
+}
+
+fn bundled_python_path() -> Option<PathBuf> {
+    std::env::var_os("TINE_BUNDLED_PYTHON").map(PathBuf::from)
 }
 
 fn supported_python_version(version: &str) -> bool {
@@ -228,14 +267,20 @@ impl EnvironmentManager {
             .join(format!("runtime-check-{unique}"));
         let runtime_id = format!("doctor-runtime-{unique}");
         let mut logs = Vec::new();
+        let uses_bundled_python = bundled_python_path()
+            .as_ref()
+            .is_some_and(|path| path == &python_command.program);
 
         let result = async {
-            self.create_venv(&runtime_id, &python_command, &venv_dir, &mut logs)
+            self.create_venv(
+                &runtime_id,
+                &python_command,
+                &venv_dir,
+                uses_bundled_python,
+                &mut logs,
+            )
                 .await?;
-            let required_packages = TINE_REQUIRED_PACKAGES
-                .iter()
-                .map(|pkg| (*pkg).to_string())
-                .collect::<Vec<_>>();
+            let required_packages = required_runtime_packages().to_vec();
             self.sync_packages(&runtime_id, &venv_dir, &required_packages, &mut logs)
                 .await?;
             let python_path = self.python_path(&venv_dir);
@@ -329,6 +374,9 @@ impl EnvironmentManager {
         let venv_dir = self.normalize_venv_dir(venv_dir);
         let mut logs = Vec::new();
         let python_command = self.resolve_python_command(DEFAULT_PYTHON_VERSION).await?;
+        let uses_bundled_python = bundled_python_path()
+            .as_ref()
+            .is_some_and(|path| path == &python_command.program);
 
         info!(
             owner = runtime_id,
@@ -353,8 +401,14 @@ impl EnvironmentManager {
 
         // Create venv if it doesn't exist
         if !venv_dir.exists() {
-            self.create_venv(runtime_id, &python_command, &venv_dir, &mut logs)
-                .await?;
+            self.create_venv(
+                runtime_id,
+                &python_command,
+                &venv_dir,
+                uses_bundled_python,
+                &mut logs,
+            )
+            .await?;
         } else {
             eprintln!("[tine-env] venv already exists at {}", venv_dir.display());
             logs.push(format!("Using existing venv at {}", venv_dir.display()));
@@ -363,9 +417,23 @@ impl EnvironmentManager {
         self.ensure_pip_available(runtime_id, &venv_dir, &mut logs)
             .await?;
 
-        // Sync all packages: required + defaults + user deps
-        let all_packages = resolve_packages(&spec.dependencies);
-        self.sync_packages(runtime_id, &venv_dir, &all_packages, &mut logs)
+        let packages_to_sync = if uses_bundled_python {
+            if spec.dependencies.is_empty() {
+                logs.push(
+                    "Bundled runtime already provides baseline packages; no package sync required"
+                        .to_string(),
+                );
+            } else {
+                logs.push(format!(
+                    "Bundled runtime provides baseline packages; syncing {} user-declared package(s)",
+                    spec.dependencies.len()
+                ));
+            }
+            spec.dependencies.clone()
+        } else {
+            resolve_packages(&spec.dependencies)
+        };
+        self.sync_packages(runtime_id, &venv_dir, &packages_to_sync, &mut logs)
             .await?;
 
         let python_path = self.python_path(&venv_dir);
@@ -441,6 +509,7 @@ impl EnvironmentManager {
         runtime_id: &str,
         python_command: &PythonCommand,
         venv_dir: &Path,
+        inherit_site_packages: bool,
         logs: &mut Vec<String>,
     ) -> TineResult<()> {
         eprintln!("[tine-env] creating venv at {}", venv_dir.display());
@@ -461,7 +530,15 @@ impl EnvironmentManager {
         command
             .args(&python_command.args)
             .arg("-m")
-            .arg("venv")
+            .arg("venv");
+        if inherit_site_packages {
+            command.arg("--system-site-packages");
+            logs.push(
+                "Bundled runtime detected; creating venv with inherited site-packages"
+                    .to_string(),
+            );
+        }
+        command
             .arg(venv_dir)
             .current_dir(&self.workspace_root);
         let output = command
@@ -620,14 +697,34 @@ impl EnvironmentManager {
         } else {
             format!("{}\n", packages.join("\n"))
         };
-        tokio::fs::write(&requirements_path, requirements_contents)
-            .await
-            .map_err(|e| TineError::EnvironmentFailed {
-                runtime_id: runtime_id.to_string(),
-                message: format!("failed to write effective requirements: {}", e),
-            })?;
+        let requirements_unchanged = match tokio::fs::read_to_string(&requirements_path).await {
+            Ok(existing) => existing == requirements_contents,
+            Err(err) if err.kind() == ErrorKind::NotFound => false,
+            Err(err) => {
+                return Err(TineError::EnvironmentFailed {
+                    runtime_id: runtime_id.to_string(),
+                    message: format!("failed to read effective requirements: {}", err),
+                });
+            }
+        };
+        if !requirements_unchanged {
+            tokio::fs::write(&requirements_path, &requirements_contents)
+                .await
+                .map_err(|e| TineError::EnvironmentFailed {
+                    runtime_id: runtime_id.to_string(),
+                    message: format!("failed to write effective requirements: {}", e),
+                })?;
+        }
         if packages.is_empty() {
             logs.push("No additional packages required".to_string());
+            return Ok(());
+        }
+
+        if requirements_unchanged {
+            logs.push(format!(
+                "Requirements already match {}; skipping package sync",
+                requirements_path.display()
+            ));
             return Ok(());
         }
 
@@ -1035,6 +1132,35 @@ mod tests {
         assert_eq!(displays.len(), 2);
         assert_eq!(displays[0], override_python);
         assert_eq!(displays[1], bundled);
+    }
+
+    #[test]
+    fn bundled_python_path_reads_env_var() {
+        let bundled = if cfg!(windows) {
+            r"C:\runtime\python.exe"
+        } else {
+            "/tmp/runtime/python/bin/python3"
+        };
+        let previous_bundled = std::env::var_os("TINE_BUNDLED_PYTHON");
+        std::env::set_var("TINE_BUNDLED_PYTHON", bundled);
+
+        assert_eq!(bundled_python_path(), Some(PathBuf::from(bundled)));
+
+        match previous_bundled {
+            Some(value) => std::env::set_var("TINE_BUNDLED_PYTHON", value),
+            None => std::env::remove_var("TINE_BUNDLED_PYTHON"),
+        }
+    }
+
+    #[test]
+    fn runtime_package_pins_load_exact_versions_from_manifest() {
+        let required = required_runtime_packages();
+        let defaults = default_runtime_packages();
+
+        assert!(required.iter().any(|pkg| pkg == "ipykernel==7.2.0"));
+        assert!(required.iter().any(|pkg| pkg == "cloudpickle==3.1.2"));
+        assert!(defaults.iter().any(|pkg| pkg == "pandas==3.0.2"));
+        assert!(defaults.iter().any(|pkg| pkg == "scikit-learn==1.8.0"));
     }
 
     #[test]

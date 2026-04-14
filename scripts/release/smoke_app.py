@@ -139,6 +139,11 @@ def http_post(url: str, payload: dict | None) -> str:
         return response.read().decode()
 
 
+def http_get_json(url: str) -> dict:
+    with request.urlopen(url, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+        return json.loads(response.read().decode())
+
+
 def wait_for_execution(base_url: str, execution_id: str, timeout_seconds: float = EXECUTION_TIMEOUT_SECONDS) -> dict:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
@@ -228,6 +233,16 @@ def run_execution_smoke(base_url: str) -> None:
         raise RuntimeError(f"branch execution failed during smoke: {branch_status}")
 
 
+def run_doctor_smoke(base_url: str) -> None:
+    payload = http_get_json(base_url + "/api/system/doctor")
+    if payload.get("ok"):
+        return
+
+    failing_checks = [check for check in payload.get("checks", []) if not check.get("ok")]
+    detail = json.dumps(failing_checks or payload, indent=2)
+    raise RuntimeError(f"doctor reported blocking issues:\n{detail}")
+
+
 def terminate_process(process: subprocess.Popen[str]) -> str:
     output = ""
     process.terminate()
@@ -281,6 +296,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Only verify the app launches and serves healthz; skip execution smoke.",
     )
     parser.add_argument(
+        "--doctor-runtime",
+        action="store_true",
+        help="Run the app's fast doctor/runtime-preflight endpoint after healthz.",
+    )
+    parser.add_argument(
         "--server-port",
         type=int,
         help="Fixed embedded server port to request from the app and probe directly.",
@@ -308,6 +328,8 @@ def main(argv: list[str] | None = None) -> int:
                 base_url = wait_for_health_at(f"http://127.0.0.1:{args.server_port}", process)
             else:
                 base_url = wait_for_health(process)
+            if args.doctor_runtime:
+                run_doctor_smoke(base_url)
             if not args.health_only:
                 run_execution_smoke(base_url)
         except Exception as exc:

@@ -7,6 +7,7 @@ import hashlib
 import json
 import shutil
 import ssl
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -45,6 +46,14 @@ def load_pins() -> dict:
 
 def python_pins() -> dict:
     return load_pins()["python"]
+
+
+def baseline_package_pins() -> list[dict[str, str]]:
+    return load_pins()["desktop_runtime"]["baseline_packages"]
+
+
+def baseline_package_specs() -> list[str]:
+    return [f"{pin['package']}=={pin['version']}" for pin in baseline_package_pins()]
 
 
 def download_ssl_context() -> ssl.SSLContext:
@@ -110,6 +119,7 @@ def sentinel_payload(target: str, artifact: dict, python_root: Path) -> dict:
         "python_url": artifact["url"],
         "python_sha256": artifact["sha256"],
         "python_executable": python_executable(python_root).relative_to(runtime_dir()).as_posix(),
+        "baseline_packages": baseline_package_specs(),
     }
 
 
@@ -130,6 +140,23 @@ def has_matching_runtime(target: str, artifact: dict) -> bool:
 
     expected = sentinel_payload(target, artifact, python_root)
     return current == expected and python_executable(python_root).is_file()
+
+
+def seed_baseline_packages(python_root: Path) -> None:
+    python = python_executable(python_root)
+    command = [
+        str(python),
+        "-m",
+        "pip",
+        "install",
+        *baseline_package_specs(),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode == 0:
+        return
+
+    detail = result.stderr.strip() or result.stdout.strip() or "pip install failed"
+    raise RuntimeError(f"failed to seed bundled runtime packages: {detail}")
 
 
 def stage_python_runtime(target: str, artifact: dict) -> None:
@@ -154,6 +181,7 @@ def stage_python_runtime(target: str, artifact: dict) -> None:
         if destination.exists():
             shutil.rmtree(destination)
         shutil.move(str(staged_python_root), destination)
+        seed_baseline_packages(destination)
 
         sentinel_path().write_text(
             json.dumps(sentinel_payload(target, artifact, destination), indent=2) + "\n"

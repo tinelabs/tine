@@ -1,6 +1,18 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+fn repo_version(manifest_dir: &Path) -> String {
+    let version_path = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("crate manifest dir should have repo root ancestors")
+        .join("VERSION");
+    fs::read_to_string(&version_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {}", version_path.display(), e))
+        .trim()
+        .to_string()
+}
+
 fn sync_png(source_path: &Path, output_path: &Path) {
     let source = fs::read(source_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", source_path.display(), e));
@@ -18,9 +30,10 @@ fn sync_png(source_path: &Path, output_path: &Path) {
 
 fn main() {
     // Regenerate tauri.conf.json from the template so the bundle version
-    // always matches the workspace version (Cargo.toml → CARGO_PKG_VERSION).
+    // always matches the repo VERSION file.
     //
-    // Single source of truth: `version.workspace = true` in Cargo.toml.
+    // Cargo and packaging metadata are still validated against VERSION in
+    // scripts/release/verify_version_alignment.py.
     // tauri.conf.json is a build artifact and must not be edited by hand.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let template_path = manifest_dir.join("tauri.conf.template.json");
@@ -48,7 +61,7 @@ fn main() {
         panic!("expected Windows icon at {}", ico_icon_path.display());
     }
 
-    let version = env!("CARGO_PKG_VERSION");
+    let version = repo_version(&manifest_dir);
     let template = fs::read_to_string(&template_path).unwrap_or_else(|e| {
         panic!(
             "failed to read {}: {}",
@@ -56,7 +69,7 @@ fn main() {
             e
         )
     });
-    let rendered = template.replace("{{VERSION}}", version);
+    let rendered = template.replace("{{VERSION}}", &version);
 
     // Avoid unnecessary writes so tauri-build does not see a spurious change.
     let needs_write = match fs::read_to_string(&config_path) {
@@ -70,8 +83,9 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=tauri.conf.template.json");
+    println!("cargo:rerun-if-changed={}", manifest_dir.join("..")
+        .join("..").join("VERSION").display());
     println!("cargo:rerun-if-changed={}", source_png_path.display());
-    println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
 
     tauri_build::build()
 }

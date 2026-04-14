@@ -1,23 +1,21 @@
 {
   "python": {
-    "version": "3.12.7",
-    "source": "python-build-standalone",
-    "release_tag": "20241016",
+    "version": "3.11.11",
     "artifacts": {
-      "macos-aarch64": {
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20241016/cpython-3.12.7%2B20241016-aarch64-apple-darwin-install_only.tar.gz",
-        "sha256": "4c18852bf9c1a11b56f21bcf0df1946f7e98ee43e9e4c0c5374b2b3765cf9508"
+      "macos-arm64": {
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20250212/cpython-3.11.11%2B20250212-aarch64-apple-darwin-install_only_stripped.tar.gz",
+        "sha256": "6d81592af7624f0d74258d66a5ce3930f9f5fdb865a2b05981f866f81f29caaf"
       },
-      "macos-x86_64": {
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20241016/cpython-3.12.7%2B20241016-x86_64-apple-darwin-install_only.tar.gz",
-        "sha256": "60c5271e7edc3c2ab47440b7abf4ed50fbc693880b474f74f05768f5b657045a"
+      "macos-x64": {
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20250212/cpython-3.11.11%2B20250212-x86_64-apple-darwin-install_only_stripped.tar.gz",
+        "sha256": "719820f1b54672d8ace0b3604f79f33af0cb429fdc7459ec30f56789f9f62c4d"
       },
-      "linux-x86_64": {
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20241016/cpython-3.12.7%2B20241016-x86_64-unknown-linux-gnu-install_only.tar.gz",
-        "sha256": "43576f7db1033dd57b900307f09c2e86f371152ac8a2607133afa51cbfc36064"
+      "linux-x64": {
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20250212/cpython-3.11.11%2B20250212-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+        "sha256": "ca6ddceab4c8e4c8f341c6027f074e0538fc06ad711dfa76737a52d74c8e3f35"
       },
-      "windows-x86_64": {
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20241016/cpython-3.12.7%2B20241016-x86_64-pc-windows-msvc-install_only.tar.gz",
+      "windows-x64": {
+        "url": "https://www.python.org/ftp/python/3.11.11/python-3.11.11-embed-amd64.zip",
         "sha256": "f05531bff16fa77b53be0776587b97b466070e768e6d5920894de988bdcd547a"
       }
     }

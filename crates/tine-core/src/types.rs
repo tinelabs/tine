@@ -843,6 +843,32 @@ impl ExecutionAccepted {
 
 /// Overall execution status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionQueueTelemetry {
+    pub pending_ahead: u64,
+    pub pending_total: u64,
+    pub active_executions: u64,
+    pub max_concurrent_executions: u64,
+    pub max_queue_depth: u64,
+    pub queue_head: bool,
+    pub queued_reason: String,
+}
+
+/// Lightweight runtime health snapshot for tree-owned kernels.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeHealthSnapshot {
+    pub tree_id: ExperimentTreeId,
+    pub has_live_kernel: bool,
+    #[serde(default)]
+    pub tree_kernel_state: Option<TreeKernelState>,
+    pub replay_required: bool,
+    #[serde(default)]
+    pub active_branch_id: Option<BranchId>,
+    #[serde(default)]
+    pub runtime_epoch: Option<u64>,
+}
+
+/// Overall execution status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionStatus {
     pub execution_id: ExecutionId,
     #[serde(default)]
@@ -859,6 +885,10 @@ pub struct ExecutionStatus {
     pub phase: ExecutionPhase,
     #[serde(default)]
     pub queue_position: Option<u64>,
+    #[serde(default)]
+    pub queue: Option<ExecutionQueueTelemetry>,
+    #[serde(default)]
+    pub runtime: Option<RuntimeHealthSnapshot>,
     #[serde(default)]
     pub cancellation_requested_at: Option<DateTime<Utc>>,
     pub node_statuses: HashMap<NodeId, NodeStatus>,

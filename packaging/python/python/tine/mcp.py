@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from importlib import metadata
+from importlib import metadata, resources
 from pathlib import Path
 from typing import Any
 
@@ -19,20 +19,82 @@ MCP_PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "tine"
 SUPPORTED_MCP_HOSTS = ("claude", "cursor", "vscode", "generic")
 
-# Keep these aligned with crates/tine-env/src/environment.rs.
-TINE_REQUIRED_PACKAGES = ("ipykernel", "cloudpickle")
-TINE_DEFAULT_PACKAGES = (
-    "pyarrow>=14",
-    "numpy>=1.26",
-    "pandas>=2.1",
-    "polars>=0.20",
-    "scipy>=1.12",
-    "scikit-learn>=1.4",
-    "matplotlib>=3.8",
-    "seaborn>=0.13",
-    "tqdm>=4.66",
-    "requests>=2.31",
-    "pillow>=10",
+CORE_RUNTIME_CATEGORY = "Core Notebook / Runtime"
+_EMBEDDED_DESKTOP_RUNTIME_BASELINE = (
+    ("Core Notebook / Runtime", "ipykernel", "7.2.0"),
+    ("Core Notebook / Runtime", "cloudpickle", "3.1.2"),
+    ("Dataframe / Math Stack", "numpy", "2.4.4"),
+    ("Dataframe / Math Stack", "pandas", "3.0.2"),
+    ("Dataframe / Math Stack", "pyarrow", "23.0.1"),
+    ("Dataframe / Math Stack", "scipy", "1.17.1"),
+    ("Dataframe / Math Stack", "polars", "1.39.3"),
+    ("Common ML", "scikit-learn", "1.8.0"),
+    ("Common Plotting / Utilities", "matplotlib", "3.10.8"),
+    ("Common Plotting / Utilities", "seaborn", "0.13.2"),
+    ("Common Plotting / Utilities", "tqdm", "4.67.1"),
+    ("Common Plotting / Utilities", "requests", "2.33.1"),
+    ("Common Plotting / Utilities", "pillow", "12.2.0"),
+)
+
+
+def _repo_runtime_pins_path() -> Path | None:
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        candidate = parent / "scripts" / "release" / "runtime_pins.json"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _packaged_runtime_pins_path() -> Path | None:
+    try:
+        candidate = resources.files("tine").joinpath("runtime_pins.json")
+    except (FileNotFoundError, ModuleNotFoundError):
+        return None
+
+    if not candidate.is_file():
+        return None
+
+    return Path(str(candidate))
+
+
+def _desktop_runtime_baseline() -> tuple[tuple[str, str, str], ...]:
+    # New environments must be able to import tine.mcp before any repo files or
+    # packaged data are available, so this resolver must always degrade to the
+    # embedded exact pins rather than failing.
+    manifest_path = _repo_runtime_pins_path() or _packaged_runtime_pins_path()
+    if manifest_path is None:
+        return _EMBEDDED_DESKTOP_RUNTIME_BASELINE
+
+    try:
+        payload = json.loads(manifest_path.read_text())
+        pins = payload["desktop_runtime"]["baseline_packages"]
+        return tuple(
+            (pin["category"], pin["package"], pin["version"])
+            for pin in pins
+            if isinstance(pin, dict)
+        )
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        return _EMBEDDED_DESKTOP_RUNTIME_BASELINE
+
+
+def _package_spec(package: str, version: str) -> str:
+    return f"{package}=={version}"
+
+
+def _packages_for_category(category: str) -> tuple[str, ...]:
+    return tuple(
+        _package_spec(package, version)
+        for pin_category, package, version in _desktop_runtime_baseline()
+        if pin_category == category
+    )
+
+
+TINE_REQUIRED_PACKAGES = _packages_for_category(CORE_RUNTIME_CATEGORY)
+TINE_DEFAULT_PACKAGES = tuple(
+    _package_spec(package, version)
+    for pin_category, package, version in _desktop_runtime_baseline()
+    if pin_category != CORE_RUNTIME_CATEGORY
 )
 
 
@@ -266,6 +328,24 @@ class McpServer:
                 },
             ),
             _tool(
+                "inspect_kernel",
+                "Inspect the current tree-owned kernel health for an experiment tree.",
+                {
+                    "type": "object",
+                    "properties": {"experiment_id": {"type": "string"}},
+                    "required": ["experiment_id"],
+                },
+            ),
+            _tool(
+                "restart_kernel",
+                "Restart the tree-owned kernel for an experiment tree. Use when the kernel is unhealthy or you want to force a clean replay boundary.",
+                {
+                    "type": "object",
+                    "properties": {"experiment_id": {"type": "string"}},
+                    "required": ["experiment_id"],
+                },
+            ),
+            _tool(
                 "execute_branch",
                 "Execute one branch in an experiment tree and return the accepted execution envelope, including execution id, submission status, phase, and queue position when available. `branch_id` defaults to `main` when omitted.",
                 {
@@ -333,13 +413,14 @@ class McpServer:
             ),
             _tool(
                 "logs",
-                "Get logs for one cell in one experiment tree branch. `branch_id` defaults to `main` when omitted.",
+                "Get logs for one cell in one experiment tree branch. `branch_id` defaults to `main` when omitted. When `tail_lines` is provided, the MCP adapter returns only the last N lines of `stdout` and `stderr` plus truncation metadata so agents can make an extra call for the full log when needed.",
                 {
                     "type": "object",
                     "properties": {
                         "experiment_id": {"type": "string"},
                         "branch_id": {"type": "string", "default": "main"},
                         "cell_id": {"type": "string"},
+                        "tail_lines": {"type": "integer", "minimum": 0},
                     },
                     "required": ["experiment_id", "cell_id"],
                 },
@@ -510,6 +591,16 @@ class McpServer:
                         _required_string(args, "cell_id"),
                     )
                 )
+            if name == "inspect_kernel":
+                return self._ok(
+                    self.api.inspect_experiment_tree_kernel(
+                        _required_string(args, "experiment_id")
+                    )
+                )
+            if name == "restart_kernel":
+                experiment_id = _required_string(args, "experiment_id")
+                self.api.restart_experiment_tree_kernel(experiment_id)
+                return self._text_ok(f"Kernel restart requested for experiment {experiment_id}")
             if name == "execute_branch":
                 experiment_id = _required_string(args, "experiment_id")
                 branch_id = _optional_string(args, "branch_id") or "main"
@@ -559,25 +650,54 @@ class McpServer:
                     payload = dict(status)
                     payload["terminal"] = terminal
                     payload["wait_exhausted"] = wait_exhausted
+                    summary, suggested_next_action = _execution_summary(payload)
+                    payload["summary"] = summary
+                    payload["suggested_next_action"] = suggested_next_action
                     return payload
+
+                def _transition_snapshot(status: dict[str, Any]) -> dict[str, Any]:
+                    queue = status.get("queue") if isinstance(status.get("queue"), dict) else {}
+                    return {
+                        "observed_at": time.time(),
+                        "status": status.get("status"),
+                        "phase": status.get("phase"),
+                        "queue_position": status.get("queue_position"),
+                        "queued_reason": queue.get("queued_reason"),
+                    }
+
+                observed_transitions: list[dict[str, Any]] = []
+                last_signature: tuple[Any, Any, Any, Any] | None = None
 
                 while True:
                     status = self.api.status(execution_id)
+                    queue = status.get("queue") if isinstance(status.get("queue"), dict) else {}
+                    signature = (
+                        status.get("status"),
+                        status.get("phase"),
+                        status.get("queue_position"),
+                        queue.get("queued_reason"),
+                    )
+                    if signature != last_signature:
+                        observed_transitions.append(_transition_snapshot(status))
+                        last_signature = signature
                     if _is_terminal_execution_status(status):
-                        return self._ok(
-                            _wait_result(status, terminal=True, wait_exhausted=False)
-                        )
+                        payload = _wait_result(status, terminal=True, wait_exhausted=False)
+                        payload["observed_transitions"] = observed_transitions
+                        return self._ok(payload)
                     if time.monotonic() >= deadline:
-                        return self._ok(
-                            _wait_result(status, terminal=False, wait_exhausted=True)
-                        )
+                        payload = _wait_result(status, terminal=False, wait_exhausted=True)
+                        payload["observed_transitions"] = observed_transitions
+                        return self._ok(payload)
                     time.sleep(max(poll_interval_ms, 50) / 1000)
             if name == "logs":
                 return self._ok(
-                    self.api.logs_for_tree_cell(
-                        _required_string(args, "experiment_id"),
-                        _optional_string(args, "branch_id") or "main",
-                        _required_string(args, "cell_id"),
+                    _slice_logs(
+                        self.api.logs_for_tree_cell(
+                            _required_string(args, "experiment_id"),
+                            _optional_string(args, "branch_id") or "main",
+                            _required_string(args, "cell_id"),
+                        ),
+                        tail_lines=_optional_non_negative_int(args, "tail_lines"),
                     )
                 )
             if name == "create_project":
@@ -841,6 +961,21 @@ def _optional_string(payload: dict[str, Any], key: str) -> str | None:
     return value
 
 
+def _optional_non_negative_int(payload: dict[str, Any], key: str) -> int | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise RuntimeError(
+            f"invalid field '{key}': expected a non-negative integer when provided, got {_value_kind(value)}"
+        )
+    if value < 0:
+        raise RuntimeError(
+            f"invalid field '{key}': expected a non-negative integer when provided"
+        )
+    return value
+
+
 def _required_object(payload: dict[str, Any], key: str) -> dict[str, Any]:
     if key not in payload:
         raise RuntimeError(f"missing required field '{key}': expected an object")
@@ -868,6 +1003,92 @@ def _optional_string_list(payload: dict[str, Any], key: str) -> list[str]:
             )
         result.append(item)
     return result
+
+
+def _tail_text_lines(text: str, tail_lines: int | None) -> tuple[str, int, bool]:
+    if tail_lines is None:
+        total_lines = len(text.splitlines())
+        return text, total_lines, False
+
+    lines = text.splitlines()
+    total_lines = len(lines)
+    if tail_lines == 0:
+        return "", total_lines, total_lines > 0
+
+    if total_lines <= tail_lines:
+        return text, total_lines, False
+
+    sliced_lines = lines[-tail_lines:]
+    sliced = "\n".join(sliced_lines)
+    if text.endswith("\n"):
+        sliced += "\n"
+    return sliced, total_lines, True
+
+
+def _slice_logs(logs: dict[str, Any], *, tail_lines: int | None) -> dict[str, Any]:
+    if tail_lines is None:
+        return logs
+
+    payload = dict(logs)
+    stdout, stdout_total_lines, stdout_truncated = _tail_text_lines(
+        str(payload.get("stdout", "")),
+        tail_lines,
+    )
+    stderr, stderr_total_lines, stderr_truncated = _tail_text_lines(
+        str(payload.get("stderr", "")),
+        tail_lines,
+    )
+    payload["stdout"] = stdout
+    payload["stderr"] = stderr
+    payload["view"] = {
+        "tail_lines": tail_lines,
+        "stdout_total_lines": stdout_total_lines,
+        "stderr_total_lines": stderr_total_lines,
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+    }
+    return payload
+
+
+def _execution_summary(status: dict[str, Any]) -> tuple[str, str]:
+    lifecycle = str(status.get("status") or "").strip().lower()
+    phase = str(status.get("phase") or "").strip().lower()
+    queue = status.get("queue") if isinstance(status.get("queue"), dict) else {}
+    queued_reason = str(queue.get("queued_reason") or "").strip().lower()
+
+    if lifecycle in {"completed", "failed", "cancelled", "timed_out", "rejected"}:
+        return (
+            f"Execution finished with status {lifecycle}.",
+            "done",
+        )
+
+    if phase == "cancellation_requested":
+        return (
+            "Execution is still running while cancellation is in progress.",
+            "wait",
+        )
+
+    if lifecycle == "running" or phase == "running":
+        return (
+            "Execution is running.",
+            "wait",
+        )
+
+    if lifecycle == "queued" or phase == "queued":
+        if queued_reason == "scheduler_state_unknown":
+            return (
+                "Execution is queued, but its scheduler state is unclear.",
+                "inspect",
+            )
+        return (
+            "Execution is queued and waiting to start.",
+            "wait",
+        )
+
+    return (
+        "Execution state changed; inspect the latest status.",
+        "inspect",
+    )
 
 
 def _cell_payload(
