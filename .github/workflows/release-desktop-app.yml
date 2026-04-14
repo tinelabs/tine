@@ -23,6 +23,11 @@ on:
         required: false
         default: ""
         type: string
+      sign_linux_appimage:
+        description: Enable GPG signing for Linux AppImage
+        required: false
+        default: false
+        type: boolean
   workflow_call:
     inputs:
       target:
@@ -37,6 +42,10 @@ on:
         required: false
         default: ""
         type: string
+      sign_linux_appimage:
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -63,21 +72,18 @@ jobs:
                   "label": "macos-aarch64",
                   "runner": "macos-14",
                   "artifact_glob": "target/release/bundle/dmg/*.dmg",
-                  "app_glob": "target/release/bundle/macos/*.app",
                   "smoke": True,
               },
               {
                   "label": "linux-x86_64",
                   "runner": "ubuntu-22.04",
                   "artifact_glob": "target/release/bundle/appimage/*.AppImage",
-                  "app_glob": "target/release/bundle/appimage/*.AppImage",
                   "smoke": True,
               },
               {
                   "label": "windows-x86_64",
                   "runner": "windows-latest",
                   "artifact_glob": "target/release/bundle/msi/*.msi",
-                  "app_glob": "",
                   "smoke": True,
               },
           ]
@@ -152,19 +158,22 @@ jobs:
         run: python scripts/release/verify_version_alignment.py --repo-root . --tauri-template crates/tine-app/tauri.conf.template.json --tauri-config crates/tine-app/tauri.conf.json --write-tauri-config
 
       - name: Prepare Linux AppImage signing key
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && inputs.sign_linux_appimage
         shell: bash
         env:
           LINUX_SIGNING_KEY: ${{ secrets.LINUX_SIGNING_KEY }}
         run: |
           set -euo pipefail
           if [[ -z "${LINUX_SIGNING_KEY}" ]]; then
-            exit 0
+            echo "sign_linux_appimage=true requires LINUX_SIGNING_KEY" >&2
+            exit 1
           fi
           export GNUPGHOME="$RUNNER_TEMP/gnupg"
           mkdir -p "$GNUPGHOME"
           chmod 700 "$GNUPGHOME"
           printf '%s' "$LINUX_SIGNING_KEY" | base64 --decode | gpg --batch --import
+          echo "allow-loopback-pinentry" > "$GNUPGHOME/gpg-agent.conf"
+          gpgconf --reload gpg-agent
           echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
 
       - name: Prepare macOS notarization key
@@ -231,16 +240,20 @@ jobs:
           APPLE_TEAM_ID: ${{ runner.os == 'macOS' && secrets.APPLE_TEAM_ID || '' }}
           APPLE_API_ISSUER: ${{ runner.os == 'macOS' && secrets.APPLE_API_ISSUER || '' }}
           APPLE_API_KEY: ${{ runner.os == 'macOS' && secrets.APPLE_API_KEY || '' }}
-          LINUX_SIGNING_KEY_ID: ${{ runner.os == 'Linux' && secrets.LINUX_SIGNING_KEY_ID || '' }}
-          LINUX_SIGNING_KEY_PASSPHRASE: ${{ runner.os == 'Linux' && secrets.LINUX_SIGNING_KEY_PASSPHRASE || '' }}
+          SIGN_LINUX_APPIMAGE: ${{ runner.os == 'Linux' && inputs.sign_linux_appimage && 'true' || 'false' }}
+          LINUX_SIGNING_KEY_ID: ${{ runner.os == 'Linux' && inputs.sign_linux_appimage && secrets.LINUX_SIGNING_KEY_ID || '' }}
+          LINUX_SIGNING_KEY_PASSPHRASE: ${{ runner.os == 'Linux' && inputs.sign_linux_appimage && secrets.LINUX_SIGNING_KEY_PASSPHRASE || '' }}
         run: |
           set -euo pipefail
           if [[ "$RUNNER_OS" == "macOS" && -n "${APPLE_ID}" && -n "${APPLE_PASSWORD}" ]]; then
             unset APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH
           fi
-          if [[ "$RUNNER_OS" == "Linux" && -n "${LINUX_SIGNING_KEY_PASSPHRASE}" ]]; then
+          if [[ "$RUNNER_OS" == "Linux" && "${SIGN_LINUX_APPIMAGE}" == "true" ]]; then
+            if [[ -z "${LINUX_SIGNING_KEY_PASSPHRASE}" ]]; then
+              echo "sign_linux_appimage=true requires LINUX_SIGNING_KEY_PASSPHRASE" >&2
+              exit 1
+            fi
             export SIGN=1
-            export APPIMAGETOOL_FORCE_SIGN=1
             export APPIMAGETOOL_SIGN_PASSPHRASE="$LINUX_SIGNING_KEY_PASSPHRASE"
             if [[ -n "${LINUX_SIGNING_KEY_ID}" ]]; then
               export SIGN_KEY="$LINUX_SIGNING_KEY_ID"
@@ -291,25 +304,6 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "bundle_path=$CANONICAL_PATH" >> "$GITHUB_OUTPUT"
 
-          if [[ '${{ matrix.smoke }}' == 'true' && '${{ runner.os }}' != 'Windows' ]]; then
-            APP_PATH="$(compgen -G '${{ matrix.app_glob }}' | head -n 1)"
-            if [[ -z "$APP_PATH" ]]; then
-              if [[ '${{ runner.os }}' == 'macOS' && -x 'target/release/tine-app' ]]; then
-                APP_PATH='target/release/tine-app'
-              else
-                echo "expected app matching ${{ matrix.app_glob }}" >&2
-                exit 1
-              fi
-            fi
-            if [[ "$APP_PATH" == *.app ]]; then
-              LAUNCH_PATH="$(find "$APP_PATH/Contents/MacOS" -type f | head -n 1)"
-            else
-              LAUNCH_PATH="$APP_PATH"
-              chmod +x "$LAUNCH_PATH" || true
-            fi
-            echo "launch_path=$LAUNCH_PATH" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Extract Windows MSI for smoke
         id: windows_msi
         if: matrix.smoke && runner.os == 'Windows'
@@ -338,16 +332,68 @@ jobs:
         shell: bash
         env:
           BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
-          LAUNCH_PATH: ${{ steps.bundle.outputs.launch_path }}
-        run: python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH" --server-port 40113 --require-bundled-python --doctor-runtime --health-only
+        run: |
+          set -euo pipefail
+
+          MOUNT_ROOT="$RUNNER_TEMP/tine-dmg-mount"
+          mkdir -p "$MOUNT_ROOT"
+
+          hdiutil attach "$BUNDLE_PATH" -nobrowse -readonly -mountpoint "$MOUNT_ROOT"
+          cleanup() {
+            hdiutil detach "$MOUNT_ROOT" -force >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          APP_PATH="$(find "$MOUNT_ROOT" -maxdepth 2 -name '*.app' | head -n 1)"
+          if [[ -z "$APP_PATH" ]]; then
+            echo "expected .app inside mounted DMG" >&2
+            exit 1
+          fi
+
+          # Copy out of read-only volume and strip quarantine for CI
+          SMOKE_DIR="$RUNNER_TEMP/tine-smoke-app"
+          mkdir -p "$SMOKE_DIR"
+          cp -R "$APP_PATH" "$SMOKE_DIR/"
+          APP_COPY="$SMOKE_DIR/$(basename "$APP_PATH")"
+          xattr -cr "$APP_COPY"
+
+          LAUNCH_PATH="$(find "$APP_COPY/Contents/MacOS" -type f | head -n 1)"
+          if [[ -z "$LAUNCH_PATH" ]]; then
+            echo "expected launchable binary inside $APP_COPY" >&2
+            exit 1
+          fi
+
+          python3 scripts/release/smoke_app.py \
+            --bundle-path "$BUNDLE_PATH" \
+            --launch-path "$LAUNCH_PATH" \
+            --server-port 40113 \
+            --require-bundled-python \
+            --doctor-runtime \
+            --health-only
 
       - name: Smoke desktop app (Linux)
         if: matrix.smoke && runner.os == 'Linux'
         shell: bash
         env:
           BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
-          LAUNCH_PATH: ${{ steps.bundle.outputs.launch_path }}
-        run: xvfb-run -a python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$LAUNCH_PATH" --server-port 40113 --require-bundled-python --doctor-runtime --health-only
+        run: |
+          chmod +x "$BUNDLE_PATH"
+          xvfb-run -a python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$BUNDLE_PATH" --server-port 40113 --require-bundled-python --doctor-runtime --health-only
+
+      - name: Validate signed AppImage
+        if: matrix.smoke && runner.os == 'Linux' && inputs.sign_linux_appimage
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
+        run: |
+          set -euo pipefail
+          VALIDATE_TOOL="$RUNNER_TEMP/validate-x86_64.AppImage"
+          curl --fail --location --retry 5 --silent --show-error \
+            --output "$VALIDATE_TOOL" \
+            https://github.com/AppImageCommunity/AppImageUpdate/releases/download/continuous/validate-x86_64.AppImage
+          chmod +x "$VALIDATE_TOOL" "$BUNDLE_PATH"
+          APPIMAGE_EXTRACT_AND_RUN=1 "$BUNDLE_PATH" --appimage-signature
+          APPIMAGE_EXTRACT_AND_RUN=1 "$VALIDATE_TOOL" "$BUNDLE_PATH"
 
       - name: Smoke desktop app (Windows)
         if: matrix.smoke && runner.os == 'Windows'
