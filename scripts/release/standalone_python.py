@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import ssl
 import subprocess
@@ -130,6 +131,65 @@ def seed_baseline_packages(python_root: Path) -> None:
         text=True,
         env={**dict(os.environ), "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
     )
+    repair_linux_vendored_shared_libraries(python_root)
+
+
+NEEDED_LIBRARY_RE = re.compile(r"Shared library: \[(.+)\]")
+
+
+def needed_shared_libraries(binary_path: Path) -> list[str]:
+    if not sys.platform.startswith("linux"):
+        return []
+
+    try:
+        result = subprocess.run(
+            ["readelf", "-d", str(binary_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return []
+
+    needed = []
+    for line in result.stdout.splitlines():
+        match = NEEDED_LIBRARY_RE.search(line)
+        if match:
+            needed.append(match.group(1))
+    return needed
+
+
+def repair_linux_vendored_shared_libraries(python_root: Path) -> None:
+    if not sys.platform.startswith("linux"):
+        return
+
+    vendored_dirs = {
+        path.parent
+        for path in python_root.rglob("*.so*")
+        if path.is_file() and path.parent.name.endswith(".libs")
+    }
+
+    for vendored_dir in vendored_dirs:
+        existing_names = {path.name for path in vendored_dir.iterdir() if path.is_file()}
+        for library_path in vendored_dir.iterdir():
+            if not library_path.is_file() or ".so" not in library_path.name:
+                continue
+
+            for needed_name in needed_shared_libraries(library_path):
+                if needed_name in existing_names or "-" not in needed_name or not needed_name.startswith("lib"):
+                    continue
+
+                base_name = needed_name.split("-", 1)[0]
+                candidates = sorted(vendored_dir.glob(f"{base_name}-*.so*"))
+                if len(candidates) != 1:
+                    continue
+
+                compatibility_link = vendored_dir / needed_name
+                if compatibility_link.exists():
+                    continue
+
+                compatibility_link.symlink_to(candidates[0].name)
+                existing_names.add(needed_name)
 
 
 def prune_desktop_runtime(python_root: Path) -> None:
