@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   activeBranchPathCellIds,
+  buildExecutionStatusEvent,
   describeExecutionProgress,
   fileQuery,
   hasHttpOrigin,
@@ -248,4 +249,64 @@ test("describeExecutionProgress falls back to simple cell status when no snapsho
     message: "Failed",
     active: false,
   });
+});
+
+test("buildExecutionStatusEvent summarizes environment preparation for the output panel", () => {
+  assert.deepEqual(
+    buildExecutionStatusEvent(
+      { execution_id: "exec_1", phase: "queued", status: "queued" },
+      {
+        execution_id: "exec_1",
+        tree_id: "tree_1",
+        branch_id: "main",
+        phase: "preparing_environment",
+        status: "running",
+      },
+      { treeId: "tree_1", branchId: "main" },
+    ),
+    {
+      kind: "execution",
+      status: "preparing_environment",
+      scope: {
+        executionId: "exec_1",
+        treeId: "tree_1",
+        branchId: "main",
+        nodeId: null,
+        runtimeId: null,
+      },
+      message: "Branch main preparing environment…",
+    },
+  );
+});
+
+test("buildExecutionStatusEvent includes queue position changes", () => {
+  assert.deepEqual(
+    buildExecutionStatusEvent(
+      { execution_id: "exec_1", phase: "queued", status: "queued", queue_position: 3 },
+      { execution_id: "exec_1", phase: "queued", status: "queued", queue_position: 1 },
+    ),
+    {
+      kind: "execution",
+      status: "queued",
+      scope: {
+        executionId: "exec_1",
+        treeId: null,
+        branchId: null,
+        nodeId: null,
+        runtimeId: null,
+      },
+      message: "Execution exec_1 queued. Position 1.",
+    },
+  );
+});
+
+test("buildExecutionStatusEvent suppresses duplicate status logs", () => {
+  assert.equal(
+    buildExecutionStatusEvent(
+      { execution_id: "exec_1", phase: "running", status: "running" },
+      { execution_id: "exec_1", phase: "running", status: "running" },
+      { treeId: "tree_1", branchId: "main" },
+    ),
+    null,
+  );
 });

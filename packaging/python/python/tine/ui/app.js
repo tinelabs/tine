@@ -44,6 +44,7 @@ import {
 } from "https://esm.sh/lucide-preact@0.511.0";
 import {
   activeBranchPathCellIds,
+  buildExecutionStatusEvent,
   describeExecutionProgress,
   fileQuery,
   hasHttpOrigin,
@@ -574,11 +575,19 @@ function isTerminalExecutionStatus(status) {
 
 function applyExecutionStatusSnapshot(execId, status, fallbackTarget = null) {
   if (!execId || !status) return;
+  const previousStatus = store.get().executionStatuses?.[execId] || null;
   const currentTarget = store.get().executionTargets?.[execId] || null;
   const executionTarget = fallbackTarget || currentTarget;
   const treeId = status.tree_id || executionTarget?.treeId || null;
   const branchId = status.branch_id || executionTarget?.branchId || null;
   const targetKind = status.target_kind || executionTarget?.targetKind || null;
+  const normalizedStatus = {
+    ...status,
+    execution_id: status.execution_id || execId,
+    tree_id: treeId,
+    branch_id: branchId,
+    target_kind: targetKind,
+  };
   const nodeIds = Object.keys(status.node_statuses || {});
   store.set((s) => {
     const cellStatuses = { ...s.cellStatuses };
@@ -590,10 +599,7 @@ function applyExecutionStatusSnapshot(execId, status, fallbackTarget = null) {
       targetKind,
     };
     executionStatuses[execId] = {
-      ...status,
-      tree_id: treeId,
-      branch_id: branchId,
-      target_kind: targetKind,
+      ...normalizedStatus,
     };
     for (const nodeId of nodeIds) {
       const cellKey = runtimeCellKey({
@@ -612,6 +618,19 @@ function applyExecutionStatusSnapshot(execId, status, fallbackTarget = null) {
       executionStatuses,
     };
   });
+  const statusEvent = buildExecutionStatusEvent(previousStatus, normalizedStatus, {
+    treeId,
+    branchId,
+    targetKind,
+  });
+  if (statusEvent) {
+    termLog(
+      statusEvent,
+      ["failed", "timed_out", "rejected"].includes(statusEvent.status)
+        ? "error"
+        : "info",
+    );
+  }
 }
 
 function stripAnsi(text) {
@@ -1463,6 +1482,7 @@ async function pollExecution(execId, runtimeId, nodeIds) {
     try {
       const st = await api.status(execId);
       const executionTarget = store.get().executionTargets?.[execId] || null;
+      applyExecutionStatusSnapshot(execId, st, executionTarget);
       const treeId = st.tree_id || executionTarget?.treeId || null;
       const branchId = st.branch_id || executionTarget?.branchId || null;
       const wsConnected = store.get().wsConnected;

@@ -531,6 +531,10 @@ impl EnvironmentManager {
             .args(&python_command.args)
             .arg("-m")
             .arg("venv");
+        if !cfg!(windows) {
+            command.arg("--symlinks");
+            logs.push("Creating venv with symlinked executables".to_string());
+        }
         if inherit_site_packages {
             command.arg("--system-site-packages");
             logs.push(

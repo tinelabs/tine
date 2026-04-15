@@ -38,6 +38,7 @@ fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let template_path = manifest_dir.join("tauri.conf.template.json");
     let config_path = manifest_dir.join("tauri.conf.json");
+    let entitlements_path = manifest_dir.join("Entitlements.plist");
     let runtime_dir = manifest_dir.join("resources").join("runtime");
     let icons_dir = manifest_dir.join("icons");
     let source_png_path = icons_dir.join("128x128@2x.png");
@@ -83,6 +84,7 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=tauri.conf.template.json");
+    println!("cargo:rerun-if-changed={}", entitlements_path.display());
     println!("cargo:rerun-if-changed={}", manifest_dir.join("..")
         .join("..").join("VERSION").display());
     println!("cargo:rerun-if-changed={}", source_png_path.display());

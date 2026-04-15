@@ -140,9 +140,31 @@ const EXECUTION_PHASE_LABELS = {
   timed_out: "Timed out",
 };
 
+function normalizedExecutionPhaseParts(status) {
+  return {
+    phase: String(status?.phase || "").trim().toLowerCase(),
+    lifecycle: String(status?.status || "").trim().toLowerCase(),
+    queuePosition: Number(status?.queue_position),
+  };
+}
+
+function lowerCaseFirst(text) {
+  if (!text) return "";
+  return text.charAt(0).toLowerCase() + text.slice(1);
+}
+
+function executionTargetLabel(status, executionTarget) {
+  const branchId = status?.branch_id || executionTarget?.branchId || null;
+  const treeId = status?.tree_id || executionTarget?.treeId || null;
+  const executionId = status?.execution_id || null;
+  if (branchId) return `Branch ${branchId}`;
+  if (treeId) return `Tree ${treeId}`;
+  if (executionId) return `Execution ${executionId}`;
+  return "Execution";
+}
+
 export function describeExecutionProgress(status, fallbackCellStatus = "idle") {
-  const phase = String(status?.phase || "").trim().toLowerCase();
-  const lifecycle = String(status?.status || "").trim().toLowerCase();
+  const { phase, lifecycle } = normalizedExecutionPhaseParts(status);
   const fallback = String(fallbackCellStatus || "").trim().toLowerCase();
   const effectivePhase = phase || lifecycle || fallback;
   const queuePosition = Number(status?.queue_position);
@@ -180,5 +202,42 @@ export function describeExecutionProgress(status, fallbackCellStatus = "idle") {
     label,
     message: active ? `${label}…` : label,
     active,
+  };
+}
+
+export function buildExecutionStatusEvent(previousStatus, nextStatus, executionTarget = null) {
+  if (!nextStatus || typeof nextStatus !== "object") return null;
+
+  const previous = normalizedExecutionPhaseParts(previousStatus);
+  const next = normalizedExecutionPhaseParts(nextStatus);
+  const effectivePhase = next.phase || next.lifecycle;
+  if (!effectivePhase) return null;
+
+  const previousQueue = Number.isFinite(previous.queuePosition)
+    ? previous.queuePosition
+    : null;
+  const nextQueue = Number.isFinite(next.queuePosition) ? next.queuePosition : null;
+
+  if (
+    previous.phase === next.phase &&
+    previous.lifecycle === next.lifecycle &&
+    previousQueue === nextQueue
+  ) {
+    return null;
+  }
+
+  const progress = describeExecutionProgress(nextStatus, next.lifecycle || "idle");
+  const label = executionTargetLabel(nextStatus, executionTarget);
+  return {
+    kind: "execution",
+    status: effectivePhase,
+    scope: {
+      executionId: nextStatus.execution_id || null,
+      treeId: nextStatus.tree_id || executionTarget?.treeId || null,
+      branchId: nextStatus.branch_id || executionTarget?.branchId || null,
+      nodeId: null,
+      runtimeId: null,
+    },
+    message: `${label} ${lowerCaseFirst(progress.message)}`,
   };
 }

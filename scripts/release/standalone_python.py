@@ -189,6 +189,7 @@ def repair_linux_vendored_shared_libraries(python_root: Path) -> None:
                     continue
 
                 compatibility_link.symlink_to(candidates[0].name)
+                print(f"  symlinked {needed_name} -> {candidates[0].name} in {vendored_dir.name}")
                 existing_names.add(needed_name)
 
 
