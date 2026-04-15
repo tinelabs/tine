@@ -159,38 +159,50 @@ def needed_shared_libraries(binary_path: Path) -> list[str]:
     return needed
 
 
-def repair_linux_vendored_shared_libraries(python_root: Path) -> None:
-    if not sys.platform.startswith("linux"):
+def repair_linux_vendored_shared_libraries(
+    python_root: Path,
+    needed_resolver=needed_shared_libraries,
+    platform_name: str | None = None,
+) -> None:
+    if not (platform_name or sys.platform).startswith("linux"):
         return
 
-    vendored_dirs = {
-        path.parent
-        for path in python_root.rglob("*.so*")
-        if path.is_file() and path.parent.name.endswith(".libs")
-    }
+    vendored_candidates: dict[str, list[Path]] = {}
+    for library_path in python_root.rglob("*.so*"):
+        if not library_path.is_file() or not library_path.parent.name.endswith(".libs"):
+            continue
+        if "-" not in library_path.name or not library_path.name.startswith("lib"):
+            continue
+        base_name = library_path.name.split("-", 1)[0]
+        vendored_candidates.setdefault(base_name, []).append(library_path)
 
-    for vendored_dir in vendored_dirs:
-        existing_names = {path.name for path in vendored_dir.iterdir() if path.is_file()}
-        for library_path in vendored_dir.iterdir():
-            if not library_path.is_file() or ".so" not in library_path.name:
+    created_links: set[Path] = set()
+    for consumer_path in python_root.rglob("*"):
+        if not consumer_path.is_file():
+            continue
+        if ".so" not in consumer_path.name and not (
+            consumer_path.parent.name == "bin" and os.access(consumer_path, os.X_OK)
+        ):
+            continue
+
+        for needed_name in needed_resolver(consumer_path):
+            if "-" not in needed_name or not needed_name.startswith("lib"):
                 continue
 
-            for needed_name in needed_shared_libraries(library_path):
-                if needed_name in existing_names or "-" not in needed_name or not needed_name.startswith("lib"):
-                    continue
+            base_name = needed_name.split("-", 1)[0]
+            candidates = vendored_candidates.get(base_name, [])
+            if len(candidates) != 1:
+                continue
 
-                base_name = needed_name.split("-", 1)[0]
-                candidates = sorted(vendored_dir.glob(f"{base_name}-*.so*"))
-                if len(candidates) != 1:
-                    continue
+            compatibility_link = candidates[0].parent / needed_name
+            if compatibility_link.exists() or compatibility_link in created_links:
+                continue
 
-                compatibility_link = vendored_dir / needed_name
-                if compatibility_link.exists():
-                    continue
-
-                compatibility_link.symlink_to(candidates[0].name)
-                print(f"  symlinked {needed_name} -> {candidates[0].name} in {vendored_dir.name}")
-                existing_names.add(needed_name)
+            compatibility_link.symlink_to(candidates[0].name)
+            created_links.add(compatibility_link)
+            print(
+                f"  symlinked {compatibility_link.name} -> {candidates[0].name} in {compatibility_link.parent.name}"
+            )
 
 
 def prune_desktop_runtime(python_root: Path) -> None:

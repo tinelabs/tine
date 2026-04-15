@@ -46,15 +46,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo-root", default=".", help="Path to the repository root.")
     parser.add_argument("--artifact-dir", required=True, help="Directory containing release artifacts.")
     parser.add_argument("--version", required=True, help="Release version to verify.")
+    parser.add_argument(
+        "--rust-target",
+        dest="rust_targets",
+        action="append",
+        default=None,
+        help="Rust target triple to require. Repeat to restrict verification to a subset.",
+    )
     args = parser.parse_args(argv)
 
     repo_root = Path(args.repo_root).resolve()
     artifact_dir = Path(args.artifact_dir).resolve()
     expected_release_artifacts_for_target, supported_release_targets = load_runtime(repo_root)
 
+    expected_targets = supported_release_targets()
+    if args.rust_targets:
+        requested = set(args.rust_targets)
+        expected_targets = [target for target in expected_targets if target.rust_target in requested]
+
     missing: list[str] = []
     invalid_layout: list[str] = []
-    for target in supported_release_targets():
+    for target in expected_targets:
         for artifact_name in expected_release_artifacts_for_target(target.rust_target, args.version):
             artifact_path = artifact_dir / artifact_name
             if not artifact_path.is_file():

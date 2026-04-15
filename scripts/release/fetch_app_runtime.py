@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from standalone_python import (
+    baseline_package_specs,
     load_runtime_pins,
     python_executable,
     repo_root,
@@ -22,11 +23,6 @@ SUPPORTED_TARGETS = {
     "windows-x86_64",
 }
 
-
-def pins_path() -> Path:
-    return repo_root() / "scripts" / "release" / "runtime_pins.json"
-
-
 def runtime_dir() -> Path:
     return repo_root() / "crates" / "tine-app" / "resources" / "runtime"
 
@@ -37,15 +33,6 @@ def load_pins() -> dict:
 
 def python_pins() -> dict:
     return load_pins()["python"]
-
-
-def baseline_package_pins() -> list[dict[str, str]]:
-    return load_pins()["desktop_runtime"]["baseline_packages"]
-
-
-def baseline_package_specs() -> list[str]:
-    return [f"{pin['package']}=={pin['version']}" for pin in baseline_package_pins()]
-
 
 def sentinel_payload(target: str, artifact: dict, python_root: Path) -> dict:
     return {

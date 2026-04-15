@@ -205,6 +205,18 @@ export function describeExecutionProgress(status, fallbackCellStatus = "idle") {
   };
 }
 
+export function executionStatusLevel(status) {
+  const { phase, lifecycle } = normalizedExecutionPhaseParts(status);
+  const effectivePhase = phase || lifecycle;
+  if (["failed", "timed_out", "rejected"].includes(effectivePhase)) {
+    return "error";
+  }
+  if (["cancelled", "cancellation_requested"].includes(effectivePhase)) {
+    return "warn";
+  }
+  return "info";
+}
+
 export function buildExecutionStatusEvent(previousStatus, nextStatus, executionTarget = null) {
   if (!nextStatus || typeof nextStatus !== "object") return null;
 
@@ -229,6 +241,7 @@ export function buildExecutionStatusEvent(previousStatus, nextStatus, executionT
   const progress = describeExecutionProgress(nextStatus, next.lifecycle || "idle");
   const label = executionTargetLabel(nextStatus, executionTarget);
   return {
+    level: executionStatusLevel(nextStatus),
     kind: "execution",
     status: effectivePhase,
     scope: {

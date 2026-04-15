@@ -174,10 +174,11 @@ function normalizeTerminalError(error) {
 function normalizeTerminalEvent(entry, level = "info") {
   const raw =
     typeof entry === "string" ? { message: entry, level } : { ...(entry || {}) };
+  const normalizedLevel = String(raw.level || level || "info").trim().toLowerCase();
   return {
     id: raw.id || nextTerminalEventId(),
     ts: raw.ts ?? Date.now(),
-    level: raw.level || level || "info",
+    level: normalizedLevel === "warning" ? "warn" : normalizedLevel || "info",
     kind: raw.kind || "system",
     scope: normalizeTerminalScope(raw.scope),
     stream: raw.stream || null,
@@ -675,12 +676,7 @@ function applyExecutionStatusSnapshot(execId, status, fallbackTarget = null) {
     targetKind,
   });
   if (statusEvent) {
-    termLog(
-      statusEvent,
-      ["failed", "timed_out", "rejected"].includes(statusEvent.status)
-        ? "error"
-        : "info",
-    );
+    termLog(statusEvent, statusEvent.level || "info");
   }
 }
 

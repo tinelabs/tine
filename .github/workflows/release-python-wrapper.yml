@@ -66,16 +66,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: linux-x86_64
-            runner: ubuntu-latest
-            rust_target: x86_64-unknown-linux-gnu
-            archive_ext: .tar.gz
-            binary_name: tine
-          - label: linux-arm64
-            runner: ubuntu-24.04-arm
-            rust_target: aarch64-unknown-linux-gnu
-            archive_ext: .tar.gz
-            binary_name: tine
           - label: macos-x86_64
             runner: macos-14
             rust_target: x86_64-apple-darwin
@@ -167,7 +157,14 @@ jobs:
           echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Verify expected archives and checksums exist
-        run: python scripts/release/verify_release_artifacts.py --repo-root . --artifact-dir release-artifacts --version "${{ steps.version.outputs.value }}"
+        run: |
+          python scripts/release/verify_release_artifacts.py \
+            --repo-root . \
+            --artifact-dir release-artifacts \
+            --version "${{ steps.version.outputs.value }}" \
+            --rust-target x86_64-apple-darwin \
+            --rust-target aarch64-apple-darwin \
+            --rust-target x86_64-pc-windows-msvc
 
   smoke-wrapper:
     name: Smoke wrapper (${{ matrix.label }})
@@ -177,10 +174,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: linux-x86_64
-            runner: ubuntu-latest
-          - label: linux-arm64
-            runner: ubuntu-24.04-arm
           - label: macos-arm64
             runner: macos-14
           - label: windows-x86_64

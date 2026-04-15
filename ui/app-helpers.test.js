@@ -5,6 +5,7 @@ import {
   activeBranchPathCellIds,
   buildExecutionStatusEvent,
   describeExecutionProgress,
+  executionStatusLevel,
   fileQuery,
   hasHttpOrigin,
   normalizeFileTreePath,
@@ -265,6 +266,7 @@ test("buildExecutionStatusEvent summarizes environment preparation for the outpu
       { treeId: "tree_1", branchId: "main" },
     ),
     {
+      level: "info",
       kind: "execution",
       status: "preparing_environment",
       scope: {
@@ -286,6 +288,7 @@ test("buildExecutionStatusEvent includes queue position changes", () => {
       { execution_id: "exec_1", phase: "queued", status: "queued", queue_position: 1 },
     ),
     {
+      level: "info",
       kind: "execution",
       status: "queued",
       scope: {
@@ -298,6 +301,12 @@ test("buildExecutionStatusEvent includes queue position changes", () => {
       message: "Execution exec_1 queued. Position 1.",
     },
   );
+});
+
+test("executionStatusLevel maps execution phases to log severity", () => {
+  assert.equal(executionStatusLevel({ phase: "preparing_environment" }), "info");
+  assert.equal(executionStatusLevel({ phase: "cancellation_requested" }), "warn");
+  assert.equal(executionStatusLevel({ phase: "failed" }), "error");
 });
 
 test("buildExecutionStatusEvent suppresses duplicate status logs", () => {

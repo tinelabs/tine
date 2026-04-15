@@ -11,7 +11,6 @@ on:
         options:
           - all
           - macos-aarch64
-          - linux-x86_64
           - windows-x86_64
       publish_to_release:
         description: Upload desktop bundles to a GitHub Release after the matrix passes
@@ -23,11 +22,6 @@ on:
         required: false
         default: ""
         type: string
-      sign_linux_appimage:
-        description: Enable GPG signing for Linux AppImage
-        required: false
-        default: false
-        type: boolean
   workflow_call:
     inputs:
       target:
@@ -42,10 +36,6 @@ on:
         required: false
         default: ""
         type: string
-      sign_linux_appimage:
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: write
@@ -75,12 +65,6 @@ jobs:
                   "smoke": True,
               },
               {
-                  "label": "linux-x86_64",
-                  "runner": "ubuntu-22.04",
-                  "artifact_glob": "target/release/bundle/appimage/*.AppImage",
-                  "smoke": True,
-              },
-              {
                   "label": "windows-x86_64",
                   "runner": "windows-latest",
                   "artifact_glob": "target/release/bundle/msi/*.msi",
@@ -88,8 +72,13 @@ jobs:
               },
           ]
 
-          if os.environ["REQUESTED_TARGET"] != "all":
-              include = [item for item in include if item["label"] == os.environ["REQUESTED_TARGET"]]
+          supported_targets = {"all", "macos-aarch64", "windows-x86_64"}
+          requested_target = os.environ["REQUESTED_TARGET"]
+          if requested_target not in supported_targets:
+              raise SystemExit(f"unsupported desktop release target: {requested_target}")
+
+          if requested_target != "all":
+              include = [item for item in include if item["label"] == requested_target]
 
           print(f"include={json.dumps(include)}")
           PY
@@ -134,21 +123,6 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            gnupg2 \
-            libfuse2 \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            webkit2gtk-4.1 \
-            libwebkit2gtk-4.1-dev \
-            xvfb
-
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version '^2' --locked
 
@@ -157,25 +131,6 @@ jobs:
 
       - name: Render tauri.conf.json from template
         run: python scripts/release/verify_version_alignment.py --repo-root . --tauri-template crates/tine-app/tauri.conf.template.json --tauri-config crates/tine-app/tauri.conf.json --write-tauri-config
-
-      - name: Prepare Linux AppImage signing key
-        if: runner.os == 'Linux' && inputs.sign_linux_appimage
-        shell: bash
-        env:
-          LINUX_SIGNING_KEY: ${{ secrets.LINUX_SIGNING_KEY }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${LINUX_SIGNING_KEY}" ]]; then
-            echo "sign_linux_appimage=true requires LINUX_SIGNING_KEY" >&2
-            exit 1
-          fi
-          export GNUPGHOME="$RUNNER_TEMP/gnupg"
-          mkdir -p "$GNUPGHOME"
-          chmod 700 "$GNUPGHOME"
-          printf '%s' "$LINUX_SIGNING_KEY" | base64 --decode | gpg --batch --import
-          echo "allow-loopback-pinentry" > "$GNUPGHOME/gpg-agent.conf"
-          gpgconf --reload gpg-agent
-          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
 
       - name: Prepare macOS notarization key
         if: runner.os == 'macOS'
@@ -228,7 +183,8 @@ jobs:
           python scripts/release/sign_macos_runtime.py \
             --root crates/tine-app/resources/runtime/python \
             --identity "$APPLE_SIGNING_IDENTITY" \
-            --keychain "$APPLE_KEYCHAIN_PATH"
+            --keychain "$APPLE_KEYCHAIN_PATH" \
+            --entitlements crates/tine-app/Entitlements.plist
 
       - name: Build desktop bundle
         shell: bash
@@ -241,68 +197,13 @@ jobs:
           APPLE_TEAM_ID: ${{ runner.os == 'macOS' && secrets.APPLE_TEAM_ID || '' }}
           APPLE_API_ISSUER: ${{ runner.os == 'macOS' && secrets.APPLE_API_ISSUER || '' }}
           APPLE_API_KEY: ${{ runner.os == 'macOS' && secrets.APPLE_API_KEY || '' }}
-          SIGN_LINUX_APPIMAGE: ${{ runner.os == 'Linux' && inputs.sign_linux_appimage && 'true' || 'false' }}
-          LINUX_SIGNING_KEY_ID: ${{ runner.os == 'Linux' && inputs.sign_linux_appimage && secrets.LINUX_SIGNING_KEY_ID || '' }}
-          LINUX_SIGNING_KEY_PASSPHRASE: ${{ runner.os == 'Linux' && inputs.sign_linux_appimage && secrets.LINUX_SIGNING_KEY_PASSPHRASE || '' }}
         run: |
           set -euo pipefail
           if [[ "$RUNNER_OS" == "macOS" && -n "${APPLE_ID}" && -n "${APPLE_PASSWORD}" ]]; then
             unset APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH
           fi
-          if [[ "$RUNNER_OS" == "Linux" && "${SIGN_LINUX_APPIMAGE}" == "true" ]]; then
-            if [[ -z "${LINUX_SIGNING_KEY_PASSPHRASE}" ]]; then
-              echo "sign_linux_appimage=true requires LINUX_SIGNING_KEY_PASSPHRASE" >&2
-              exit 1
-            fi
-            export SIGN=1
-            export APPIMAGETOOL_SIGN_PASSPHRASE="$LINUX_SIGNING_KEY_PASSPHRASE"
-            if [[ -n "${LINUX_SIGNING_KEY_ID}" ]]; then
-              export SIGN_KEY="$LINUX_SIGNING_KEY_ID"
-            fi
-          fi
           cd crates/tine-app
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            export APPIMAGE_EXTRACT_AND_RUN=1
-            export XDG_CACHE_HOME="$RUNNER_TEMP/xdg-cache"
-            set +e
-            cargo tauri build --config tauri.conf.json 2>&1 | tee "$RUNNER_TEMP/tauri-build.log"
-            status=${PIPESTATUS[0]}
-            set -e
-            if [[ $status -ne 0 ]]; then
-              echo "::group::Linux desktop bundle diagnostics"
-              df -h . "$RUNNER_TEMP" 2>/dev/null || true
-              du -sh resources/runtime resources/runtime/python 2>/dev/null || true
-              echo "--- last 200 lines of tauri build log ---"
-              tail -n 200 "$RUNNER_TEMP/tauri-build.log" 2>/dev/null || true
-              echo "--- resource listing ---"
-              find resources/runtime -maxdepth 3 | sort | head -n 200 || true
-              echo "--- bundle listing ---"
-              find ../../target/release/bundle -maxdepth 4 | sort | head -n 400 || true
-              echo "--- tauri tool cache ---"
-              find "$XDG_CACHE_HOME/tauri" -maxdepth 2 | sort | head -n 200 || true
-              appdir_path="$(find ../../target/release/bundle/appimage -maxdepth 1 -type d -name '*.AppDir' | head -n 1)"
-              linuxdeploy_path="$XDG_CACHE_HOME/tauri/linuxdeploy-x86_64.AppImage"
-              if [[ -n "$appdir_path" && -x "$linuxdeploy_path" ]]; then
-                echo "--- manual linuxdeploy rerun ---"
-                OUTPUT="$RUNNER_TEMP/manual-linuxdeploy.AppImage" \
-                ARCH=x86_64 \
-                APPIMAGE_EXTRACT_AND_RUN=1 \
-                "$linuxdeploy_path" \
-                  --appimage-extract-and-run \
-                  --verbosity 0 \
-                  --appdir "$appdir_path" \
-                  --plugin gtk \
-                  --output appimage 2>&1 || true
-              fi
-              if [[ -f resources/runtime/.fetched-runtime.json ]]; then
-                cat resources/runtime/.fetched-runtime.json
-              fi
-              echo "::endgroup::"
-              exit $status
-            fi
-          else
-            cargo tauri build -vv --config tauri.conf.json
-          fi
+          cargo tauri build -vv --config tauri.conf.json
 
       - name: Resolve version and built bundle paths
         id: bundle
@@ -394,30 +295,6 @@ jobs:
             --require-bundled-python \
             --doctor-runtime \
             --health-only
-
-      - name: Smoke desktop app (Linux)
-        if: matrix.smoke && runner.os == 'Linux'
-        shell: bash
-        env:
-          BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
-        run: |
-          chmod +x "$BUNDLE_PATH"
-          xvfb-run -a python3 scripts/release/smoke_app.py --bundle-path "$BUNDLE_PATH" --launch-path "$BUNDLE_PATH" --server-port 40113 --require-bundled-python --doctor-runtime --health-only
-
-      - name: Validate signed AppImage
-        if: matrix.smoke && runner.os == 'Linux' && inputs.sign_linux_appimage
-        shell: bash
-        env:
-          BUNDLE_PATH: ${{ steps.bundle.outputs.bundle_path }}
-        run: |
-          set -euo pipefail
-          VALIDATE_TOOL="$RUNNER_TEMP/validate-x86_64.AppImage"
-          curl --fail --location --retry 5 --silent --show-error \
-            --output "$VALIDATE_TOOL" \
-            https://github.com/AppImageCommunity/AppImageUpdate/releases/download/continuous/validate-x86_64.AppImage
-          chmod +x "$VALIDATE_TOOL" "$BUNDLE_PATH"
-          APPIMAGE_EXTRACT_AND_RUN=1 "$BUNDLE_PATH" --appimage-signature
-          APPIMAGE_EXTRACT_AND_RUN=1 "$VALIDATE_TOOL" "$BUNDLE_PATH"
 
       - name: Smoke desktop app (Windows)
         if: matrix.smoke && runner.os == 'Windows'
