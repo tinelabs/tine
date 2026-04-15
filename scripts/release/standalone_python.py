@@ -132,6 +132,42 @@ def seed_baseline_packages(python_root: Path) -> None:
     )
 
 
+def prune_desktop_runtime(python_root: Path) -> None:
+    removable_paths = [
+        python_root / "include",
+        python_root / "lib" / "pkgconfig",
+        python_root / "lib" / "tcl8",
+        python_root / "lib" / "tcl8.6",
+        python_root / "lib" / "thread2.8.7",
+        python_root / "lib" / "tk8.6",
+        python_root / "share" / "man",
+        python_root / "share" / "terminfo",
+    ]
+    removable_globs = [
+        "bin/2to3*",
+        "bin/idle3*",
+        "bin/pydoc3*",
+        "bin/python3-config",
+        "bin/python3.12-config",
+        "lib/python3.12/lib2to3",
+        "lib/python3.12/tkinter",
+        "lib/python3.12/idlelib",
+    ]
+
+    for path in removable_paths:
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+
+    for pattern in removable_globs:
+        for path in python_root.glob(pattern):
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+
+
 def stage_python_runtime(destination_root: Path, artifact_url: str, artifact_sha256: str) -> Path:
     destination_root.mkdir(parents=True, exist_ok=True)
 
@@ -153,6 +189,7 @@ def stage_python_runtime(destination_root: Path, artifact_url: str, artifact_sha
         if destination.exists():
             shutil.rmtree(destination)
         shutil.move(str(staged_python_root), destination)
+        prune_desktop_runtime(destination)
 
     return destination
 
@@ -184,5 +221,6 @@ def stage_python_runtime_from_checksum_file(
         if destination.exists():
             shutil.rmtree(destination)
         shutil.move(str(staged_python_root), destination)
+        prune_desktop_runtime(destination)
 
     return destination

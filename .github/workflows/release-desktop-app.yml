@@ -269,8 +269,13 @@ jobs:
             set -e
             if [[ $status -ne 0 ]]; then
               echo "::group::Linux desktop bundle diagnostics"
+              df -h . "$RUNNER_TEMP" 2>/dev/null || true
               du -sh resources/runtime resources/runtime/python 2>/dev/null || true
+              echo "--- last 200 lines of tauri build log ---"
+              tail -n 200 "$RUNNER_TEMP/tauri-build.log" 2>/dev/null || true
+              echo "--- resource listing ---"
               find resources/runtime -maxdepth 3 | sort | head -n 200 || true
+              echo "--- bundle listing ---"
               find target/release/bundle -maxdepth 3 | sort | head -n 200 || true
               if [[ -f resources/runtime/.fetched-runtime.json ]]; then
                 cat resources/runtime/.fetched-runtime.json
