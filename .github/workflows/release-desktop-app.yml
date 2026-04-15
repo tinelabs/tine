@@ -263,6 +263,7 @@ jobs:
           cd crates/tine-app
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             export APPIMAGE_EXTRACT_AND_RUN=1
+            export XDG_CACHE_HOME="$RUNNER_TEMP/xdg-cache"
             set +e
             cargo tauri build --config tauri.conf.json 2>&1 | tee "$RUNNER_TEMP/tauri-build.log"
             status=${PIPESTATUS[0]}
@@ -276,7 +277,23 @@ jobs:
               echo "--- resource listing ---"
               find resources/runtime -maxdepth 3 | sort | head -n 200 || true
               echo "--- bundle listing ---"
-              find target/release/bundle -maxdepth 3 | sort | head -n 200 || true
+              find ../../target/release/bundle -maxdepth 4 | sort | head -n 400 || true
+              echo "--- tauri tool cache ---"
+              find "$XDG_CACHE_HOME/tauri" -maxdepth 2 | sort | head -n 200 || true
+              appdir_path="$(find ../../target/release/bundle/appimage -maxdepth 1 -type d -name '*.AppDir' | head -n 1)"
+              linuxdeploy_path="$XDG_CACHE_HOME/tauri/linuxdeploy-x86_64.AppImage"
+              if [[ -n "$appdir_path" && -x "$linuxdeploy_path" ]]; then
+                echo "--- manual linuxdeploy rerun ---"
+                OUTPUT="$RUNNER_TEMP/manual-linuxdeploy.AppImage" \
+                ARCH=x86_64 \
+                APPIMAGE_EXTRACT_AND_RUN=1 \
+                "$linuxdeploy_path" \
+                  --appimage-extract-and-run \
+                  --verbosity 0 \
+                  --appdir "$appdir_path" \
+                  --plugin gtk \
+                  --output appimage 2>&1 || true
+              fi
               if [[ -f resources/runtime/.fetched-runtime.json ]]; then
                 cat resources/runtime/.fetched-runtime.json
               fi
