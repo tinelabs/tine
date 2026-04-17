@@ -203,7 +203,11 @@ jobs:
             unset APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH
           fi
           cd crates/tine-app
-          cargo tauri build -vv --config tauri.conf.json
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            CI=true cargo tauri build --bundles dmg -vv --config tauri.conf.json
+          else
+            cargo tauri build -vv --config tauri.conf.json
+          fi
 
       - name: Resolve version and built bundle paths
         id: bundle

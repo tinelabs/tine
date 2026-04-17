@@ -27,20 +27,38 @@ export async function resolveApiBaseUrl({
     return "";
   }
 
+  const info = await resolveServerInfo({
+    invoke,
+    retryDelayMs,
+    retryLimit,
+    sleep,
+  });
+  return `http://${desktopHost}:${info.port}`;
+}
+
+export async function resolveServerInfo({
+  invoke,
+  retryDelayMs = 250,
+  retryLimit = 20,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}) {
   let lastError = null;
   for (let attempt = 0; attempt < retryLimit; attempt += 1) {
     try {
-      const port = await invoke("server_port");
-      if (port) {
-        return `http://${desktopHost}:${port}`;
+      const info = await invoke("server_info");
+      if (info && info.port) {
+        return {
+          port: info.port,
+          preferredPort: info.preferredPort ?? info.port,
+          fellBack: Boolean(info.fellBack),
+        };
       }
     } catch (error) {
       lastError = error;
     }
     await sleep(retryDelayMs);
   }
-
-  throw lastError || new Error("embedded server port unavailable");
+  throw lastError || new Error("embedded server info unavailable");
 }
 
 export function resolveApiUrl(path, baseUrl) {

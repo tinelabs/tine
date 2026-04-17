@@ -15,10 +15,39 @@ import { h, render } from "preact";
 import { useState, useEffect, useRef, useCallback } from "preact/hooks";
 import htm from "htm";
 import DOMPurify from "dompurify";
-import CodeMirror from "https://esm.sh/@uiw/react-codemirror@4.23.6?alias=react:preact/compat,react-dom:preact/compat&deps=preact@10.25.4";
-import { python } from "https://esm.sh/@codemirror/lang-python@6.1.6";
-import { createTheme } from "https://esm.sh/@uiw/codemirror-themes@4.23.6";
-import { tags as t } from "https://esm.sh/@lezer/highlight@1.2.1";
+// All @codemirror/* packages share the same state/view/language URLs via
+// the `deps` query so a single instance of @codemirror/state is loaded
+// (mismatched copies break instanceof checks during extension resolution).
+import {
+  EditorView,
+  keymap,
+  placeholder as cmPlaceholder,
+} from "https://esm.sh/@codemirror/view@6.34.1?deps=@codemirror/state@6.5.0";
+import {
+  EditorState,
+  Compartment,
+} from "https://esm.sh/@codemirror/state@6.5.0";
+import { python } from "https://esm.sh/@codemirror/lang-python@6.1.6?deps=@codemirror/state@6.5.0,@codemirror/view@6.34.1,@codemirror/language@6.10.3";
+import {
+  defaultKeymap,
+  history,
+  historyKeymap,
+  indentWithTab,
+} from "https://esm.sh/@codemirror/commands@6.7.0?deps=@codemirror/state@6.5.0,@codemirror/view@6.34.1,@codemirror/language@6.10.3";
+import {
+  indentUnit,
+  syntaxHighlighting,
+  defaultHighlightStyle,
+  bracketMatching,
+  indentOnInput,
+} from "https://esm.sh/@codemirror/language@6.10.3?deps=@codemirror/state@6.5.0,@codemirror/view@6.34.1";
+import {
+  autocompletion,
+  closeBrackets,
+  closeBracketsKeymap,
+  completionKeymap,
+} from "https://esm.sh/@codemirror/autocomplete@6.18.1?deps=@codemirror/state@6.5.0,@codemirror/view@6.34.1,@codemirror/language@6.10.3";
+import { oneDark } from "https://esm.sh/@codemirror/theme-one-dark@6.1.2?deps=@codemirror/state@6.5.0,@codemirror/view@6.34.1,@codemirror/language@6.10.3";
 import hljs from "https://esm.sh/highlight.js@11.11.1/lib/core";
 import pythonLanguage from "https://esm.sh/highlight.js@11.11.1/lib/languages/python";
 import {
@@ -46,6 +75,7 @@ import {
   normalizeFileTreePath,
   pickActiveBranchId,
   resolveApiBaseUrl,
+  resolveServerInfo,
   resolveApiUrl,
   resolveWebSocketUrl,
   watchedDirForPath,
@@ -56,64 +86,8 @@ const MAX_TERMINAL_EVENTS = 400;
 const TEXT_PREVIEW_LIMIT_BYTES = 512 * 1024;
 let terminalEventCounter = 0;
 
-const CODEMIRROR_THEME_SETTINGS = {
-  background: "var(--cm-bg)",
-  backgroundImage: "none",
-  foreground: "var(--fg)",
-  caret: "var(--cm-cursor)",
-  selection: "var(--cm-selection)",
-  selectionMatch: "var(--cm-selection)",
-  lineHighlight: "transparent",
-  gutterBackground: "var(--cm-bg)",
-  gutterForeground: "var(--fg-2)",
-};
-
-const CODEMIRROR_THEME_STYLES = [
-  { tag: t.comment, color: "var(--fg-3)", fontStyle: "italic" },
-  { tag: [t.string, t.special(t.string)], color: "var(--green)" },
-  { tag: [t.number, t.integer, t.float, t.bool, t.null], color: "var(--yellow)" },
-  { tag: [t.keyword, t.operatorKeyword, t.modifier], color: "var(--purple)" },
-  { tag: [t.definitionKeyword, t.controlKeyword], color: "var(--purple)" },
-  { tag: [t.variableName, t.name], color: "var(--fg)" },
-  { tag: [t.definition(t.variableName), t.function(t.variableName)], color: "var(--blue)" },
-  { tag: [t.typeName, t.className, t.namespace], color: "var(--blue)" },
-  { tag: [t.propertyName, t.attributeName], color: "var(--accent-dim)" },
-  { tag: [t.punctuation, t.separator, t.bracket], color: "var(--fg-2)" },
-  { tag: [t.meta, t.annotation], color: "var(--accent-dim)" },
-];
-
-const CM_LIGHT_THEME = createTheme({
-  theme: "light",
-  settings: CODEMIRROR_THEME_SETTINGS,
-  styles: CODEMIRROR_THEME_STYLES,
-});
-
-const CM_DARK_THEME = createTheme({
-  theme: "dark",
-  settings: CODEMIRROR_THEME_SETTINGS,
-  styles: CODEMIRROR_THEME_STYLES,
-});
-
 if (!hljs.getLanguage("python")) {
   hljs.registerLanguage("python", pythonLanguage);
-}
-
-function currentThemeMode() {
-  if (typeof document !== "undefined") {
-    const attr = document.documentElement.getAttribute("data-theme");
-    if (attr === "dark" || attr === "light") return attr;
-  }
-  try {
-    if (typeof localStorage !== "undefined") {
-      const saved = localStorage.getItem("tine-theme");
-      if (saved === "dark" || saved === "light") return saved;
-    }
-  } catch {}
-  return "light";
-}
-
-if (typeof document !== "undefined") {
-  document.documentElement.setAttribute("data-theme", currentThemeMode());
 }
 
 function loadSidebarCollapsed() {
@@ -547,6 +521,8 @@ const store = createStore({
   terminalEvents: [],
   toast: null,
   compareSelection: [],
+  serverInfo: null,
+  serverFallbackDismissed: false,
 });
 
 function useStore(sel) {
@@ -1666,8 +1642,6 @@ async function cancelExecutionById(execId) {
 
 // ── Cell Component ────────────────────────────────────────────
 
-const PYTHON_EXTENSIONS = [python()];
-
 function HighlightEditor({
   value,
   onChange,
@@ -1675,89 +1649,118 @@ function HighlightEditor({
   readOnly = false,
   placeholder = "",
   textareaRef = null,
-  language = "python",
 }) {
+  const hostRef = useRef(null);
   const viewRef = useRef(null);
-  const [editorTheme, setEditorTheme] = useState(() => currentThemeMode());
-
-  const handleCreateEditor = useCallback(
-    (view) => {
-      viewRef.current = view;
-      if (!textareaRef) return;
-      const focusHandle = { focus: () => view.focus() };
-      if (typeof textareaRef === "function") textareaRef(focusHandle);
-      else textareaRef.current = focusHandle;
-    },
-    [textareaRef],
-  );
+  const onChangeRef = useRef(onChange);
+  const onKeyDownRef = useRef(onKeyDown);
+  const readOnlyCompRef = useRef(null);
+  if (readOnlyCompRef.current === null) {
+    readOnlyCompRef.current = new Compartment();
+  }
 
   useEffect(() => {
+    onChangeRef.current = onChange;
+  }, [onChange]);
+  useEffect(() => {
+    onKeyDownRef.current = onKeyDown;
+  }, [onKeyDown]);
+
+  // Mount once; never recreate on prop changes.
+  useEffect(() => {
+    if (!hostRef.current) return;
+    const roComp = readOnlyCompRef.current;
+    const runShiftEnter = (view) => {
+      const handler = onKeyDownRef.current;
+      if (!handler) return false;
+      handler({
+        shiftKey: true,
+        key: "Enter",
+        preventDefault: () => {},
+        stopPropagation: () => {},
+      });
+      return true;
+    };
+
+    const state = EditorState.create({
+      doc: value || "",
+      extensions: [
+        history(),
+        indentUnit.of("    "),
+        EditorState.tabSize.of(4),
+        indentOnInput(),
+        bracketMatching(),
+        closeBrackets(),
+        autocompletion(),
+        syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+        python(),
+        oneDark,
+        cmPlaceholder(placeholder || ""),
+        keymap.of([
+          { key: "Shift-Enter", preventDefault: true, run: runShiftEnter },
+          indentWithTab,
+          ...closeBracketsKeymap,
+          ...defaultKeymap,
+          ...historyKeymap,
+          ...completionKeymap,
+        ]),
+        EditorView.updateListener.of((update) => {
+          if (update.docChanged) {
+            onChangeRef.current?.(update.state.doc.toString());
+          }
+        }),
+        EditorView.contentAttributes.of({ spellcheck: "false" }),
+        roComp.of(EditorState.readOnly.of(readOnly)),
+      ],
+    });
+    const view = new EditorView({ state, parent: hostRef.current });
+    viewRef.current = view;
+
+    const focusHandle = { focus: () => view.focus() };
+    if (textareaRef) {
+      if (typeof textareaRef === "function") textareaRef(focusHandle);
+      else textareaRef.current = focusHandle;
+    }
+
     return () => {
+      view.destroy();
+      viewRef.current = null;
       if (textareaRef && typeof textareaRef !== "function") {
         textareaRef.current = null;
       }
-      viewRef.current = null;
     };
-  }, [textareaRef]);
-
-  useEffect(() => {
-    if (typeof document === "undefined") return undefined;
-    const root = document.documentElement;
-    const syncTheme = () => setEditorTheme(currentThemeMode());
-    syncTheme();
-    const observer = new MutationObserver(syncTheme);
-    observer.observe(root, {
-      attributes: true,
-      attributeFilter: ["data-theme"],
-    });
-    return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleChange = useCallback(
-    (next) => {
-      onChange?.(next);
-    },
-    [onChange],
-  );
+  // Sync external value changes without recreating the view.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    const current = view.state.doc.toString();
+    const next = value || "";
+    if (current === next) return;
+    view.dispatch({
+      changes: { from: 0, to: current.length, insert: next },
+    });
+  }, [value]);
 
-  const handleKeyDown = useCallback(
-    (event) => {
-      if (!readOnly && event.shiftKey && event.key === "Enter") {
-        event.preventDefault();
-        onKeyDown?.(event);
-      }
-    },
-    [onKeyDown, readOnly],
-  );
-
-  const extensions = language === "python" ? PYTHON_EXTENSIONS : [];
+  // Sync readOnly toggle.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: readOnlyCompRef.current.reconfigure(
+        EditorState.readOnly.of(readOnly),
+      ),
+    });
+  }, [readOnly]);
 
   return html`
     <div
       class="cell-editor-shell ${!(value || "").trim() ? "empty" : ""}"
       data-placeholder=${placeholder}
-      onKeyDown=${handleKeyDown}
     >
-      <${CodeMirror}
-        value=${value || ""}
-        height="auto"
-        theme=${editorTheme === "dark" ? CM_DARK_THEME : CM_LIGHT_THEME}
-        extensions=${extensions}
-        readOnly=${readOnly}
-        editable=${!readOnly}
-        placeholder=${placeholder}
-        basicSetup=${{
-          lineNumbers: false,
-          foldGutter: false,
-          highlightActiveLineGutter: false,
-          highlightActiveLine: false,
-          bracketMatching: true,
-          autocompletion: false,
-          indentOnInput: true,
-        }}
-        onCreateEditor=${handleCreateEditor}
-        onChange=${(nextValue) => handleChange(nextValue)}
-      />
+      <div ref=${hostRef} class="cell-editor-input cm-editor-host"></div>
     </div>
   `;
 }
@@ -3050,6 +3053,7 @@ function Titlebar() {
         >
           <${MoonStar} size=${15} strokeWidth=${2} />
         </button>
+        <${ServerFallbackChip} />
         <span
           class="ws-indicator ${ws ? "connected" : ""}"
           title=${ws ? "Connected" : "Disconnected"}
@@ -4004,6 +4008,12 @@ function App() {
     connectWS();
     navigateFromHash();
     window.addEventListener("hashchange", navigateFromHash);
+
+    if (hasDesktopBridge()) {
+      resolveServerInfo({ invoke: resolveDesktopInvoke(), sleep })
+        .then((info) => store.set((s) => ({ ...s, serverInfo: info })))
+        .catch(() => {});
+    }
     return () => window.removeEventListener("hashchange", navigateFromHash);
   }, []);
 
@@ -4049,6 +4059,28 @@ function App() {
       </div>
       <${Toast} />
     </div>
+  `;
+}
+
+function ServerFallbackChip() {
+  const info = useStore((s) => s.serverInfo);
+  if (!info || !info.fellBack) return null;
+  const mcpCommand = `tine-mcp --api-url http://127.0.0.1:${info.port}`;
+  const copy = () => {
+    navigator.clipboard
+      ?.writeText(mcpCommand)
+      .then(() => showToast("MCP command copied"))
+      .catch(() => showToast("Copy failed"));
+  };
+  return html`
+    <button
+      class="server-fallback-chip"
+      onClick=${copy}
+      title=${`Port ${info.preferredPort} was in use. Click to copy: ${mcpCommand}`}
+      aria-label=${`Server on port ${info.port}. Click to copy MCP command.`}
+    >
+      :${info.port}
+    </button>
   `;
 }
 

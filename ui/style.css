@@ -119,6 +119,28 @@ html, body, #root {
     "sidebar main";
 }
 
+.server-fallback-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  height: 22px;
+  padding: 0 0.5rem;
+  border-radius: 999px;
+  background: rgba(234, 179, 8, 0.14);
+  border: 1px solid rgba(234, 179, 8, 0.45);
+  color: var(--fg);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.72rem;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+  transition: background 120ms ease;
+}
+
+.server-fallback-chip:hover {
+  background: rgba(234, 179, 8, 0.24);
+}
+
 /* ── Titlebar ─────────────────────────────────────────────────── */
 .titlebar {
   grid-area: titlebar;
@@ -845,6 +867,29 @@ html, body, #root {
   width: 100%;
 }
 
+.plain-editor-input {
+  min-height: 88px;
+  max-height: 520px;
+  padding: 0;
+  border: 0;
+  outline: none;
+  resize: vertical;
+  overflow: auto;
+  background: transparent;
+  color: var(--fg);
+  caret-color: var(--cm-cursor);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1.5;
+  tab-size: 4;
+  font-variant-ligatures: none;
+  white-space: pre;
+}
+
+.plain-editor-input::placeholder {
+  color: var(--fg-3);
+}
+
 .cell-editor-input::selection {
   background: transparent;
 }
@@ -881,12 +926,18 @@ html, body, #root {
   font-size: 14px;
   background: var(--cm-bg) !important;
   color: var(--fg) !important;
+  caret-color: var(--cm-cursor) !important;
 }
 
 .cm-editor-host .cm-content,
 .cm-editor-host .cm-line {
   background: var(--cm-bg) !important;
   color: var(--fg) !important;
+}
+
+.cm-editor-host .cm-cursor,
+.cm-editor-host .cm-dropCursor {
+  border-left: 2px solid var(--cm-cursor) !important;
 }
 
 .cm-editor-host .cm-scroller,

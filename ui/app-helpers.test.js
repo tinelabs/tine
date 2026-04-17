@@ -46,7 +46,9 @@ test("resolveApiBaseUrl falls back to the embedded desktop server port", async (
     hasDesktopBridge: true,
     invoke: async () => {
       attempts += 1;
-      return attempts >= 2 ? 63125 : null;
+      return attempts >= 2
+        ? { port: 63125, preferredPort: 9473, fellBack: true }
+        : null;
     },
     retryDelayMs: 0,
     retryLimit: 3,

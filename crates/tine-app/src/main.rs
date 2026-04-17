@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -174,22 +174,41 @@ async fn save_export_file(
     Ok(Some(path.display().to_string()))
 }
 
-/// IPC: get the embedded server port
+/// IPC: get the embedded server port + fallback state.
 #[tauri::command]
-fn server_port(state: tauri::State<'_, AppState>) -> Result<u16, String> {
+fn server_info(state: tauri::State<'_, AppState>) -> Result<ServerInfo, String> {
     let port = state.port.load(Ordering::Relaxed);
     if port == 0 {
-        Err("embedded server port unavailable".to_string())
-    } else {
-        Ok(port)
+        return Err("embedded server port unavailable".to_string());
     }
+    Ok(ServerInfo {
+        port,
+        preferred_port: state.preferred_port,
+        fell_back: state.fell_back.load(Ordering::Relaxed),
+    })
 }
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerInfo {
+    port: u16,
+    preferred_port: u16,
+    fell_back: bool,
+}
+
+/// Preferred port for the embedded server. Keeping this as a canonical default
+/// means users can wire MCP clients against `http://127.0.0.1:9473` without
+/// consulting the app each session — we only advertise the fallback port when
+/// 9473 is occupied.
+const PREFERRED_PORT: u16 = 9473;
 
 #[derive(Clone)]
 struct AppState {
     workspace: Arc<Mutex<Option<Arc<Workspace>>>>,
     workspace_dir: PathBuf,
     port: Arc<AtomicU16>,
+    preferred_port: u16,
+    fell_back: Arc<AtomicBool>,
 }
 
 fn main() {
@@ -230,20 +249,23 @@ fn main() {
                 workspace: Arc::new(Mutex::new(None)),
                 workspace_dir: ws_dir.clone(),
                 port: Arc::new(AtomicU16::new(0)),
+                preferred_port: PREFERRED_PORT,
+                fell_back: Arc::new(AtomicBool::new(false)),
             };
 
             app.manage(state.clone());
 
             // Spawn the embedded server on a background tokio task
             tauri::async_runtime::spawn(async move {
-                match start_embedded_server(&ws_dir).await {
-                    Ok((workspace, port)) => {
-                        info!(port = port, "embedded tine server started");
+                match start_embedded_server(&ws_dir, state.preferred_port).await {
+                    Ok((workspace, port, fell_back)) => {
+                        info!(port = port, fell_back = fell_back, "embedded tine server started");
 
                         if let Ok(mut state_workspace) = state.workspace.lock() {
                             *state_workspace = Some(workspace);
                         }
                         state.port.store(port, Ordering::Relaxed);
+                        state.fell_back.store(fell_back, Ordering::Relaxed);
 
                         // Navigate the main window to the embedded server
                         if let Some(window) = handle.get_webview_window("main") {
@@ -274,7 +296,7 @@ fn main() {
             default_projects_dir,
             pick_project_folder,
             save_export_file,
-            server_port,
+            server_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tine");
@@ -294,10 +316,12 @@ fn resolve_workspace_dir() -> PathBuf {
     default_projects_root(Path::new("."))
 }
 
-/// Start the tine axum server on a random free port.
+/// Start the tine axum server. Tries the preferred port first so MCP clients
+/// can assume a canonical URL; falls back to an ephemeral port if it's taken.
 async fn start_embedded_server(
     workspace_dir: &std::path::Path,
-) -> Result<(Arc<Workspace>, u16), Box<dyn std::error::Error>> {
+    preferred_port: u16,
+) -> Result<(Arc<Workspace>, u16, bool), Box<dyn std::error::Error>> {
     // Ensure .tine/ directory exists
     let tine_dir = workspace_dir.join(".tine");
     tokio::fs::create_dir_all(&tine_dir).await?;
@@ -307,9 +331,26 @@ async fn start_embedded_server(
     let workspace = Arc::new(Workspace::open(workspace_dir.to_path_buf(), store, 8).await?);
 
     // Release smoke can override the bind address to avoid brittle port discovery.
-    let bind_addr = std::env::var("TINE_EMBEDDED_SERVER_BIND")
-        .unwrap_or_else(|_| "127.0.0.1:0".to_string());
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    // When the override is absent, try the canonical `127.0.0.1:<preferred>` and
+    // fall back to an ephemeral port so a second desktop instance (or another
+    // process already holding the preferred port) can still run.
+    let (listener, fell_back) = match std::env::var("TINE_EMBEDDED_SERVER_BIND") {
+        Ok(bind_addr) => (tokio::net::TcpListener::bind(&bind_addr).await?, false),
+        Err(_) => {
+            let preferred = format!("127.0.0.1:{preferred_port}");
+            match tokio::net::TcpListener::bind(&preferred).await {
+                Ok(l) => (l, false),
+                Err(error) => {
+                    info!(
+                        port = preferred_port,
+                        %error,
+                        "preferred port unavailable, falling back to ephemeral",
+                    );
+                    (tokio::net::TcpListener::bind("127.0.0.1:0").await?, true)
+                }
+            }
+        }
+    };
     let port = listener.local_addr()?.port();
 
     let ui_dir = resolve_ui_dir(workspace_dir)?;
@@ -328,7 +369,7 @@ async fn start_embedded_server(
         axum::serve(listener, router).await.ok();
     });
 
-    Ok((workspace, port))
+    Ok((workspace, port, fell_back))
 }
 
 fn find_workspace_root_from(start: &Path) -> Option<PathBuf> {
