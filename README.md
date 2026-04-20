@@ -48,7 +48,11 @@ Tine has a simple surface model:
 
 The UI and MCP are adapters over the same local system rather than separate runtimes.
 
-## Quick start
+## Run locally
+
+There are two normal ways to run Tine locally.
+
+### Release install
 
 The release-oriented install path is:
 
@@ -119,6 +123,16 @@ If you do not want the browser to open automatically:
 ```bash
 tine serve --workspace . --bind 127.0.0.1:9473
 ```
+
+### Run from this repository
+
+If you are working inside this repository, use the local Rust CLI instead of the packaged wrapper:
+
+```bash
+cargo run -p tine-cli -- serve --workspace . --bind 127.0.0.1:9473 --open
+```
+
+Source development expects Rust 1.75+ and Python 3.10+ to be available locally.
 
 ## MCP setup
 
@@ -205,16 +219,6 @@ That gives you:
 - the **MCP adapter** talking to the same local API
 - one local Rust backend shared by both
 
-## Development from source
-
-If you are working inside this repository rather than using the release package, the development startup path is:
-
-```bash
-cargo run -p tine-cli -- serve --workspace . --bind 127.0.0.1:9473 --open
-```
-
-That path is for repo development. For fresh user onboarding and release usage, prefer `pip install tine` followed by `tine serve`.
-
 ## Repository guide
 
 If you are navigating the repo, these are the most relevant top-level areas:
@@ -233,8 +237,3 @@ For contribution rules, issue focus areas, validation guidance, and the current 
 ## Acknowledgements
 
 Tine is grateful to the `ipykernel` and Jupyter communities. Their work helped establish the notebook and kernel patterns that make interactive computing and tool-driven workflows possible.
-
-
-
-
-

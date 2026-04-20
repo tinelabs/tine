@@ -123,6 +123,29 @@ test("pickActiveBranchId preserves valid active branch and falls back to root", 
   assert.equal(pickActiveBranchId(null, "missing"), "main");
 });
 
+test("pickActiveBranchId falls back to persisted runtime branch before root", () => {
+  const tree = {
+    root_branch_id: "main",
+    branches: [
+      { id: "main" },
+      { id: "alt-1" },
+    ],
+  };
+
+  assert.equal(
+    pickActiveBranchId(tree, null, { active_branch_id: "alt-1" }),
+    "alt-1",
+  );
+  assert.equal(
+    pickActiveBranchId(tree, "missing", { active_branch_id: "alt-1" }),
+    "alt-1",
+  );
+  assert.equal(
+    pickActiveBranchId(tree, null, { active_branch_id: "missing" }),
+    "main",
+  );
+});
+
 test("activeBranchPathCellIds returns the selected branch lineage cells", () => {
   const tree = {
     root_branch_id: "main",
