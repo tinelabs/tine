@@ -542,19 +542,22 @@ function useStore(sel) {
   return sel(store.get());
 }
 
-function defaultBranchIdForTree(tree) {
-  return pickActiveBranchId(tree, null);
+function defaultBranchIdForTree(tree, runtimeState = null) {
+  return pickActiveBranchId(tree, null, runtimeState);
 }
 
 function setActiveExperimentState(exp) {
   store.set((s) => {
     const matchingTree =
       (s.experimentTrees || []).find((tree) => tree.id === exp?.id) || null;
+    const runtimeState = exp?.id ? s.treeRuntimeStates?.[exp.id] || null : null;
     return {
       ...s,
       activeExperiment: exp,
       activeTreeId: exp?.id || null,
-      activeBranchId: exp ? defaultBranchIdForTree(matchingTree) : null,
+      activeBranchId: exp
+        ? defaultBranchIdForTree(matchingTree, runtimeState)
+        : null,
     };
   });
 }
@@ -1483,8 +1486,9 @@ async function loadExperiments() {
         : s.activeExperiment;
       const activeTree =
         trees.find((tree) => tree.id === activeExperiment?.id) || null;
+      const activeRuntimeState = activeTree ? runtimeStates[activeTree.id] || null : null;
       const activeBranchId = activeExperiment
-        ? pickActiveBranchId(activeTree, s.activeBranchId)
+        ? pickActiveBranchId(activeTree, s.activeBranchId, activeRuntimeState)
         : null;
       return {
         ...s,

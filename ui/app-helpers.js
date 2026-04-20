@@ -89,10 +89,15 @@ export function watchedDirForPath(path) {
   return normalizeFileTreePath(normalized.slice(0, idx));
 }
 
-export function pickActiveBranchId(tree, currentBranchId) {
+export function pickActiveBranchId(tree, currentBranchId, runtimeState = null) {
   const branches = tree?.branches || [];
   if (currentBranchId && branches.some(branch => branch.id === currentBranchId)) {
     return currentBranchId;
+  }
+  const persistedBranchId =
+    runtimeState?.active_branch_id || runtimeState?.activeBranchId || null;
+  if (persistedBranchId && branches.some(branch => branch.id === persistedBranchId)) {
+    return persistedBranchId;
   }
   return tree?.root_branch_id || "main";
 }
