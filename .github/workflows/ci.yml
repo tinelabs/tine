@@ -7,20 +7,24 @@ on:
       - main
 
 jobs:
-  release-binary-changes:
-    name: Detect release binary changes
+  changes:
+    name: Detect CI validation surface changes
     runs-on: ubuntu-latest
     outputs:
       rust_release: ${{ steps.filter.outputs.rust_release }}
+      python_wrapper: ${{ steps.filter.outputs.python_wrapper }}
+      workflow_definitions: ${{ steps.filter.outputs.workflow_definitions }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Detect files that require a release binary rebuild
+      - name: Detect files that require release validation
         id: filter
         uses: dorny/paths-filter@v3
         with:
           filters: |
+            workflow_definitions:
+              - '.github/workflows/**'
             rust_release:
               - '.github/workflows/ci.yml'
               - 'Cargo.toml'
@@ -28,21 +32,6 @@ jobs:
               - 'VERSION'
               - 'crates/**'
               - 'scripts/release/**'
-
-  python-wrapper-changes:
-    name: Detect Python wrapper changes
-    runs-on: ubuntu-latest
-    outputs:
-      python_wrapper: ${{ steps.filter.outputs.python_wrapper }}
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Detect files that require Python wrapper validation
-        id: filter
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
             python_wrapper:
               - '.github/workflows/ci.yml'
               - 'packaging/python/**'
@@ -51,12 +40,24 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
 
+  validate-workflows:
+    name: Validate workflow definitions
+    needs:
+      - changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.workflow_definitions == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate GitHub Actions workflows
+        uses: reviewdog/action-actionlint@v1
+
   version-alignment:
     name: Verify version alignment
     needs:
-      - release-binary-changes
-      - python-wrapper-changes
-    if: github.event_name != 'pull_request' || needs.release-binary-changes.outputs.rust_release == 'true' || needs.python-wrapper-changes.outputs.python_wrapper == 'true'
+      - changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.rust_release == 'true' || needs.changes.outputs.python_wrapper == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -73,8 +74,8 @@ jobs:
   python-wrapper-tests:
     name: Python wrapper tests
     needs:
-      - python-wrapper-changes
-    if: github.event_name != 'pull_request' || needs.python-wrapper-changes.outputs.python_wrapper == 'true'
+      - changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.python_wrapper == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -96,8 +97,8 @@ jobs:
     needs:
       - version-alignment
       - python-wrapper-tests
-      - python-wrapper-changes
-    if: github.event_name != 'pull_request' || needs.python-wrapper-changes.outputs.python_wrapper == 'true'
+      - changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.python_wrapper == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -123,9 +124,9 @@ jobs:
   build-release-binary:
     name: Build Linux release binary
     needs:
-      - release-binary-changes
+      - changes
       - version-alignment
-    if: github.event_name != 'pull_request' || needs.release-binary-changes.outputs.rust_release == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.rust_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
