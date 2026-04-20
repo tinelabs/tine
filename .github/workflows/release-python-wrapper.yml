@@ -49,14 +49,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build local binary for version check
-        run: cargo build -p tine-cli
-
       - name: Verify Python, Rust workspace, and binary versions align
-        run: python scripts/release/verify_version_alignment.py --repo-root . --binary target/debug/tine
+        run: python scripts/release/verify_version_alignment.py --repo-root .
 
   build-rust-binaries:
     name: Build Rust binary (${{ matrix.label }})
@@ -89,6 +83,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_target }}
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
 
       - name: Set up Python
         uses: actions/setup-python@v5
