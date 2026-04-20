@@ -1550,6 +1550,7 @@ async function pollExecution(execId, runtimeId, nodeIds) {
               ? await api.treeCellLogs(treeId, branchId, nid)
               : null;
             if (!l) continue;
+            const terminalStatus = nodeStatusToCellStatus(st.node_statuses?.[nid]);
             const cellKey = runtimeCellKey({
               runtimeId,
               treeId,
@@ -1567,7 +1568,7 @@ async function pollExecution(execId, runtimeId, nodeIds) {
                 [cellKey]:
                   !s.wsConnected || ["idle", "queued", "running", "timeout"].includes(s.cellStatuses[cellKey] || "idle")
                     ? (deriveStatusFromLogs(l) === "idle"
-                        ? s.cellStatuses[cellKey] || "idle"
+                        ? terminalStatus || s.cellStatuses[cellKey] || "idle"
                         : deriveStatusFromLogs(l))
                     : s.cellStatuses[cellKey],
               },
