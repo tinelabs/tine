@@ -228,10 +228,13 @@ jobs:
           fi
           EXT="${BUNDLE_PATH##*.}"
           CANONICAL_PATH="release-artifacts/tine-app-${VERSION}-${{ matrix.label }}.${EXT}"
+          LATEST_ALIAS_PATH="release-artifacts/tine-${{ matrix.label }}.${EXT}"
           mkdir -p release-artifacts
           cp "$BUNDLE_PATH" "$CANONICAL_PATH"
+          cp "$BUNDLE_PATH" "$LATEST_ALIAS_PATH"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "bundle_path=$CANONICAL_PATH" >> "$GITHUB_OUTPUT"
+          echo "latest_alias_path=$LATEST_ALIAS_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Extract Windows MSI for smoke
         id: windows_msi
@@ -312,16 +315,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY' "${{ steps.bundle.outputs.bundle_path }}"
+          python - <<'PY' "${{ steps.bundle.outputs.bundle_path }}" "${{ steps.bundle.outputs.latest_alias_path }}"
           import hashlib
           import sys
           from pathlib import Path
 
-          bundle_path = Path(sys.argv[1])
-          digest = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
-          bundle_path.with_suffix(bundle_path.suffix + ".sha256").write_text(
+          for raw_path in sys.argv[1:]:
+            bundle_path = Path(raw_path)
+            digest = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+            bundle_path.with_suffix(bundle_path.suffix + ".sha256").write_text(
               f"{digest}  {bundle_path.name}\n"
-          )
+            )
           PY
 
       - name: Upload bundle artifact
@@ -331,6 +335,8 @@ jobs:
           path: |
             ${{ steps.bundle.outputs.bundle_path }}
             ${{ steps.bundle.outputs.bundle_path }}.sha256
+            ${{ steps.bundle.outputs.latest_alias_path }}
+            ${{ steps.bundle.outputs.latest_alias_path }}.sha256
 
   upload-release-assets:
     name: Upload desktop release assets

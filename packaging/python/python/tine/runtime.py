@@ -73,7 +73,7 @@ def package_version() -> str:
     try:
         return metadata.version("tine")
     except metadata.PackageNotFoundError:  # pragma: no cover - local source checkout
-        return "0.2.4-dev"
+        return "0.2.5-dev"
 
 
 def source_checkout_version(module_file: Path | None = None) -> str | None:
