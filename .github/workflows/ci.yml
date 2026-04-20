@@ -7,8 +7,57 @@ on:
       - main
 
 jobs:
+  changes:
+    name: Detect CI validation surface changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust_release: ${{ steps.filter.outputs.rust_release }}
+      python_wrapper: ${{ steps.filter.outputs.python_wrapper }}
+      workflow_definitions: ${{ steps.filter.outputs.workflow_definitions }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Detect files that require release validation
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            workflow_definitions:
+              - '.github/workflows/**'
+            rust_release:
+              - '.github/workflows/ci.yml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'VERSION'
+              - 'crates/**'
+              - 'scripts/release/**'
+            python_wrapper:
+              - '.github/workflows/ci.yml'
+              - 'packaging/python/**'
+              - 'scripts/release/**'
+              - 'VERSION'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+
+  validate-workflows:
+    name: Validate workflow definitions
+    needs:
+      - changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.workflow_definitions == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate GitHub Actions workflows
+        uses: reviewdog/action-actionlint@v1
+
   version-alignment:
     name: Verify version alignment
+    needs:
+      - changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.rust_release == 'true' || needs.changes.outputs.python_wrapper == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -19,17 +68,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build local binary for version check
-        run: cargo build -p tine-cli
-
       - name: Verify Python, Rust workspace, and binary versions align
-        run: python scripts/release/verify_version_alignment.py --repo-root . --binary target/debug/tine
+        run: python scripts/release/verify_version_alignment.py --repo-root .
 
   python-wrapper-tests:
     name: Python wrapper tests
+    needs:
+      - changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.python_wrapper == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -51,6 +97,8 @@ jobs:
     needs:
       - version-alignment
       - python-wrapper-tests
+      - changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.python_wrapper == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -76,7 +124,9 @@ jobs:
   build-release-binary:
     name: Build Linux release binary
     needs:
+      - changes
       - version-alignment
+    if: github.event_name != 'pull_request' || needs.changes.outputs.rust_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -84,6 +134,9 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
         run: cargo build --release -p tine-cli

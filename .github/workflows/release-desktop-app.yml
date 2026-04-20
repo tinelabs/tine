@@ -95,9 +95,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Render and verify workspace and Tauri config versions align
         run: python scripts/release/verify_version_alignment.py --repo-root . --tauri-template crates/tine-app/tauri.conf.template.json --tauri-config crates/tine-app/tauri.conf.json --write-tauri-config
 
@@ -122,6 +119,9 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version '^2' --locked
