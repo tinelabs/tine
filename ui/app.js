@@ -11,8 +11,13 @@
     - "experiment" in UI copy should mean experiment tree / separate runtime
     - "branch" should mean an in-tree path inside the selected experiment tree
 */
-import { h, render } from "preact";
-import { useState, useEffect, useRef, useCallback } from "preact/hooks";
+import { Component, h, render } from "preact";
+import {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+} from "preact/hooks";
 import htm from "htm";
 import DOMPurify from "dompurify";
 // All @codemirror/* packages share the same state/view/language URLs via
@@ -68,16 +73,32 @@ import {
 } from "https://esm.sh/lucide-preact@0.511.0";
 import {
   activeBranchPathCellIds,
+  appendTerminalEvent,
+  applyExecutionSnapshotToState,
+  branchRequiresReplay,
   buildExecutionStatusEvent,
+  deriveRuntimeUi,
   describeExecutionProgress,
+  fileTreeRefreshKey,
   fileQuery,
+  finishTrackedExecutionState,
   hasHttpOrigin,
+  markReplayRequiredCellStatuses,
+  nextAsyncRequestId,
+  nodeStatusToCellStatus,
   normalizeFileTreePath,
   pickActiveBranchId,
+  registerPendingFileTreeRefresh,
+  reconnectResyncTargets,
+  resolvePollWindowExpiry,
   resolveApiBaseUrl,
   resolveServerInfo,
   resolveApiUrl,
   resolveWebSocketUrl,
+  shouldApplyScopedRequestResult,
+  shouldHydrateTerminalLogs,
+  shouldRequestExecutionResync,
+  shouldRenderStderr,
   watchedDirForPath,
 } from "./app-helpers.js";
 
@@ -128,6 +149,15 @@ function executionEventScope(data = {}) {
   });
 }
 
+function executionLifecycleScope(data = {}) {
+  return normalizeTerminalScope({
+    executionId: data.execution_id,
+    treeId: data.tree_id,
+    branchId: data.branch_id,
+    nodeId: null,
+  });
+}
+
 function normalizeTerminalMetrics(metrics) {
   if (!metrics || typeof metrics !== "object") return null;
   const pairs = Object.entries(metrics).filter(
@@ -164,12 +194,24 @@ function normalizeTerminalEvent(entry, level = "info") {
   };
 }
 
-function appendTerminalEvent(events, event) {
-  return [...(events || []), event].slice(-MAX_TERMINAL_EVENTS);
-}
-
 function terminalEventSummary(event) {
-  if (event.message) return event.message;
+  if (event.message) {
+    const message = String(event.message).trim();
+    const branchId = event.scope.branchId;
+    if (!branchId) return message;
+
+    if (message === `Preparing branch ${branchId}`) return "preparing runtime";
+    if (message === `Runtime ready for branch ${branchId}`) return "runtime ready";
+    if (message === `Runtime for branch ${branchId} needs replay`) return "marked for replay";
+    if (message === `Kernel lost for branch ${branchId}`) return "kernel lost";
+
+    const branchPrefix = `Branch ${branchId} `;
+    if (message.startsWith(branchPrefix)) {
+      return message.slice(branchPrefix.length);
+    }
+
+    return message;
+  }
   const target =
     event.scope.nodeId ||
     event.scope.branchId ||
@@ -178,25 +220,24 @@ function terminalEventSummary(event) {
     event.scope.executionId ||
     event.kind;
   if (event.kind === "node") {
-    if (event.status === "started") return `${target} started`;
+    if (event.status === "started") return "started";
     if (event.status === "done")
-      return `${target} done${event.duration_ms != null ? ` (${event.duration_ms}ms)` : ""}`;
-    if (event.status === "cached") return `${target} cache hit`;
+      return `done${event.duration_ms != null ? ` (${event.duration_ms}ms)` : ""}`;
+    if (event.status === "cached") return "cache hit";
     if (event.status === "failed")
-      return `${target} failed${event.error?.evalue ? `: ${event.error.evalue}` : ""}`;
+      return `failed${event.error?.evalue ? `: ${event.error.evalue}` : ""}`;
   }
   if (event.kind === "execution") {
-    if (event.status === "started") return `${target} started`;
+    if (event.status === "started") return "started";
     if (event.status === "done")
-      return `${target} done${event.duration_ms != null ? ` (${event.duration_ms}ms)` : ""}`;
-    if (event.status === "failed") return `${target} failed`;
+      return `done${event.duration_ms != null ? ` (${event.duration_ms}ms)` : ""}`;
+    if (event.status === "failed") return "failed";
   }
   if (event.kind === "runtime_state") {
-    if (event.status === "switching")
-      return `${target} switching runtime context`;
-    if (event.status === "ready") return `${target} runtime ready`;
-    if (event.status === "needs_replay") return `${target} marked for replay`;
-    if (event.status === "kernel_lost") return `${target} kernel lost`;
+    if (event.status === "switching") return "switching runtime context";
+    if (event.status === "ready") return "runtime ready";
+    if (event.status === "needs_replay") return "marked for replay";
+    if (event.status === "kernel_lost") return "kernel lost";
   }
   if (event.error?.evalue) return event.error.evalue;
   return target;
@@ -204,8 +245,11 @@ function terminalEventSummary(event) {
 
 function terminalEventBadges(event) {
   const badges = [];
-  if (event.kind && event.kind !== "system") badges.push(event.kind);
-  if (event.status) badges.push(event.status);
+  const hasExplicitMessage = Boolean(event.message);
+  if (!hasExplicitMessage && event.kind && event.kind !== "system") {
+    badges.push(event.kind);
+  }
+  if (!hasExplicitMessage && event.status) badges.push(event.status);
   if (event.scope.runtimeId) badges.push(`runtime:${event.scope.runtimeId}`);
   if (event.scope.treeId) badges.push(`tree:${event.scope.treeId}`);
   if (event.scope.branchId) badges.push(`branch:${event.scope.branchId}`);
@@ -400,6 +444,12 @@ const api = {
   experimentTree: (id) => fetchJSON("GET", `/api/experiment-trees/${id}`),
   treeRuntimeState: (id) =>
     fetchJSON("GET", `/api/experiment-trees/${id}/runtime-state`),
+  inspectTreeKernel: (id) =>
+    fetchJSON("GET", `/api/experiment-trees/${id}/inspect-kernel`),
+  restartTreeKernel: (id) =>
+    fetchJSON("POST", `/api/experiment-trees/${id}/restart-kernel`),
+  shutdownTreeKernel: (id) =>
+    fetchJSON("POST", `/api/experiment-trees/${id}/shutdown-kernel`),
   createTreeBranch: (treeId, payload) =>
     fetchJSON("POST", `/api/experiment-trees/${treeId}/branches`, payload),
   deleteTreeBranch: (treeId, branchId) =>
@@ -513,6 +563,7 @@ const store = createStore({
   executionStatuses: {},
   activeCellExecutions: {},
   treeRuntimeStates: {},
+  treeKernelHealth: {},
   sidebarTab: "experiments",
   sidebarCollapsed: loadSidebarCollapsed(),
   fileTree: {},
@@ -525,20 +576,16 @@ const store = createStore({
   serverFallbackDismissed: false,
 });
 
+let activeNavigationId = 0;
+let latestExperimentsRequestId = 0;
+const latestRuntimeSnapshotRequestIds = new Map();
+const pendingFileTreeRefreshes = new Map();
+const latestFileTreeRefreshRequestIds = new Map();
+const pendingExecutionResyncs = new Set();
+
 function useStore(sel) {
-  const [, fu] = useState(0);
-  const ref = useRef(sel(store.get()));
-  useEffect(
-    () =>
-      store.sub(() => {
-        const n = sel(store.get());
-        if (n !== ref.current) {
-          ref.current = n;
-          fu((c) => c + 1);
-        }
-      }),
-    [],
-  );
+  const [, forceUpdate] = useState(0);
+  useEffect(() => store.sub(() => forceUpdate((value) => value + 1)), []);
   return sel(store.get());
 }
 
@@ -575,27 +622,6 @@ function showToast(msg) {
   setTimeout(() => store.set((s) => ({ ...s, toast: null })), 2500);
 }
 
-function nodeStatusToCellStatus(status) {
-  switch (String(status || "")) {
-    case "queued":
-    case "pending":
-      return "queued";
-    case "running":
-      return "running";
-    case "completed":
-      return "done";
-    case "cache_hit":
-      return "cached";
-    case "failed":
-    case "interrupted":
-      return "failed";
-    case "skipped":
-      return "idle";
-    default:
-      return null;
-  }
-}
-
 function isTerminalExecutionStatus(status) {
   const lifecycle = String(status?.status || "").trim().toLowerCase();
   if (["completed", "failed", "cancelled", "timed_out", "rejected"].includes(lifecycle)) {
@@ -619,36 +645,13 @@ function applyExecutionStatusSnapshot(execId, status, fallbackTarget = null) {
     branch_id: branchId,
     target_kind: targetKind,
   };
-  const nodeIds = Object.keys(status.node_statuses || {});
-  store.set((s) => {
-    const cellStatuses = { ...s.cellStatuses };
-    const executionTargets = { ...s.executionTargets };
-    const executionStatuses = { ...s.executionStatuses };
-    executionTargets[execId] = {
-      treeId,
-      branchId,
-      targetKind,
-    };
-    executionStatuses[execId] = {
-      ...normalizedStatus,
-    };
-    for (const nodeId of nodeIds) {
-      const cellKey = runtimeCellKey({
-        treeId,
-        branchId,
-        nodeId,
-      });
-      if (!cellKey) continue;
-      const nextStatus = nodeStatusToCellStatus(status.node_statuses?.[nodeId]);
-      if (nextStatus) cellStatuses[cellKey] = nextStatus;
-    }
-    return {
-      ...s,
-      cellStatuses,
-      executionTargets,
-      executionStatuses,
-    };
-  });
+  store.set((s) =>
+    applyExecutionSnapshotToState(s, {
+      executionId: execId,
+      status,
+      target: executionTarget,
+    }),
+  );
   const statusEvent = buildExecutionStatusEvent(previousStatus, normalizedStatus, {
     treeId,
     branchId,
@@ -657,6 +660,38 @@ function applyExecutionStatusSnapshot(execId, status, fallbackTarget = null) {
   if (statusEvent) {
     termLog(statusEvent, statusEvent.level || "info");
   }
+
+  if (treeId && branchId) {
+    maybeMarkBranchReplayRequired(treeId, branchId);
+  }
+}
+
+function maybeMarkBranchReplayRequired(treeId, branchId, runtimeStateOverride = null) {
+  if (!treeId || !branchId) return;
+  const snapshot = store.get();
+  const activeTree = (snapshot.experimentTrees || []).find(
+    (tree) => tree.id === treeId,
+  );
+  if (!activeTree) return;
+  const runtimeState = runtimeStateOverride || snapshot.treeRuntimeStates?.[treeId] || null;
+  const runtimeHealth = snapshot.treeKernelHealth?.[treeId] || null;
+  const requiresReplay = branchRequiresReplay({
+    treeId,
+    branchId,
+    runtimeState,
+    runtimeHealth,
+    executionStatuses: snapshot.executionStatuses,
+  });
+  if (!requiresReplay) return;
+  const nodeIds = activeBranchPathCellIds(activeTree, branchId);
+  store.set((s) => {
+    const cellStatuses = markReplayRequiredCellStatuses(s.cellStatuses, {
+      treeId,
+      branchId,
+      nodeIds,
+    });
+    return cellStatuses === s.cellStatuses ? s : { ...s, cellStatuses };
+  });
 }
 
 function stripAnsi(text) {
@@ -841,27 +876,7 @@ function cancelTrackedExecution(execId) {
 
 function finishTrackedExecution(execId) {
   if (!execId) return;
-  store.set((s) => {
-    const activePollIds = { ...s.activePollIds };
-    delete activePollIds[execId];
-    const executionTargets = { ...s.executionTargets };
-    const executionStatuses = { ...s.executionStatuses };
-    delete executionTargets[execId];
-    delete executionStatuses[execId];
-    const activeCellExecutions = { ...s.activeCellExecutions };
-    for (const [cellKey, currentExecId] of Object.entries(
-      activeCellExecutions,
-    )) {
-      if (currentExecId === execId) delete activeCellExecutions[cellKey];
-    }
-    return {
-      ...s,
-      activePollIds,
-      executionTargets,
-      executionStatuses,
-      activeCellExecutions,
-    };
-  });
+  store.set((s) => finishTrackedExecutionState(s, execId));
 }
 
 function registerExecution(execId, treeId, nodeIds, target = null, status = null) {
@@ -1123,13 +1138,61 @@ async function hydrateTreeBranchLogs(treeId, branchId, nodes) {
 let wsRetryDelay = 2000;
 const WS_MAX_DELAY = 30000;
 let wsInstance = null;
+let wsReconnectTimer = null;
+let wsLifecycleToken = 0;
+let wsShouldReconnect = false;
 
-function connectWS() {
+function clearWSReconnectTimer() {
+  if (wsReconnectTimer != null) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+  }
+}
+
+function scheduleWSReconnect(lifecycleToken) {
+  if (!wsShouldReconnect || lifecycleToken !== wsLifecycleToken) return;
+  clearWSReconnectTimer();
+  const retryDelay = wsRetryDelay;
+  wsReconnectTimer = setTimeout(() => {
+    wsReconnectTimer = null;
+    connectWS(lifecycleToken);
+  }, retryDelay);
+  wsRetryDelay = Math.min(wsRetryDelay * 2, WS_MAX_DELAY);
+}
+
+function stopWS() {
+  wsShouldReconnect = false;
+  wsLifecycleToken += 1;
+  clearWSReconnectTimer();
+  const previousSocket = wsInstance;
+  wsInstance = null;
+  if (previousSocket) {
+    previousSocket.onopen = null;
+    previousSocket.onclose = null;
+    previousSocket.onerror = null;
+    previousSocket.onmessage = null;
+    try {
+      previousSocket.close();
+    } catch {}
+  }
+  store.set((s) => (s.wsConnected ? { ...s, wsConnected: false } : s));
+}
+
+function connectWS(lifecycleToken = wsLifecycleToken) {
+  if (!wsShouldReconnect || lifecycleToken !== wsLifecycleToken) return;
   currentApiBaseUrl()
     .then((baseUrl) => {
+      if (!wsShouldReconnect || lifecycleToken !== wsLifecycleToken) return;
       const ws = new WebSocket(resolveWebSocketUrl(location, baseUrl));
+      clearWSReconnectTimer();
       wsInstance = ws;
       ws.onopen = () => {
+        if (!wsShouldReconnect || lifecycleToken !== wsLifecycleToken || wsInstance !== ws) {
+          try {
+            ws.close();
+          } catch {}
+          return;
+        }
         wsRetryDelay = 2000;
         store.set((s) => ({ ...s, wsConnected: true }));
         termLog({
@@ -1137,19 +1200,24 @@ function connectWS() {
           status: "connected",
           message: "WebSocket connected",
         });
+        resyncTrackedExecutionsAfterReconnect();
       };
       ws.onclose = () => {
+        if (wsInstance === ws) wsInstance = null;
+        if (!wsShouldReconnect || lifecycleToken !== wsLifecycleToken) return;
         store.set((s) => ({ ...s, wsConnected: false }));
         termLog({
           kind: "system",
           status: "disconnected",
           message: `WebSocket disconnected, retrying in ${wsRetryDelay / 1000}s`,
         });
-        setTimeout(connectWS, wsRetryDelay);
-        wsRetryDelay = Math.min(wsRetryDelay * 2, WS_MAX_DELAY);
+        scheduleWSReconnect(lifecycleToken);
       };
       ws.onerror = () => {};
       ws.onmessage = (e) => {
+        if (!wsShouldReconnect || lifecycleToken !== wsLifecycleToken || wsInstance !== ws) {
+          return;
+        }
         try {
           handleEvent(JSON.parse(e.data));
         } catch (err) {
@@ -1170,9 +1238,80 @@ function connectWS() {
       };
     })
     .catch(() => {
+      if (!wsShouldReconnect || lifecycleToken !== wsLifecycleToken) return;
       store.set((s) => ({ ...s, wsConnected: false }));
-      setTimeout(connectWS, wsRetryDelay);
-      wsRetryDelay = Math.min(wsRetryDelay * 2, WS_MAX_DELAY);
+      scheduleWSReconnect(lifecycleToken);
+    });
+}
+
+function startWS() {
+  stopWS();
+  wsRetryDelay = 2000;
+  wsShouldReconnect = true;
+  connectWS(wsLifecycleToken);
+}
+
+async function resyncTrackedExecutionsAfterReconnect() {
+  const reconnectTargets = reconnectResyncTargets(store.get());
+  if (!reconnectTargets.length) return;
+
+  const results = await Promise.all(
+    reconnectTargets.map(async ({ executionId, target }) => {
+      try {
+        const status = await api.status(executionId);
+        return { executionId, target, status, error: null };
+      } catch (error) {
+        return { executionId, target, status: null, error };
+      }
+    }),
+  );
+
+  for (const result of results) {
+    if (result.status) {
+      applyExecutionStatusSnapshot(
+        result.executionId,
+        result.status,
+        result.target,
+      );
+      if (isTerminalExecutionStatus(result.status)) {
+        finishTrackedExecution(result.executionId);
+      }
+      continue;
+    }
+
+    if (String(result.error).includes("404")) {
+      finishTrackedExecution(result.executionId);
+      continue;
+    }
+
+    termLog(
+      `Execution ${result.executionId} reconnect resync failed: ${result.error}`,
+      "warn",
+    );
+  }
+}
+
+function requestExecutionStatusResync(executionId) {
+  if (!executionId || pendingExecutionResyncs.has(executionId)) return;
+  pendingExecutionResyncs.add(executionId);
+  api.status(executionId)
+    .then((status) => {
+      if (!status) return;
+      const target = store.get().executionTargets?.[executionId] || null;
+      applyExecutionStatusSnapshot(executionId, status, target);
+      if (isTerminalExecutionStatus(status)) {
+        finishTrackedExecution(executionId);
+      }
+    })
+    .catch((error) => {
+      if (String(error).includes("404")) {
+        finishTrackedExecution(executionId);
+        return;
+      }
+      termLog(`Execution ${executionId} resync failed: ${error}`, "warn");
+    })
+    .finally(() => {
+      pendingExecutionResyncs.delete(executionId);
     });
 }
 
@@ -1199,6 +1338,16 @@ function handleEvent(evt) {
       };
     }
     const k = resolveCellKey(d, ns);
+    if (
+      shouldRequestExecutionResync({
+        eventType: type,
+        executionId: d.execution_id,
+        cellKey: k,
+        executionTarget: d.execution_id ? ns.executionTargets[d.execution_id] || null : null,
+      })
+    ) {
+      requestExecutionStatusResync(d.execution_id);
+    }
     if (
       k &&
       d.execution_id &&
@@ -1316,25 +1465,14 @@ function handleEvent(evt) {
         if (d.path) {
           const dir = watchedDirForPath(d.path);
           const projectId = store.get().currentProject?.id || null;
-          api
-            .listFiles(dir, projectId)
-            .then((entries) => {
-              store.set((s2) => ({
-                ...s2,
-                fileTree: {
-                  ...s2.fileTree,
-                  [dir]: { entries, expanded: true },
-                },
-              }));
-            })
-            .catch(() => {});
+          queueFileTreeRefresh(dir, projectId);
         }
         break;
       case "ExecutionStarted":
         termLog({
           kind: "execution",
           status: "started",
-          scope: executionEventScope(d),
+          scope: executionLifecycleScope(d),
         });
         break;
       case "ExecutionCompleted":
@@ -1350,7 +1488,7 @@ function handleEvent(evt) {
         termLog({
           kind: "execution",
           status: "done",
-          scope: executionEventScope(d),
+          scope: executionLifecycleScope(d),
           duration_ms: d.duration_ms ?? null,
         });
         break;
@@ -1368,7 +1506,7 @@ function handleEvent(evt) {
           {
             kind: "execution",
             status: "failed",
-            scope: executionEventScope(d),
+            scope: executionLifecycleScope(d),
           },
           "error",
         );
@@ -1417,13 +1555,13 @@ function handleEvent(evt) {
           }),
           message:
             d.kernel_state === "switching"
-              ? `Preparing branch ${d.branch_id}`
+              ? "preparing runtime"
               : d.kernel_state === "ready"
-                ? `Runtime ready for branch ${d.branch_id}`
+                ? "runtime ready"
                 : d.kernel_state === "needs_replay"
-                  ? `Runtime for branch ${d.branch_id} needs replay`
+                  ? "marked for replay"
                   : d.kernel_state === "kernel_lost"
-                    ? `Kernel lost for branch ${d.branch_id}`
+                    ? "kernel lost"
                     : null,
         });
         break;
@@ -1436,16 +1574,16 @@ function handleEvent(evt) {
       "TreeRuntimeStateChanged",
     ]);
     if (d.tree_id && runtimeEventTypes.has(type)) {
-      api
-        .treeRuntimeState(d.tree_id)
-        .then((runtimeState) => {
-          store.set((s2) => ({
-            ...s2,
-            treeRuntimeStates: {
-              ...s2.treeRuntimeStates,
-              [d.tree_id]: runtimeState,
-            },
-          }));
+      refreshTreeRuntimeSnapshot(d.tree_id)
+        .then(({ runtimeState }) => {
+          const snapshot = store.get();
+          const tree = (snapshot.experimentTrees || []).find(
+            (item) => item.id === d.tree_id,
+          );
+          const branchId = tree
+            ? pickActiveBranchId(tree, snapshot.activeBranchId, runtimeState)
+            : d.branch_id || runtimeState?.active_branch_id || null;
+          maybeMarkBranchReplayRequired(d.tree_id, branchId, runtimeState);
         })
         .catch(() => {});
     }
@@ -1463,22 +1601,140 @@ async function loadProjects() {
   }
 }
 
+async function refreshTreeRuntimeSnapshot(treeId) {
+  if (!treeId) return { runtimeState: null, runtimeHealth: null };
+  const previousId = latestRuntimeSnapshotRequestIds.get(treeId) || 0;
+  const requestId = nextAsyncRequestId(previousId);
+  latestRuntimeSnapshotRequestIds.set(treeId, requestId);
+  const [runtimeState, runtimeHealth] = await Promise.all([
+    api.treeRuntimeState(treeId).catch(() => null),
+    api.inspectTreeKernel(treeId).catch(() => null),
+  ]);
+  if (
+    !shouldApplyScopedRequestResult({
+      requestId,
+      latestRequestId: latestRuntimeSnapshotRequestIds.get(treeId) || 0,
+      requestScope: treeId,
+      currentScope: (store.get().experimentTrees || []).some((tree) => tree.id === treeId)
+        ? treeId
+        : null,
+    })
+  ) {
+    return { runtimeState, runtimeHealth };
+  }
+  store.set((s) => ({
+    ...s,
+    treeRuntimeStates: {
+      ...s.treeRuntimeStates,
+      [treeId]: runtimeState,
+    },
+    treeKernelHealth: {
+      ...s.treeKernelHealth,
+      [treeId]: runtimeHealth,
+    },
+  }));
+  return { runtimeState, runtimeHealth };
+}
+
+async function fetchAndStoreFileTreeDir(
+  dirPath,
+  projectId,
+  { errorPrefix = "Files" } = {},
+) {
+  const dirKey = normalizeFileTreePath(dirPath);
+  const refreshScope = fileTreeRefreshKey(dirKey, projectId);
+  const requestId = nextAsyncRequestId(
+    latestFileTreeRefreshRequestIds.get(refreshScope) || 0,
+  );
+  latestFileTreeRefreshRequestIds.set(refreshScope, requestId);
+
+  try {
+    const entries = await api.listFiles(dirKey, projectId);
+    if (
+      !shouldApplyScopedRequestResult({
+        requestId,
+        latestRequestId: latestFileTreeRefreshRequestIds.get(refreshScope),
+        requestScope: refreshScope,
+        currentScope: fileTreeRefreshKey(
+          dirKey,
+          store.get().currentProject?.id || null,
+        ),
+      })
+    ) {
+      return entries;
+    }
+
+    store.set((s) => ({
+      ...s,
+      fileTree: { ...s.fileTree, [dirKey]: { entries, expanded: true } },
+    }));
+    return entries;
+  } catch (error) {
+    termLog(`${errorPrefix}: ${error}`, "error");
+    return null;
+  }
+}
+
+function queueFileTreeRefresh(dirPath, projectId, delayMs = 75) {
+  const dirKey = normalizeFileTreePath(dirPath);
+  const registration = registerPendingFileTreeRefresh(
+    new Set(pendingFileTreeRefreshes.keys()),
+    dirKey,
+    projectId,
+  );
+  if (!registration.shouldSchedule) return;
+
+  const refreshKey = registration.refreshKey;
+  const timerId = setTimeout(async () => {
+    pendingFileTreeRefreshes.delete(refreshKey);
+    await fetchAndStoreFileTreeDir(dirKey, projectId, { errorPrefix: "Files" });
+  }, delayMs);
+  pendingFileTreeRefreshes.set(refreshKey, timerId);
+}
+
+function clearPendingFileTreeRefreshes() {
+  for (const timerId of pendingFileTreeRefreshes.values()) {
+    clearTimeout(timerId);
+  }
+  pendingFileTreeRefreshes.clear();
+}
+
 async function loadExperiments() {
   const project = store.get().currentProject;
   if (!project) return;
+  const requestId = nextAsyncRequestId(latestExperimentsRequestId);
+  latestExperimentsRequestId = requestId;
+  const requestProjectId = project.id || null;
   try {
     const rawTrees = await api.experimentTrees().catch(() => []);
     const trees = (rawTrees || []).filter(
-      (tree) => !project?.id || tree.project_id === project.id,
+      (tree) => !requestProjectId || tree.project_id === requestProjectId,
+    );
+    const runtimeEntries = await Promise.all(
+      trees.map(async (tree) => {
+        const [runtimeState, runtimeHealth] = await Promise.all([
+          api.treeRuntimeState(tree.id).catch(() => null),
+          api.inspectTreeKernel(tree.id).catch(() => null),
+        ]);
+        return [tree.id, { runtimeState, runtimeHealth }];
+      }),
     );
     const runtimeStates = Object.fromEntries(
-      await Promise.all(
-        trees.map(async (tree) => [
-          tree.id,
-          await api.treeRuntimeState(tree.id).catch(() => null),
-        ]),
-      ),
+      runtimeEntries.map(([treeId, snapshot]) => [treeId, snapshot.runtimeState]),
     );
+    const treeKernelHealth = Object.fromEntries(
+      runtimeEntries.map(([treeId, snapshot]) => [treeId, snapshot.runtimeHealth]),
+    );
+    if (
+      !shouldApplyScopedRequestResult({
+        requestId,
+        latestRequestId: latestExperimentsRequestId,
+        requestScope: requestProjectId,
+        currentScope: store.get().currentProject?.id || null,
+      })
+    ) {
+      return trees;
+    }
     store.set((s) => {
       const activeId = s.activeExperiment?.id;
       const activeExperiment = activeId
@@ -1498,6 +1754,7 @@ async function loadExperiments() {
         activeTreeId: activeExperiment?.id || null,
         activeBranchId,
         treeRuntimeStates: runtimeStates,
+        treeKernelHealth,
       };
     });
     return trees;
@@ -1512,8 +1769,9 @@ async function pollExecution(execId, runtimeId, nodeIds) {
     if (
       !(execId in store.get().activePollIds) ||
       store.get().activePollIds[execId] === false
-    )
+    ) {
       return;
+    }
     await new Promise((r) => setTimeout(r, 1000));
     try {
       const st = await api.status(execId);
@@ -1588,46 +1846,38 @@ async function pollExecution(execId, runtimeId, nodeIds) {
     }
   }
   const wsConnected = store.get().wsConnected;
+  const expiry = resolvePollWindowExpiry({
+    currentStatus: null,
+    wsConnected,
+  });
   if (targetNodes.length && !wsConnected) {
     const executionTarget = store.get().executionTargets?.[execId] || null;
-    for (const nid of targetNodes) {
-      const k = runtimeCellKey({
-        runtimeId,
-        treeId: executionTarget?.treeId || null,
-        branchId: executionTarget?.branchId || null,
-        nodeId: nid,
-      });
-      store.set((s) => ({
-        ...s,
-        cellStatuses: {
-          ...s.cellStatuses,
-          [k]: s.cellStatuses[k] === "running" ? "timeout" : s.cellStatuses[k],
-        },
-        cellLogs: {
-          ...s.cellLogs,
-          [k]: {
-            ...(s.cellLogs[k] || {}),
-            error: {
-              ename: "Timeout",
-              evalue: "Execution polling timed out after 120s",
-              traceback: [],
-            },
-          },
-        },
-      }));
-    }
-  } else if (targetNodes.length) {
-    termLog(
-      `Execution ${execId} polling window ended; waiting for WebSocket updates`,
-      "info",
-    );
+    store.set((s) => {
+      let cellStatuses = s.cellStatuses;
+      for (const nid of targetNodes) {
+        const k = runtimeCellKey({
+          runtimeId,
+          treeId: executionTarget?.treeId || null,
+          branchId: executionTarget?.branchId || null,
+          nodeId: nid,
+        });
+        if (!k) continue;
+        const next = resolvePollWindowExpiry({
+          currentStatus: s.cellStatuses[k] || null,
+          wsConnected: false,
+        });
+        if (next.shouldUpdateStatus && next.nextStatus !== s.cellStatuses[k]) {
+          if (cellStatuses === s.cellStatuses) cellStatuses = { ...s.cellStatuses };
+          cellStatuses[k] = next.nextStatus;
+        }
+      }
+      return cellStatuses === s.cellStatuses ? s : { ...s, cellStatuses };
+    });
   }
   finishTrackedExecution(execId);
   termLog(
-    wsConnected
-      ? `Execution ${execId} poll window ended`
-      : `Execution ${execId} polling timed out`,
-    wsConnected ? "info" : "error",
+    `Execution ${execId} ${expiry.logMessage}`,
+    expiry.logLevel,
   );
 }
 
@@ -1811,6 +2061,7 @@ function Cell({
   const saveT = useRef(null);
   const latestCode = useRef(code);
   const saveInFlight = useRef(null);
+  const terminalLogHydrationRef = useRef(null);
   const textareaRef = useRef(null);
   const branchLocked =
     readOnly;
@@ -1818,6 +2069,14 @@ function Cell({
     (experimentTrees || []).find(
       (tree) => tree.id === (activeTreeId || runtimePid),
     ) || null;
+  const activateBranchContext = useCallback(() => {
+    if (!treeExecutionBranchId) return;
+    store.set((s) =>
+      s.activeBranchId === treeExecutionBranchId
+        ? s
+        : { ...s, activeBranchId: treeExecutionBranchId },
+    );
+  }, [treeExecutionBranchId]);
 
   // Hard reset when the cell identity changes (e.g. switching to a different
   // notebook cell).
@@ -2088,28 +2347,41 @@ function Cell({
   ]);
 
   useEffect(() => {
-    if (status === "done" || status === "failed" || status === "cached") {
-      const loadLogs =
-        isTreeExecutionRuntime && treeContext?.treeId && treeExecutionBranchId
-          ? api.treeCellLogs(treeContext.treeId, treeExecutionBranchId, nid)
-          : Promise.resolve(null);
-      loadLogs
-        .then((l) => {
-          if (!l || !hasLogContent(l)) return;
-          store.set((s) => ({
-            ...s,
-            cellLogs: { ...s.cellLogs, [key]: mergeLogs(s.cellLogs[key], l) },
-          }));
-        })
-        .catch(() => {});
+    const treeId = treeContext?.treeId || null;
+    const hydrationKey = `${key}:${status}`;
+    if (
+      !shouldHydrateTerminalLogs({
+        status,
+        logs,
+        hydrationKey,
+        loadedHydrationKey: terminalLogHydrationRef.current,
+        isTreeExecutionRuntime,
+        treeId,
+        branchId: treeExecutionBranchId,
+      })
+    ) {
+      return;
     }
+
+    terminalLogHydrationRef.current = hydrationKey;
+    api.treeCellLogs(treeId, treeExecutionBranchId, nid)
+      .then((l) => {
+        if (!l || !hasLogContent(l)) return;
+        store.set((s) => ({
+          ...s,
+          cellLogs: { ...s.cellLogs, [key]: mergeLogs(s.cellLogs[key], l) },
+        }));
+      })
+      .catch(() => {
+        terminalLogHydrationRef.current = null;
+      });
   }, [
     status,
-    runtimePid,
+    logs,
     nid,
     key,
     isTreeExecutionRuntime,
-    treeContext,
+    treeContext?.treeId,
     treeExecutionBranchId,
   ]);
 
@@ -2128,6 +2400,8 @@ function Cell({
               ? "✗"
               : status === "cached"
                 ? "⚡"
+                : status === "stale"
+                  ? "↺"
                 : status === "timeout"
                   ? "⏱"
                   : "○";
@@ -2136,6 +2410,8 @@ function Cell({
       ? "running"
       : status === "done" || status === "cached"
         ? "done"
+        : status === "stale"
+          ? "stale"
         : status === "failed" || status === "timeout" || status === "save_error"
           ? "failed"
           : "idle";
@@ -2148,6 +2424,8 @@ function Cell({
         ? "Done"
         : status === "cached"
           ? "Cached"
+          : status === "stale"
+            ? "Needs replay"
           : status === "timeout"
             ? "Timed out"
             : status === "save_error"
@@ -2175,7 +2453,7 @@ function Cell({
         </span>`;
 
   return html`
-    <div class="cell-shell" ref=${shellRef}>
+    <div class="cell-shell" ref=${shellRef} onClick=${activateBranchContext}>
       <div class="notebook-cell">
         <div class="cell-header">
           <span class="cell-number">In[${index + 1}]</span>
@@ -2188,6 +2466,7 @@ function Cell({
         <div
           class="cell-code ${!code.trim() ? "empty" : ""}"
           onClick=${() => {
+            activateBranchContext();
             if (!readOnly) textareaRef.current?.focus();
           }}
         >
@@ -2341,7 +2620,7 @@ function renderOutput(logs, idx, status, executionProgress = null) {
         ${safeLogs.stdout
           ? html`<pre class="output-text">${stripAnsi(safeLogs.stdout)}</pre>`
           : null}
-        ${safeLogs.stderr
+        ${shouldRenderStderr(safeLogs)
           ? html`<pre class="output-text out-stderr">
 ${stripAnsi(safeLogs.stderr)}</pre
             >`
@@ -2647,6 +2926,7 @@ function getExpStatus(exp) {
     return "running";
   if (sts.some((s) => s === "failed" || s === "timeout" || s === "save_error"))
     return "failed";
+  if (sts.some((s) => s === "stale")) return "stale";
   if (sts.length && sts.every((s) => s === "done" || s === "cached"))
     return "done";
   return "idle";
@@ -2659,21 +2939,15 @@ function FilesPanel() {
   const project = useStore((s) => s.currentProject);
 
   useEffect(() => {
+    clearPendingFileTreeRefreshes();
     store.set((s) => ({ ...s, fileTree: {}, filePreview: null }));
     loadDir("");
   }, [project?.id]);
 
   async function loadDir(path) {
-    try {
-      const dirKey = normalizeFileTreePath(path);
-      const entries = await api.listFiles(dirKey, project?.id);
-      store.set((s) => ({
-        ...s,
-        fileTree: { ...s.fileTree, [dirKey]: { entries, expanded: true } },
-      }));
-    } catch (e) {
-      termLog(`Files: ${e}`, "error");
-    }
+    await fetchAndStoreFileTreeDir(path, project?.id || null, {
+      errorPrefix: "Files",
+    });
   }
 
   function toggle(path, isDir) {
@@ -2846,6 +3120,10 @@ function Sidebar() {
   const tab = useStore((s) => s.sidebarTab);
   const collapsed = useStore((s) => s.sidebarCollapsed);
   const goHome = () => {
+    if ((window.location.hash || "#/") === "#/") {
+      navigateFromHash();
+      return;
+    }
     window.location.hash = "/";
   };
   const setTab = (t) => store.set((s) => ({ ...s, sidebarTab: t }));
@@ -3118,6 +3396,9 @@ function NotebookView() {
   const experimentTrees = useStore((s) => s.experimentTrees);
   const activeTreeId = useStore((s) => s.activeTreeId);
   const activeBranchId = useStore((s) => s.activeBranchId);
+  const treeRuntimeStates = useStore((s) => s.treeRuntimeStates);
+  const treeKernelHealth = useStore((s) => s.treeKernelHealth);
+  const executionStatuses = useStore((s) => s.executionStatuses);
   const project = useStore((s) => s.currentProject);
   const activePipeline = ae || experiments[0] || null;
   const activeTree =
@@ -3145,6 +3426,20 @@ function NotebookView() {
         (branch) => branch.id === (activeBranchId || activeTree.root_branch_id),
       ) || null
     : null;
+  const selectedRuntimeState = activeTree ? treeRuntimeStates?.[activeTree.id] || null : null;
+  const selectedKernelHealth = activeTree ? treeKernelHealth?.[activeTree.id] || null : null;
+  const selectedBranchId = selectedBranch?.id || activeTree?.root_branch_id || null;
+  const runtimeMenuRef = useRef(null);
+  const [runtimeMenuOpen, setRuntimeMenuOpen] = useState(false);
+  const selectedBranchRequiresReplay = activeTree && selectedBranchId
+    ? branchRequiresReplay({
+        treeId: activeTree.id,
+        branchId: selectedBranchId,
+        runtimeState: selectedRuntimeState,
+        runtimeHealth: selectedKernelHealth,
+        executionStatuses,
+      })
+    : false;
   const activeExecutionId =
     selectedBranch && activeTree
       ? activeBranchPathCellIds(activeTree, selectedBranch.id)
@@ -3158,6 +3453,24 @@ function NotebookView() {
           .map((cellKey) => store.get().activeCellExecutions[cellKey])
           .find(Boolean)
       : null;
+  const kernelState = String(
+    selectedRuntimeState?.kernel_state || selectedRuntimeState?.kernelState || "",
+  )
+    .trim()
+    .toLowerCase();
+  const hasLiveKernel =
+    selectedKernelHealth?.has_live_kernel ?? selectedKernelHealth?.hasLiveKernel ?? false;
+  const runtimeUi = deriveRuntimeUi({
+    kernelState,
+    hasLiveKernel,
+    isBusy: Boolean(activeExecutionId),
+  });
+  const selectedRunBlocked = !activeExecutionId && selectedBranchRequiresReplay && runtimeUi.runBlocked;
+  const selectedRunTitle = selectedRunBlocked
+    ? "Replay required in the live kernel. Restart or turn off the kernel to start this branch cleanly."
+    : runtimeUi.tone === "muted"
+      ? "Run selected branch from a fresh kernel"
+      : "Run selected branch";
 
   useEffect(() => {
     if (!exportMenuBranchKey) return;
@@ -3172,7 +3485,20 @@ function NotebookView() {
   }, [exportMenuBranchKey]);
 
   useEffect(() => {
+    if (!runtimeMenuOpen) return;
+    const onMouseDown = (event) => {
+      const menu = runtimeMenuRef.current;
+      if (!menu?.contains(event.target)) {
+        setRuntimeMenuOpen(false);
+      }
+    };
+    window.addEventListener("mousedown", onMouseDown);
+    return () => window.removeEventListener("mousedown", onMouseDown);
+  }, [runtimeMenuOpen]);
+
+  useEffect(() => {
     setExportMenuBranchKey(null);
+    setRuntimeMenuOpen(false);
   }, [activeTree?.id, activeBranchId]);
 
   useEffect(() => {
@@ -3353,12 +3679,90 @@ function NotebookView() {
     }
   };
 
+  const refreshSelectedRuntime = async () => {
+    if (!activeTree?.id) return;
+    const { runtimeState } = await refreshTreeRuntimeSnapshot(activeTree.id);
+    if (selectedBranchId) {
+      maybeMarkBranchReplayRequired(activeTree.id, selectedBranchId, runtimeState);
+    }
+  };
+
+  const restartKernel = async () => {
+    if (!activeTree?.id) return;
+    try {
+      await api.restartTreeKernel(activeTree.id);
+      await refreshSelectedRuntime();
+      setRuntimeMenuOpen(false);
+      showToast("Kernel restarted");
+    } catch (e) {
+      termLog(`Restart kernel: ${e}`, "error");
+    }
+  };
+
+  const shutdownKernel = async () => {
+    if (!activeTree?.id) return;
+    try {
+      await api.shutdownTreeKernel(activeTree.id);
+      await refreshSelectedRuntime();
+      setRuntimeMenuOpen(false);
+      showToast("Kernel turned off");
+    } catch (e) {
+      termLog(`Turn off kernel: ${e}`, "error");
+    }
+  };
+
+  const handleRuntimeAction = async (actionId) => {
+    if (actionId === "restart") {
+      await restartKernel();
+      return;
+    }
+    if (actionId === "shutdown") {
+      await shutdownKernel();
+    }
+  };
+
   return html`
     <div class="notebook-page">
       <div class="notebook-toolbar">
         <div class="notebook-toolbar-left">
-          <div class="notebook-toolbar-title">
-            ${activePipeline.name || activePipeline.id.slice(0, 8)}
+          <div class="notebook-toolbar-title-row">
+            <div class="notebook-toolbar-title">
+              ${activePipeline.name || activePipeline.id.slice(0, 8)}
+            </div>
+            ${activeExecutionId
+              ? html`<button
+                  class="titlebar-btn btn btn-secondary btn-danger"
+                  onClick=${() => cancelExecutionById(activeExecutionId)}
+                  title="Terminate active run"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      d="M7 7h10v10H7z"
+                      fill="currentColor"
+                    />
+                  </svg>
+                  Terminate
+                </button>`
+              : null}
+            <button
+              class="titlebar-btn btn btn-primary"
+              onClick=${runSelected}
+              disabled=${selectedRunBlocked}
+              title=${selectedRunTitle}
+            >
+              <${GitBranch} size=${15} strokeWidth=${2} /> Run Branch
+            </button>
+            ${activeTree && (activeTree.branches || []).length > 1
+              ? html`
+                  <button
+                    class="titlebar-btn btn btn-secondary"
+                    onClick=${runAllBranches}
+                    title="Run every branch from scratch"
+                  >
+                    <${Play} size=${15} strokeWidth=${2} /> Run All
+                  </button>
+                `
+              : null}
           </div>
           ${selectedBranch &&
           activeTree &&
@@ -3369,38 +3773,57 @@ function NotebookView() {
             : null}
         </div>
         <div class="notebook-toolbar-actions">
-          ${activeExecutionId
-            ? html`<button
-                class="titlebar-btn btn btn-secondary btn-danger"
-                onClick=${() => cancelExecutionById(activeExecutionId)}
-                title="Terminate active run"
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path
-                    d="M7 7h10v10H7z"
-                    fill="currentColor"
-                  />
-                </svg>
-                Terminate
-              </button>`
-            : null}
-          <button
-            class="titlebar-btn btn btn-primary"
-            onClick=${runSelected}
-            title="Run selected branch"
-          >
-            <${GitBranch} size=${15} strokeWidth=${2} /> Run Branch
-          </button>
-          ${activeTree && (activeTree.branches || []).length > 1
-            ? html`
+          ${activeTree
+            ? html`<div class="kernel-control" ref=${runtimeMenuRef}>
                 <button
-                  class="titlebar-btn btn btn-secondary"
-                  onClick=${runAllBranches}
-                  title="Run every branch from scratch"
+                  class="kernel-light kernel-light--${runtimeUi.tone} btn btn-secondary"
+                  onClick=${() =>
+                    runtimeUi.menuActions.length
+                      ? setRuntimeMenuOpen((open) => !open)
+                      : null}
+                  title=${runtimeUi.title}
+                  aria-label=${runtimeUi.label}
+                  aria-expanded=${runtimeUi.menuActions.length ? runtimeMenuOpen : undefined}
+                  disabled=${runtimeUi.menuActions.length === 0}
                 >
-                  <${Play} size=${15} strokeWidth=${2} /> Run All
+                  <span class="kernel-light-dot" aria-hidden="true"></span>
+                  <span class="kernel-light-label">${runtimeUi.label}</span>
+                  ${runtimeUi.menuActions.length
+                    ? html`<svg
+                        class="kernel-light-chevron ${runtimeMenuOpen
+                          ? "is-open"
+                          : ""}"
+                        viewBox="0 0 12 12"
+                        aria-hidden="true"
+                      >
+                        <path
+                          d="M3 4.5l3 3 3-3"
+                          stroke="currentColor"
+                          stroke-width="1.5"
+                          fill="none"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        />
+                      </svg>`
+                    : null}
                 </button>
-              `
+                ${runtimeMenuOpen && runtimeUi.menuActions.length
+                  ? html`<div class="ctx-menu kernel-menu kernel-menu--right">
+                      ${runtimeUi.menuActions.map(
+                        (action) => html`<button
+                          key=${action.id}
+                          class="ctx-item ${action.kind === "danger" ? "danger" : ""}"
+                          onClick=${(e) => {
+                            e.stopPropagation();
+                            handleRuntimeAction(action.id);
+                          }}
+                        >
+                          ${action.label}
+                        </button>`,
+                      )}
+                    </div>`
+                  : null}
+              </div>`
             : null}
         </div>
       </div>
@@ -3775,7 +4198,11 @@ function Dashboard() {
   };
 
   const pick = (p) => {
-    store.set((s) => ({ ...s, currentProject: p, view: "notebook" }));
+    const nextHash = `#/projects/${p.id}`;
+    if ((window.location.hash || "#/") === nextHash) {
+      navigateFromHash();
+      return;
+    }
     window.location.hash = `/projects/${p.id}`;
   };
 
@@ -3962,7 +4389,76 @@ function parseHash() {
   return { route: "dashboard" };
 }
 
+class UiErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, errorMessage: "" };
+  }
+
+  componentDidCatch(error) {
+    const errorMessage = String(error?.message || error || "Unknown UI error");
+    this.setState({ hasError: true, errorMessage });
+    termLog(
+      {
+        kind: "system",
+        status: "ui_error",
+        message: `UI render failure: ${errorMessage}`,
+        error: {
+          ename: error?.name || "UiError",
+          evalue: errorMessage,
+          traceback: [],
+        },
+      },
+      "error",
+    );
+  }
+
+  componentDidUpdate(previousProps) {
+    if (
+      this.state.hasError &&
+      previousProps.resetKey !== this.props.resetKey
+    ) {
+      this.setState({ hasError: false, errorMessage: "" });
+    }
+  }
+
+  render() {
+    if (!this.state.hasError) {
+      return this.props.children;
+    }
+
+    return html`
+      <div class="app notebook-app">
+        <div class="main-content">
+          <div class="notebook-container">
+            <div class="notebook-empty">
+              <div class="empty-message">
+                <h3>UI error</h3>
+                <p>${this.state.errorMessage || "A render failure interrupted the current view."}</p>
+                <div class="empty-actions">
+                  <button class="btn btn-primary" onClick=${() => window.location.reload()}>
+                    Reload
+                  </button>
+                  <button class="btn btn-secondary" onClick=${() => {
+                    this.setState({ hasError: false, errorMessage: "" });
+                    window.location.hash = "/";
+                  }}>
+                    Back to projects
+                  </button>
+                </div>
+              </div>
+            </div>
+            <${LogPanel} />
+          </div>
+        </div>
+        <${Toast} />
+      </div>
+    `;
+  }
+}
+
 async function navigateFromHash() {
+  const navigationId = ++activeNavigationId;
   const { route, projectId, expId } = parseHash();
   if (route === "dashboard") {
     store.set((s) => ({
@@ -3980,8 +4476,10 @@ async function navigateFromHash() {
   if (route === "project" && projectId) {
     try {
       const proj = await api.project(projectId);
+      if (navigationId !== activeNavigationId) return;
       store.set((s) => ({ ...s, currentProject: proj, view: "notebook" }));
       const experiments = await loadExperiments();
+      if (navigationId !== activeNavigationId) return;
       if (expId) {
         const exp =
           (store.get().experimentTrees || []).find((tree) => tree.id === expId) ||
@@ -3992,6 +4490,7 @@ async function navigateFromHash() {
         setActiveExperimentState(experiments[0]);
       }
     } catch (e) {
+      if (navigationId !== activeNavigationId) return;
       termLog(`Navigate: ${e}`, "error");
       store.set((s) => ({ ...s, view: "dashboard" }));
     }
@@ -4010,7 +4509,7 @@ function App() {
     const saved = localStorage.getItem("tine-theme");
     if (saved) document.documentElement.setAttribute("data-theme", saved);
 
-    connectWS();
+    startWS();
     navigateFromHash();
     window.addEventListener("hashchange", navigateFromHash);
 
@@ -4019,7 +4518,10 @@ function App() {
         .then((info) => store.set((s) => ({ ...s, serverInfo: info })))
         .catch(() => {});
     }
-    return () => window.removeEventListener("hashchange", navigateFromHash);
+    return () => {
+      window.removeEventListener("hashchange", navigateFromHash);
+      stopWS();
+    };
   }, []);
 
   useEffect(() => {
@@ -4089,4 +4591,7 @@ function ServerFallbackChip() {
   `;
 }
 
-render(html`<${App} />`, document.getElementById("root"));
+render(
+  html`<${UiErrorBoundary} resetKey=${window.location.hash || "#/"}><${App} /></${UiErrorBoundary}>`,
+  document.getElementById("root"),
+);

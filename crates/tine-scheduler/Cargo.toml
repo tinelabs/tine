@@ -10,6 +10,7 @@ tine-graph.workspace = true
 tine-kernel.workspace = true
 tine-catalog.workspace = true
 tine-env.workspace = true
+tine-observe.workspace = true
 tokio.workspace = true
 dashmap.workspace = true
 tracing.workspace = true

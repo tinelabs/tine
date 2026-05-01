@@ -16,6 +16,9 @@ use tine_core::{
 use tine_env::{EnvironmentManager, TreeEnvironmentDescriptor};
 use tine_graph::ExecutableTreeGraph;
 use tine_kernel::{KernelExecutionResult, KernelManager};
+use tine_observe::{
+    OutcomeTimer, METRIC_ARTIFACT_PERSIST_SLOT_COUNT, METRIC_ARTIFACT_PERSIST_TOTAL,
+};
 
 // Metric name constants (matching tine-observe)
 const M_NODES_EXECUTED: &str = "tine_nodes_executed_total";
@@ -315,7 +318,7 @@ impl Scheduler {
             .await?;
 
         // Plan execution (cache check)
-        let (to_execute, to_skip) = graph.plan_execution(branch, cache, lockfile_hash);
+        let (mut to_execute, to_skip) = graph.plan_execution(branch, cache, lockfile_hash);
 
         info!(
             execution = %execution_id,
@@ -350,10 +353,12 @@ impl Scheduler {
 
         // Track per-node artifact keys (populated by execution or cache)
         let mut node_artifacts: HashMap<NodeId, HashMap<SlotName, ArtifactKey>> = HashMap::new();
+        let mut usable_cache_hits = Vec::new();
 
         // Inject cached artifacts for skipped (cache-hit) nodes
         for node_id in &to_skip {
             let cell = Self::cell_by_node_id(branch, node_id);
+            let mut cache_ready = true;
 
             // Find the matching cache entry for this node
             let code_hash = NodeCacheKey::hash_code(&cell.code.source);
@@ -362,27 +367,74 @@ impl Scheduler {
             if let Some((_, artifacts)) = matching_entry {
                 // Inject each output artifact into the kernel namespace via _pf_load_artifact
                 for slot in &cell.outputs {
-                    if let Some(artifact_key) = artifacts.get(slot) {
-                        if let Some(path) = self.catalog.get_path(artifact_key) {
-                            let inject_code = format!(
-                                "{} = _pf_load_artifact('{}')",
-                                slot.as_str(),
-                                path.display()
-                            );
-                            debug!(
+                    let Some(artifact_key) = artifacts.get(slot) else {
+                        cache_ready = false;
+                        warn!(node = %node_id, slot = %slot, "cache entry missing declared output slot");
+                        break;
+                    };
+                    let Some(path) = self.catalog.get_path(artifact_key) else {
+                        cache_ready = false;
+                        warn!(
+                            node = %node_id,
+                            slot = %slot,
+                            artifact = %artifact_key,
+                            "cached artifact missing on disk; falling back to execution"
+                        );
+                        break;
+                    };
+
+                    let inject_code = format!(
+                        "{} = _pf_load_artifact('{}')",
+                        slot.as_str(),
+                        path.display()
+                    );
+                    debug!(
+                        node = %node_id,
+                        slot = %slot,
+                        artifact = %artifact_key,
+                        "injecting cached artifact"
+                    );
+                    match self.kernel_mgr.execute_tree_code(&tree_id, &inject_code).await {
+                        Ok(result) if result.error.is_none() => {}
+                        Ok(result) => {
+                            cache_ready = false;
+                            let error = result
+                                .error
+                                .map(|err| format!("{}: {}", err.ename, err.evalue))
+                                .unwrap_or_else(|| "unknown python error".to_string());
+                            warn!(
                                 node = %node_id,
                                 slot = %slot,
                                 artifact = %artifact_key,
-                                "injecting cached artifact"
+                                error = %error,
+                                "cached artifact injection raised python error; falling back to execution"
                             );
-                            let _ = self
-                                .kernel_mgr
-                                .execute_tree_code(&tree_id, &inject_code)
-                                .await;
+                            break;
+                        }
+                        Err(err) => {
+                        cache_ready = false;
+                            warn!(
+                                node = %node_id,
+                                slot = %slot,
+                                artifact = %artifact_key,
+                                error = %err,
+                                "cached artifact injection failed; falling back to execution"
+                            );
+                            break;
                         }
                     }
                 }
-                node_artifacts.insert(node_id.clone(), artifacts.clone());
+                if cache_ready {
+                    node_artifacts.insert(node_id.clone(), artifacts.clone());
+                    usable_cache_hits.push(node_id.clone());
+                }
+            } else {
+                cache_ready = false;
+            }
+
+            if !cache_ready {
+                to_execute.push(node_id.clone());
+                continue;
             }
 
             metrics::counter!(M_NODES_CACHE_HIT).increment(1);
@@ -398,7 +450,7 @@ impl Scheduler {
         }
 
         // Execute nodes in topological order with parallelism
-        let mut completed: HashSet<NodeId> = to_skip.into_iter().collect();
+        let mut completed: HashSet<NodeId> = usable_cache_hits.into_iter().collect();
         let mut failed_nodes = Vec::new();
         let mut node_logs: HashMap<NodeId, NodeLogs> = HashMap::new();
         let mut node_statuses: HashMap<NodeId, NodeStatus> = HashMap::new();
@@ -898,6 +950,8 @@ async fn execute_cell(
     let artifact_dir = catalog.artifact_dir();
     let runtime_id = Scheduler::branch_runtime_id(branch);
 
+    let mut persist_timer = OutcomeTimer::start(METRIC_ARTIFACT_PERSIST_TOTAL);
+    metrics::histogram!(METRIC_ARTIFACT_PERSIST_SLOT_COUNT).record(cell.outputs.len() as f64);
     for slot in &cell.outputs {
         let artifact_path =
             artifact_dir.join(format!("{}-{}-{}.pkl", runtime_id, cell.cell_id, slot));
@@ -968,6 +1022,8 @@ except Exception as _pf_err:
             }
         }
     }
+    persist_timer.set_outcome("success");
+    drop(persist_timer);
 
     metrics::counter!(M_NODES_EXECUTED).increment(1);
     let _ = event_tx.send(ExecutionEvent::NodeCompleted {

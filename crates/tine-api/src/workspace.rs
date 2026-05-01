@@ -22,6 +22,10 @@ use tine_core::{
 };
 use tine_env::{EnvironmentManager, TreeEnvironmentDescriptor};
 use tine_kernel::{KernelIsolationOutcome, KernelLifecycleEvent, KernelManager};
+use tine_observe::{
+    OutcomeTimer, METRIC_PREPARE_CONTEXT_REPLAY, METRIC_PREPARE_CONTEXT_REPLAY_CELLS,
+    METRIC_PREPARE_CONTEXT_TOTAL,
+};
 use tine_scheduler::Scheduler;
 
 /// Parse SQLite datetime strings (both `YYYY-MM-DD HH:MM:SS` and RFC3339).
@@ -513,7 +517,8 @@ impl Workspace {
             .flatten();
         if let Some((status_json,)) = existing {
             if let Ok(status) = serde_json::from_str::<ExecutionStatus>(&status_json) {
-                if Self::normalize_execution_status(status).finished_at.is_some() {
+                let status = Self::normalize_execution_status(status);
+                if status.finished_at.is_some() || status.cancellation_requested_at.is_some() {
                     return;
                 }
             }
@@ -580,7 +585,8 @@ impl Workspace {
             .flatten();
         if let Some((status_json,)) = existing {
             if let Ok(status) = serde_json::from_str::<ExecutionStatus>(&status_json) {
-                if Self::normalize_execution_status(status).finished_at.is_some() {
+                let status = Self::normalize_execution_status(status);
+                if status.finished_at.is_some() || status.cancellation_requested_at.is_some() {
                     return;
                 }
             }
@@ -854,6 +860,53 @@ impl Workspace {
         Ok(())
     }
 
+    async fn await_cancellation_settle(
+        pool: &SqlitePool,
+        execution_id: &ExecutionId,
+    ) -> TineResult<()> {
+        const MAX_POLLS: usize = 40;
+        const POLL_DELAY_MS: u64 = 100;
+
+        for _ in 0..MAX_POLLS {
+            let row: Option<(String,)> =
+                sqlx::query_as("SELECT status FROM executions WHERE id = ?")
+                    .bind(execution_id.as_str())
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| TineError::Database(e.to_string()))?;
+            let Some((status_json,)) = row else {
+                return Ok(());
+            };
+
+            let status: ExecutionStatus =
+                Self::normalize_execution_status(serde_json::from_str(&status_json)?);
+            if status.finished_at.is_some() {
+                return Ok(());
+            }
+
+            let has_active_nodes = status.node_statuses.values().any(|node_status| {
+                matches!(
+                    node_status,
+                    NodeStatus::Pending | NodeStatus::Queued | NodeStatus::Running
+                )
+            });
+            if !has_active_nodes {
+                return Ok(());
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(POLL_DELAY_MS)).await;
+        }
+
+        warn!(
+            execution = %execution_id,
+            polls = MAX_POLLS,
+            poll_delay_ms = POLL_DELAY_MS,
+            "await_cancellation_settle reached poll budget while nodes were still active; \
+             proceeding to finalize anyway"
+        );
+        Ok(())
+    }
+
     async fn update_execution_status_record<F>(
         pool: &SqlitePool,
         execution_id: &ExecutionId,
@@ -964,6 +1017,48 @@ impl Workspace {
         (status, node_logs)
     }
 
+    fn reconcile_shutdown_execution_status(
+        mut status: ExecutionStatus,
+        mut node_logs: HashMap<NodeId, NodeLogs>,
+        reason: &str,
+        cancellation_requested_at: chrono::DateTime<Utc>,
+    ) -> (ExecutionStatus, HashMap<NodeId, NodeLogs>) {
+        status = Self::normalize_execution_status(status);
+        status.finished_at = Some(Utc::now());
+        status.status = ExecutionLifecycleStatus::Cancelled;
+        status.phase = ExecutionPhase::Cancelled;
+        status.queue_position = None;
+        status.queue = None;
+        status.cancellation_requested_at = Some(cancellation_requested_at);
+
+        for (node_id, node_status) in status.node_statuses.iter_mut() {
+            if matches!(
+                node_status,
+                NodeStatus::Completed | NodeStatus::CacheHit | NodeStatus::Skipped
+            ) {
+                continue;
+            }
+
+            *node_status = NodeStatus::Interrupted;
+            let logs = node_logs.entry(node_id.clone()).or_insert_with(|| NodeLogs {
+                stdout: String::new(),
+                stderr: String::new(),
+                outputs: Vec::new(),
+                error: None,
+                duration_ms: None,
+                metrics: HashMap::new(),
+            });
+            if logs.stderr.is_empty() {
+                logs.stderr = reason.to_string();
+            } else if !logs.stderr.contains(reason) {
+                logs.stderr.push('\n');
+                logs.stderr.push_str(reason);
+            }
+        }
+
+        (status, node_logs)
+    }
+
     fn execution_nodes_finished(status: &ExecutionStatus) -> bool {
         !status.node_statuses.is_empty()
             && status.node_statuses.values().all(|node_status| {
@@ -1058,6 +1153,121 @@ impl Workspace {
         }
 
         Ok(reconciled)
+    }
+
+    async fn reconcile_tree_kernel_shutdown_executions(
+        pool: &SqlitePool,
+        tree_id: &ExperimentTreeId,
+        reason: &str,
+        cancellation_requested_at: chrono::DateTime<Utc>,
+    ) -> TineResult<usize> {
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, status, node_logs FROM executions WHERE tree_id = ? AND finished_at IS NULL",
+        )
+        .bind(tree_id.as_str())
+        .fetch_all(pool)
+        .await
+        .map_err(|e| TineError::Database(e.to_string()))?;
+
+        let mut reconciled = 0usize;
+        for (execution_id, status_json, node_logs_json) in rows {
+            let status = match serde_json::from_str::<ExecutionStatus>(&status_json) {
+                Ok(status) => Self::normalize_execution_status(status),
+                Err(err) => {
+                    warn!(
+                        tree = %tree_id,
+                        execution = %execution_id,
+                        error = %err,
+                        "skipping execution during shutdown reconciliation: status JSON \
+                         could not be parsed (likely DB corruption or schema drift)"
+                    );
+                    continue;
+                }
+            };
+            if status.finished_at.is_some() {
+                continue;
+            }
+
+            let node_logs: HashMap<NodeId, NodeLogs> = match node_logs_json.as_deref() {
+                Some(json) => match serde_json::from_str(json) {
+                    Ok(logs) => logs,
+                    Err(err) => {
+                        warn!(
+                            tree = %tree_id,
+                            execution = %execution_id,
+                            error = %err,
+                            "node_logs JSON could not be parsed during shutdown \
+                             reconciliation; falling back to empty logs"
+                        );
+                        HashMap::new()
+                    }
+                },
+                None => HashMap::new(),
+            };
+            let (reconciled_status, reconciled_logs) = Self::reconcile_shutdown_execution_status(
+                status,
+                node_logs,
+                reason,
+                cancellation_requested_at,
+            );
+            let reconciled_status_json =
+                serde_json::to_string(&reconciled_status).map_err(TineError::Serialization)?;
+            let reconciled_logs_json =
+                serde_json::to_string(&reconciled_logs).map_err(TineError::Serialization)?;
+            sqlx::query(
+                "UPDATE executions SET status = ?, node_logs = ?, finished_at = datetime('now') WHERE id = ?",
+            )
+            .bind(&reconciled_status_json)
+            .bind(&reconciled_logs_json)
+            .bind(&execution_id)
+            .execute(pool)
+            .await
+            .map_err(|e| TineError::Database(e.to_string()))?;
+            reconciled += 1;
+        }
+
+        Ok(reconciled)
+    }
+
+    async fn mark_tree_shutdown_requested(
+        pool: &SqlitePool,
+        tree_id: &ExperimentTreeId,
+        cancellation_requested_at: chrono::DateTime<Utc>,
+    ) -> TineResult<usize> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, status FROM executions WHERE tree_id = ? AND finished_at IS NULL",
+        )
+        .bind(tree_id.as_str())
+        .fetch_all(pool)
+        .await
+        .map_err(|e| TineError::Database(e.to_string()))?;
+
+        let mut updated = 0usize;
+        for (execution_id, status_json) in rows {
+            let mut status = match serde_json::from_str::<ExecutionStatus>(&status_json) {
+                Ok(status) => Self::normalize_execution_status(status),
+                Err(_) => continue,
+            };
+            if status.finished_at.is_some() {
+                continue;
+            }
+
+            status.cancellation_requested_at = Some(cancellation_requested_at);
+            status.queue_position = None;
+            status.queue = None;
+            Self::apply_execution_phase(&mut status, ExecutionPhase::CancellationRequested);
+
+            let status_json = serde_json::to_string(&status).map_err(TineError::Serialization)?;
+            sqlx::query("UPDATE executions SET status = ? WHERE id = ? AND finished_at IS NULL")
+                .bind(&status_json)
+                .bind(&execution_id)
+                .execute(pool)
+                .await
+                .map_err(|e| TineError::Database(e.to_string()))?;
+            updated += 1;
+        }
+
+        Ok(updated)
     }
 
     async fn run_branch_execution(
@@ -1366,6 +1576,8 @@ impl Workspace {
             .and_then(|json| serde_json::from_str(json).ok())
             .unwrap_or_default();
 
+        let cancellation_pending = status.cancellation_requested_at.is_some();
+
         match event {
             ExecutionEvent::ExecutionStarted { .. } => {
                 Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
@@ -1453,10 +1665,19 @@ impl Workspace {
                     .insert(node_id.clone(), NodeStatus::CacheHit);
             }
             ExecutionEvent::NodeFailed { node_id, error, .. } => {
-                Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+                if !cancellation_pending {
+                    Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+                }
                 status
                     .node_statuses
-                    .insert(node_id.clone(), NodeStatus::Failed);
+                    .insert(
+                        node_id.clone(),
+                        if cancellation_pending {
+                            NodeStatus::Interrupted
+                        } else {
+                            NodeStatus::Failed
+                        },
+                    );
                 let logs = node_logs
                     .entry(node_id.clone())
                     .or_insert_with(|| NodeLogs {
@@ -1470,20 +1691,31 @@ impl Workspace {
                 logs.error = Some(error.clone());
             }
             ExecutionEvent::ExecutionCompleted { .. } => {
-                status.finished_at = Some(Utc::now());
-                Self::apply_execution_phase(&mut status, ExecutionPhase::Completed);
+                if !cancellation_pending {
+                    status.finished_at = Some(Utc::now());
+                    Self::apply_execution_phase(&mut status, ExecutionPhase::Completed);
+                }
             }
             ExecutionEvent::ExecutionFailed { .. } => {
-                status.finished_at = Some(Utc::now());
-                let terminal_status =
-                    Self::terminal_status_from_outcome(&status.node_statuses, &node_logs);
-                status.status = terminal_status.clone();
-                status.phase = Self::terminal_phase_from_status(&terminal_status);
+                if !cancellation_pending {
+                    status.finished_at = Some(Utc::now());
+                    let terminal_status =
+                        Self::terminal_status_from_outcome(&status.node_statuses, &node_logs);
+                    status.status = terminal_status.clone();
+                    status.phase = Self::terminal_phase_from_status(&terminal_status);
+                }
             }
             _ => {}
         }
 
-        if status.finished_at.is_none() && Self::execution_nodes_finished(&status) {
+        if cancellation_pending && status.finished_at.is_none() {
+            Self::apply_execution_phase(&mut status, ExecutionPhase::CancellationRequested);
+        }
+
+        if !cancellation_pending
+            && status.finished_at.is_none()
+            && Self::execution_nodes_finished(&status)
+        {
             status.finished_at = Some(Utc::now());
             let terminal_status =
                 Self::terminal_status_from_outcome(&status.node_statuses, &node_logs);
@@ -1886,8 +2118,63 @@ impl Workspace {
         Ok(self.runtime_health_snapshot(tree_id).await)
     }
 
+    pub async fn shutdown_tree_kernel(
+        &self,
+        tree_id: &ExperimentTreeId,
+    ) -> TineResult<TreeRuntimeState> {
+        let cancellation_requested_at = Utc::now();
+        let marked = Self::mark_tree_shutdown_requested(
+            &self.pool,
+            tree_id,
+            cancellation_requested_at,
+        )
+        .await?;
+        match self.scheduler.interrupt_tree_kernel(tree_id).await {
+            Ok(()) => {}
+            Err(TineError::KernelNotFound { .. }) => {}
+            Err(err) => {
+                // Don't abort: shutdown below SIGKILLs as a fallback. Aborting
+                // here would leave the DB marked shutdown-requested while the
+                // kernel is still alive — an inconsistent state.
+                warn!(
+                    tree = %tree_id,
+                    error = %err,
+                    "interrupt_tree_kernel failed during shutdown; proceeding to force shutdown"
+                );
+            }
+        }
+        match self.scheduler.shutdown_tree_kernel(tree_id).await {
+            Ok(()) => {}
+            Err(TineError::KernelNotFound { .. }) => {}
+            Err(err) => {
+                warn!(
+                    tree = %tree_id,
+                    error = %err,
+                    "shutdown_tree_kernel failed; aborting before marking needs_replay"
+                );
+                return Err(err);
+            }
+        }
+        let state = self.mark_tree_needs_replay(tree_id).await?;
+        let reconciled = Self::reconcile_tree_kernel_shutdown_executions(
+            &self.pool,
+            tree_id,
+            "Tree kernel was shut down while execution was running",
+            cancellation_requested_at,
+        )
+        .await?;
+        if marked > 0 || reconciled > 0 {
+            warn!(tree = %tree_id, marked, reconciled, "processed active executions during tree kernel shutdown");
+        }
+        Ok(state)
+    }
+
     pub async fn restart_tree_kernel(&self, tree_id: &ExperimentTreeId) -> TineResult<()> {
-        self.kernel_mgr.restart_tree_kernel(tree_id).await
+        match self.kernel_mgr.restart_tree_kernel(tree_id).await {
+            Ok(()) => Ok(()),
+            Err(TineError::KernelNotFound { .. }) => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn add_cell_to_experiment_tree_branch(
@@ -3042,12 +3329,27 @@ impl Workspace {
         match self.scheduler.interrupt_tree_kernel(tree_id).await {
             Ok(()) => {}
             Err(TineError::KernelNotFound { .. }) => {}
-            Err(err) => return Err(err),
+            Err(err) => {
+                warn!(
+                    tree = %tree_id,
+                    error = %err,
+                    "interrupt_tree_kernel failed while marking kernel lost; \
+                     proceeding to force shutdown"
+                );
+            }
         }
         match self.scheduler.shutdown_tree_kernel(tree_id).await {
             Ok(()) => {}
             Err(TineError::KernelNotFound { .. }) => {}
-            Err(err) => return Err(err),
+            Err(err) => {
+                warn!(
+                    tree = %tree_id,
+                    error = %err,
+                    "shutdown_tree_kernel failed while marking kernel lost; \
+                     aborting before flipping state"
+                );
+                return Err(err);
+            }
         }
         let updated = Self::apply_runtime_state_transition(
             &self.pool,
@@ -3108,6 +3410,7 @@ impl Workspace {
         cell_id: &CellId,
         execution_id: Option<&ExecutionId>,
     ) -> TineResult<PreparedContext> {
+        let mut total_timer = OutcomeTimer::start(METRIC_PREPARE_CONTEXT_TOTAL);
         let tree = self.get_experiment_tree(tree_id).await?;
         Self::validate_branch_membership(&tree, branch_id, cell_id)?;
         let path_cell_ids = Self::branch_path_cell_ids(&tree, branch_id)?;
@@ -3177,10 +3480,23 @@ impl Workspace {
                 .await?;
             }
         }
+        let mut replay_timer = OutcomeTimer::start(METRIC_PREPARE_CONTEXT_REPLAY);
+        metrics::histogram!(METRIC_PREPARE_CONTEXT_REPLAY_CELLS)
+            .record(replay_prefix.len() as f64);
         for replay_cell_id in &replay_prefix {
             self.execute_tree_cell_for_target(&tree, branch_id, replay_cell_id)
                 .await?;
         }
+        replay_timer.set_outcome("success");
+        drop(replay_timer);
+
+        let outcome = if reusing_existing_kernel {
+            "reuse"
+        } else if replay_prefix.is_empty() {
+            "restart_noreplay"
+        } else {
+            "restart_replay"
+        };
 
         let runtime_state = TreeRuntimeState {
             tree_id: tree_id.clone(),
@@ -3193,6 +3509,7 @@ impl Workspace {
             last_isolation_result: current.last_isolation_result,
         };
         self.set_tree_runtime_state(runtime_state.clone()).await?;
+        total_timer.set_outcome(outcome);
         Ok(PreparedContext {
             tree_id: tree_id.clone(),
             branch_id: branch_id.clone(),
@@ -3900,6 +4217,24 @@ impl WorkspaceApi for Workspace {
         Workspace::get_tree_runtime_state(self, tree_id).await
     }
 
+    async fn inspect_tree_kernel(
+        &self,
+        tree_id: &ExperimentTreeId,
+    ) -> TineResult<RuntimeHealthSnapshot> {
+        Workspace::inspect_tree_kernel(self, tree_id).await
+    }
+
+    async fn shutdown_tree_kernel(
+        &self,
+        tree_id: &ExperimentTreeId,
+    ) -> TineResult<TreeRuntimeState> {
+        Workspace::shutdown_tree_kernel(self, tree_id).await
+    }
+
+    async fn restart_tree_kernel(&self, tree_id: &ExperimentTreeId) -> TineResult<()> {
+        Workspace::restart_tree_kernel(self, tree_id).await
+    }
+
     async fn execute_cell_in_experiment_tree_branch(
         &self,
         tree_id: &ExperimentTreeId,
@@ -3968,7 +4303,9 @@ impl WorkspaceApi for Workspace {
         let pool = self.pool.clone();
         let execution_id = execution_id.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            if let Err(err) = Self::await_cancellation_settle(&pool, &execution_id).await {
+                warn!(execution = %execution_id, error = %err, "failed while waiting for cancelled execution to settle");
+            }
             if let Err(err) = Self::finalize_cancelled_execution(
                 &pool,
                 &execution_id,

@@ -11,6 +11,10 @@ use tracing::{debug, info};
 use tine_core::{
     EnvironmentSpec, ExperimentTreeDef, ExperimentTreeId, ProjectId, TineError, TineResult,
 };
+use tine_observe::{
+    OutcomeTimer, METRIC_ENV_ENSURE_LOCK_WAIT, METRIC_ENV_ENSURE_PIP_CHECK,
+    METRIC_ENV_ENSURE_PREFLIGHT, METRIC_ENV_ENSURE_SYNC, METRIC_ENV_ENSURE_TOTAL,
+};
 
 // ---------------------------------------------------------------------------
 // Default packages — the "conda defaults" equivalent
@@ -369,8 +373,12 @@ impl EnvironmentManager {
         spec: &EnvironmentSpec,
         venv_dir: &Path,
     ) -> TineResult<(PathBuf, String)> {
+        let mut total_timer = OutcomeTimer::start(METRIC_ENV_ENSURE_TOTAL);
+        let mut lock_wait_timer = OutcomeTimer::start(METRIC_ENV_ENSURE_LOCK_WAIT);
         let _global_env_guard = global_env_lock().lock().await;
         let _env_guard = self.env_lock.lock().await;
+        lock_wait_timer.set_outcome("success");
+        drop(lock_wait_timer);
         let venv_dir = self.normalize_venv_dir(venv_dir);
         let mut logs = Vec::new();
         let python_command = self.resolve_python_command(DEFAULT_PYTHON_VERSION).await?;
@@ -414,8 +422,11 @@ impl EnvironmentManager {
             logs.push(format!("Using existing venv at {}", venv_dir.display()));
         }
 
+        let mut pip_check_timer = OutcomeTimer::start(METRIC_ENV_ENSURE_PIP_CHECK);
         self.ensure_pip_available(runtime_id, &venv_dir, &mut logs)
             .await?;
+        pip_check_timer.set_outcome("success");
+        drop(pip_check_timer);
 
         let packages_to_sync = if uses_bundled_python {
             if spec.dependencies.is_empty() {
@@ -433,13 +444,20 @@ impl EnvironmentManager {
         } else {
             resolve_packages(&spec.dependencies)
         };
+        let mut sync_timer = OutcomeTimer::start(METRIC_ENV_ENSURE_SYNC);
         self.sync_packages(runtime_id, &venv_dir, &packages_to_sync, &mut logs)
             .await?;
+        sync_timer.set_outcome("success");
+        drop(sync_timer);
 
         let python_path = self.python_path(&venv_dir);
+        let mut preflight_timer = OutcomeTimer::start(METRIC_ENV_ENSURE_PREFLIGHT);
         self.preflight_kernel_runtime(runtime_id, &python_path, &venv_dir, &mut logs)
             .await?;
+        preflight_timer.set_outcome("success");
+        drop(preflight_timer);
 
+        total_timer.set_outcome("success");
         Ok((venv_dir, logs.join("\n\n")))
     }
 
