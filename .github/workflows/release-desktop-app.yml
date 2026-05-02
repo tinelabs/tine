@@ -18,7 +18,7 @@ on:
         default: false
         type: boolean
       release_tag:
-        description: Release tag to use when publishing from workflow_dispatch (for example v0.2.2)
+        description: Release tag or version to publish from workflow_dispatch; values like 0.2.2 are normalized to v0.2.2
         required: false
         default: ""
         type: string
@@ -354,9 +354,11 @@ jobs:
             echo "publish_to_release requires release_tag" >&2
             exit 1
           fi
+          NORMALIZED_VERSION="${TAG#v}"
+          CANONICAL_TAG="v${NORMALIZED_VERSION}"
 
-          echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
-          echo "release_name=Desktop App $TAG" >> "$GITHUB_OUTPUT"
+          echo "tag_name=$CANONICAL_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_name=Desktop App $CANONICAL_TAG" >> "$GITHUB_OUTPUT"
           echo "draft=true" >> "$GITHUB_OUTPUT"
           echo "prerelease=true" >> "$GITHUB_OUTPUT"
 

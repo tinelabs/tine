@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Git tag and GitHub Release name to create after validation passes
+        description: Git version or tag to release; values like 0.2.6 are normalized to v0.2.6
         required: true
         type: string
       publish_release:
@@ -28,28 +28,54 @@ permissions:
   id-token: write
 
 jobs:
+  resolve-release-tag:
+    name: Resolve canonical release tag
+    runs-on: ubuntu-latest
+    outputs:
+      canonical_tag: ${{ steps.tag.outputs.canonical_tag }}
+      release_name: ${{ steps.tag.outputs.release_name }}
+    steps:
+      - name: Canonicalize requested release tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAW_TAG="${{ inputs.release_tag }}"
+          if [[ -z "$RAW_TAG" ]]; then
+            echo "release_tag is required" >&2
+            exit 1
+          fi
+          NORMALIZED_VERSION="${RAW_TAG#v}"
+          CANONICAL_TAG="v${NORMALIZED_VERSION}"
+          echo "canonical_tag=$CANONICAL_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_name=$CANONICAL_TAG" >> "$GITHUB_OUTPUT"
+
   validate-wrapper:
     name: Validate wrapper release
+    needs: resolve-release-tag
     uses: ./.github/workflows/release-python-wrapper.yml
     with:
       publish_to_release: false
       publish_to_pypi: false
-      release_tag: ${{ inputs.release_tag }}
+      release_tag: ${{ needs.resolve-release-tag.outputs.canonical_tag }}
     secrets: inherit
 
   validate-desktop:
     name: Validate desktop release
-    needs: validate-wrapper
+    needs:
+      - resolve-release-tag
+      - validate-wrapper
     uses: ./.github/workflows/release-desktop-app.yml
     with:
       target: all
       publish_to_release: false
-      release_tag: ${{ inputs.release_tag }}
+      release_tag: ${{ needs.resolve-release-tag.outputs.canonical_tag }}
     secrets: inherit
 
   publish-release:
     name: Publish GitHub release
     needs:
+      - resolve-release-tag
       - validate-wrapper
       - validate-desktop
     runs-on: ubuntu-latest
@@ -78,8 +104,8 @@ jobs:
       - name: Create release and upload validated assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag }}
-          name: ${{ inputs.release_tag }}
+          tag_name: ${{ needs.resolve-release-tag.outputs.canonical_tag }}
+          name: ${{ needs.resolve-release-tag.outputs.release_name }}
           target_commitish: ${{ github.sha }}
           prerelease: ${{ inputs.prerelease }}
           generate_release_notes: true

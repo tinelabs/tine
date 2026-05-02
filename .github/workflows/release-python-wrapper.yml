@@ -14,7 +14,7 @@ on:
         default: false
         type: boolean
       release_tag:
-        description: Release tag to publish to when publish_to_release is enabled
+        description: Release tag or version to publish to; values like 0.2.6 are normalized to v0.2.6
         required: false
         default: ""
         type: string
@@ -231,7 +231,7 @@ jobs:
     outputs:
       tag_name: ${{ steps.meta.outputs.tag_name }}
     steps:
-      - name: Validate requested release tag
+      - name: Resolve canonical release tag
         id: meta
         shell: bash
         run: |
@@ -241,7 +241,8 @@ jobs:
             echo "publish_to_release requires release_tag" >&2
             exit 1
           fi
-          echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
+          NORMALIZED_VERSION="${TAG#v}"
+          echo "tag_name=v${NORMALIZED_VERSION}" >> "$GITHUB_OUTPUT"
 
   upload-release-assets:
     name: Upload release assets
