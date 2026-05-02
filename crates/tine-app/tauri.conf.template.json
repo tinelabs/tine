@@ -31,8 +31,7 @@
     "active": true,
     "targets": [
       "dmg",
-      "msi",
-      "appimage"
+      "msi"
     ],
     "resources": [
       "resources/runtime",

@@ -5829,13 +5829,15 @@ dependencies = [
 
 [[package]]
 name = "tine-api"
-version = "0.2.4"
+version = "0.2.6"
 dependencies = [
  "async-trait",
  "blake3",
  "chrono",
  "dashmap",
  "hex",
+ "metrics",
+ "metrics-exporter-prometheus",
  "serde",
  "serde_json",
  "serial_test",
@@ -5847,6 +5849,7 @@ dependencies = [
  "tine-env",
  "tine-graph",
  "tine-kernel",
+ "tine-observe",
  "tine-scheduler",
  "tokio",
  "tracing",
@@ -5855,7 +5858,7 @@ dependencies = [
 
 [[package]]
 name = "tine-app"
-version = "0.2.4"
+version = "0.2.6"
 dependencies = [
  "async-trait",
  "axum 0.8.8",
@@ -5879,7 +5882,7 @@ dependencies = [
 
 [[package]]
 name = "tine-catalog"
-version = "0.2.4"
+version = "0.2.6"
 dependencies = [
  "arrow-ipc",
  "arrow-schema",
@@ -5894,7 +5897,7 @@ dependencies = [
 
 [[package]]
 name = "tine-cli"
-version = "0.2.4"
+version = "0.2.6"
 dependencies = [
  "async-trait",
  "blake3",
@@ -5914,7 +5917,7 @@ dependencies = [
 
 [[package]]
 name = "tine-core"
-version = "0.2.4"
+version = "0.2.6"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -5929,21 +5932,23 @@ dependencies = [
 
 [[package]]
 name = "tine-env"
-version = "0.2.4"
+version = "0.2.6"
 dependencies = [
  "blake3",
+ "metrics",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tine-core",
+ "tine-observe",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "tine-graph"
-version = "0.2.4"
+version = "0.2.6"
 dependencies = [
  "chrono",
  "petgraph",
@@ -5953,7 +5958,7 @@ dependencies = [
 
 [[package]]
 name = "tine-kernel"
-version = "0.2.4"
+version = "0.2.6"
 dependencies = [
  "bytes",
  "dashmap",
@@ -5968,6 +5973,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tine-core",
  "tine-env",
+ "tine-observe",
  "tokio",
  "tracing",
  "uuid",
@@ -5975,7 +5981,7 @@ dependencies = [
 
 [[package]]
 name = "tine-observe"
-version = "0.2.4"
+version = "0.2.6"
 dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
@@ -5985,7 +5991,7 @@ dependencies = [
 
 [[package]]
 name = "tine-python"
-version = "0.2.4"
+version = "0.2.6"
 dependencies = [
  "async-trait",
  "blake3",
@@ -6006,7 +6012,7 @@ dependencies = [
 
 [[package]]
 name = "tine-scheduler"
-version = "0.2.4"
+version = "0.2.6"
 dependencies = [
  "blake3",
  "dashmap",
@@ -6021,13 +6027,14 @@ dependencies = [
  "tine-env",
  "tine-graph",
  "tine-kernel",
+ "tine-observe",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "tine-server"
-version = "0.2.4"
+version = "0.2.6"
 dependencies = [
  "async-trait",
  "axum 0.8.8",

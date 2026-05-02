@@ -18,10 +18,32 @@ Tine is a local-first execution engine where notebooks branch like code. Run wor
   <img src="docs/assets/tine-demo.gif" alt="Tine branching workflow demo" width="920" />
 </p>
 
-Tine gives AI agents a safe place to explore multiple paths in parallel while you keep the browser view over the same local state, logs, and results.
+## Get started
 
+```bash
+pip install tine
+tine serve --open
+```
 
-## What Tine is
+That installs the wrapper, starts a local server, and opens the UI at <http://127.0.0.1:9473>.
+
+Tine needs Python 3.10+. If your default `python` is older, install with a newer one explicitly, e.g. `python3.11 -m pip install tine`.
+
+To run inside a specific folder as your workspace:
+
+```bash
+tine serve --workspace ./my-project --open
+```
+
+To skip the browser auto-open, drop `--open`.
+
+To sanity-check the install:
+
+```bash
+tine doctor
+```
+
+## How it works
 
 Tine is built around a tree-native notebook model:
 
@@ -29,171 +51,38 @@ Tine is built around a tree-native notebook model:
 - an experiment contains **branches**
 - branches contain **cells**
 
-Each experiment owns its own execution environment and kernel. Execution happens against branches and cells inside that experiment, which makes it practical to explore multiple paths without collapsing everything into one linear notebook.
-
-In practice, that gives Tine a few important properties:
-
-- local-first execution
-- branch-aware notebook workflows
-- reproducible runtime ownership
-- one backend shared by the UI and MCP
-
-## Product shape
-
-Tine has a simple surface model:
-
-- **Web UI** for people
-- **Local Rust server** as the canonical backend
-- **Python MCP layer** for agent integrations
-
-The UI and MCP are adapters over the same local system rather than separate runtimes.
-
-## Run locally
-
-There are two normal ways to run Tine locally.
-
-### Release install
-
-The release-oriented install path is:
-
-```bash
-pip install tine
-```
-
-Tine requires Python 3.10 or newer. If your system `python` points to an older interpreter, install with a newer one explicitly, for example `python3.11 -m pip install tine`.
-
-Then start the local server for your workspace:
-
-```bash
-tine serve --workspace . --bind 127.0.0.1:9473 --open
-```
-
-If you want to sanity-check the install first:
-
-```bash
-tine doctor
-```
-
-Open the app at:
-
-```text
-http://127.0.0.1:9473
-```
-
-That install gives you:
-
-- `tine` as the public wrapper entrypoint
-- `tine mcp ...` for MCP config and stdio adapter commands
-- `tine-mcp` as a compatibility alias for the MCP adapter
-
-On first use, the wrapper resolves a matching Tine engine binary for your OS and architecture.
-
-Supported release targets today:
-
-| OS | Architectures |
-| --- | --- |
-| macOS | Apple Silicon, Intel |
-| Linux | x86_64, arm64 |
-| Windows | x86_64 |
+Each experiment owns its own kernel and environment, so branches let you explore multiple paths in parallel against the same code without collapsing everything into one linear notebook. The Web UI and any connected agent share that local runtime, so they always see the same state, logs, and outputs.
 
 ## Desktop app
 
-Tine also ships desktop app bundles through GitHub Releases for users who want a native installer instead of the Python wrapper.
+If you'd rather not install through pip, signed desktop bundles are published on every release:
 
-Current desktop bundle targets are:
+- **macOS** — `.dmg` for Apple Silicon and Intel
+- **Windows** — `.msi` for x86_64
 
-- macOS: `.dmg` for Apple Silicon and Intel
-- Windows: `.msi` for x86_64
-- Linux: `.AppImage` for x86_64
+Each bundle ships with a private Python runtime inside, so it doesn't depend on a system Python install.
 
-Desktop bundles include a private Python runtime inside the app, so they do not depend on system Python to launch the local notebook experience.
+Downloads: <https://github.com/tinelabs/tine/releases>
 
-Desktop app downloads live on GitHub Releases:
+The desktop app uses the same local backend as `pip install tine` — only the wrapper differs.
 
-```text
-https://github.com/tinelabs/tine/releases
-```
+## Use with AI agents
 
-The desktop app and `pip install tine` use the same local backend and UI. The difference is only the distribution wrapper.
-
-The server is the canonical local backend. Both the web UI and MCP connect to that same API.
-
-If you do not want the browser to open automatically:
-
-```bash
-tine serve --workspace . --bind 127.0.0.1:9473
-```
-
-### Run from this repository
-
-If you are working inside this repository, use the local Rust CLI instead of the packaged wrapper:
-
-```bash
-cargo run -p tine-cli -- serve --workspace . --bind 127.0.0.1:9473 --open
-```
-
-Source development expects Rust 1.75+ and Python 3.10+ to be available locally.
-
-## MCP setup
-
-Tine supports agent workflows through MCP.
-
-Generate an MCP config document for a supported host:
+Tine is MCP-native. Generate a config for your agent host of choice:
 
 ```bash
 tine mcp print-config --host vscode --api-url http://127.0.0.1:9473
 ```
 
-Supported hosts:
+Supported hosts: `vscode`, `cursor`, `claude`, `generic`.
 
-- `vscode`
-- `cursor`
-- `claude`
-- `generic`
-
-Example VS Code config output:
-
-```json
-{
-  "servers": {
-    "tine": {
-      "type": "stdio",
-      "command": "tine",
-      "args": ["mcp", "serve", "--api-url", "http://127.0.0.1:9473"]
-    }
-  }
-}
-```
-
-Example Claude Desktop config output:
-
-```json
-{
-  "mcpServers": {
-    "tine": {
-      "command": "tine",
-      "args": ["mcp", "serve", "--api-url", "http://127.0.0.1:9473"]
-    }
-  }
-}
-```
-
-### MCP config registration
-
-To write the generated config directly into the standard host config location:
+To write the generated config directly into your host's standard config location:
 
 ```bash
 tine mcp register --host vscode --api-url http://127.0.0.1:9473
 ```
 
-Equivalent examples:
-
-```bash
-tine mcp register --host cursor --api-url http://127.0.0.1:9473
-tine mcp register --host claude --api-url http://127.0.0.1:9473
-```
-
-Default config targets are resolved per OS:
+Default config targets per host:
 
 | Host | macOS | Linux | Windows |
 | --- | --- | --- | --- |
@@ -201,38 +90,48 @@ Default config targets are resolved per OS:
 | Cursor | `~/Library/Application Support/Cursor/User/mcp.json` | `~/.config/Cursor/User/mcp.json` | `%APPDATA%/Cursor/User/mcp.json` |
 | Claude | `~/Library/Application Support/Claude/claude_desktop_config.json` | `~/.config/Claude/claude_desktop_config.json` | `%APPDATA%/Claude/claude_desktop_config.json` |
 
-If you prefer to manage the file yourself, print the config and copy it into your host config manually instead of using `register`.
+To manage the file yourself, use `print-config` and paste it in manually.
 
-## Common local setup
-
-For the most common local setup:
+A typical agent setup:
 
 ```bash
 pip install tine
-tine serve --workspace . --bind 127.0.0.1:9473 --open
+tine serve --open
 tine mcp register --host vscode --api-url http://127.0.0.1:9473
 ```
 
-That gives you:
+You now have the Web UI and an agent both talking to the same local runtime.
 
-- the **web UI** talking to the local API
-- the **MCP adapter** talking to the same local API
-- one local Rust backend shared by both
+## Supported targets
 
-## Repository guide
+`pip install tine` resolves a matching engine binary for your OS and architecture on first use.
 
-If you are navigating the repo, these are the most relevant top-level areas:
+| OS | Architectures |
+| --- | --- |
+| macOS | Apple Silicon, Intel |
+| Linux | x86_64, arm64 |
+| Windows | x86_64 |
 
-- `ui/` for the browser UI
-- `crates/tine-server/` for the local HTTP and WebSocket server
-- `crates/tine-cli/` for the local launcher and operator commands
-- `packaging/python/` for the Python wrapper, packaging, and MCP entrypoints
+## Develop locally
+
+If you're working inside this repo, run the Rust CLI directly instead of the packaged wrapper:
+
+```bash
+cargo run -p tine-cli -- serve --workspace . --open
+```
+
+Source development expects Rust 1.75+ and Python 3.10+.
+
+The most relevant top-level areas:
+
+- `ui/` — browser UI
+- `crates/tine-server/` — local HTTP and WebSocket server
+- `crates/tine-cli/` — local launcher and operator commands
+- `packaging/python/` — Python wrapper, packaging, and MCP entrypoints
 
 ## Contributing
 
-Contributions from both humans and AI agents are welcome.
-
-For contribution rules, issue focus areas, validation guidance, and the current priority list, see [CONTRIBUTING.md](CONTRIBUTING.md).
+Contributions from both humans and AI agents are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution rules, focus areas, and validation guidance.
 
 ## Acknowledgements
 

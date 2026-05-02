@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 tine-core.workspace = true
+tine-observe.workspace = true
 tokio.workspace = true
 dashmap.workspace = true
 tracing.workspace = true

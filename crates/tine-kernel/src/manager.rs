@@ -27,6 +27,12 @@ use runtimelib::{
 use tine_core::{
     ExperimentTreeId, KernelConnectionInfo, NamespaceDelta, NodeOutput, TineError, TineResult,
 };
+use tine_observe::{
+    OutcomeTimer, METRIC_KERNEL_EXECUTE_IOPUB_WAIT, METRIC_KERNEL_EXECUTE_SHELL_REPLY,
+    METRIC_KERNEL_EXECUTE_TOTAL, METRIC_KERNEL_START_CHANNEL_CONNECT,
+    METRIC_KERNEL_START_HEARTBEAT_CONNECT, METRIC_KERNEL_START_HEARTBEAT_READY,
+    METRIC_KERNEL_START_SETUP_CODE, METRIC_KERNEL_START_SPAWN, METRIC_KERNEL_START_TOTAL,
+};
 
 /// When the kernel pool is full, only evict kernels that have been idle for at
 /// least this long.
@@ -366,6 +372,7 @@ impl KernelManager {
         venv_dir: &Path,
         working_dir: &Path,
     ) -> TineResult<()> {
+        let mut total_timer = OutcomeTimer::start(METRIC_KERNEL_START_TOTAL);
         // Acquire per-owner start lock to prevent concurrent duplicate starts
         let lock = self
             .start_locks
@@ -380,6 +387,7 @@ impl KernelManager {
 
         // Double-check: another task may have started the kernel while we waited
         if self.kernels.contains_key(owner_id) {
+            total_timer.set_outcome("already_started");
             return Ok(());
         }
 
@@ -402,7 +410,10 @@ impl KernelManager {
                 .start_kernel_once(owner_id, venv_dir, working_dir)
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    total_timer.set_outcome("success");
+                    return Ok(());
+                }
                 Err(TineError::KernelStartupFailed {
                     runtime_id,
                     message,
@@ -439,6 +450,7 @@ impl KernelManager {
         venv_dir: &Path,
         working_dir: &Path,
     ) -> TineResult<()> {
+        let mut spawn_timer = OutcomeTimer::start(METRIC_KERNEL_START_SPAWN);
         // Allocate 5 ports via runtimelib
         let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
         let ports = peek_ports(ip, 5)
@@ -506,9 +518,12 @@ impl KernelManager {
 
         let pid = process.id().unwrap_or(0);
         let kernel_id = format!("kernel-{}", pid);
+        spawn_timer.set_outcome("success");
+        drop(spawn_timer);
 
         // Connect heartbeat channel first, then poll it to confirm readiness
         // (replaces the old hardcoded 2s sleep)
+        let mut hb_connect_timer = OutcomeTimer::start(METRIC_KERNEL_START_HEARTBEAT_CONNECT);
         let connect_deadline = Instant::now() + Duration::from_secs(HEARTBEAT_STARTUP_TIMEOUT_SECS);
         let mut connect_delay = Duration::from_millis(100);
         let mut heartbeat = loop {
@@ -571,7 +586,11 @@ impl KernelManager {
             connect_delay = (connect_delay * 2).min(Duration::from_secs(2));
         };
 
+        hb_connect_timer.set_outcome("success");
+        drop(hb_connect_timer);
+
         // Poll heartbeat with exponential backoff until the kernel responds
+        let mut hb_ready_timer = OutcomeTimer::start(METRIC_KERNEL_START_HEARTBEAT_READY);
         let hb_deadline = Instant::now() + Duration::from_secs(HEARTBEAT_STARTUP_TIMEOUT_SECS);
         let mut hb_delay = Duration::from_millis(100);
         let mut hb_attempt = 0u32;
@@ -661,9 +680,13 @@ impl KernelManager {
             .await);
         }
 
+        hb_ready_timer.set_outcome("success");
+        drop(hb_ready_timer);
+
         info!(owner = %owner_id, pid = pid, "heartbeat confirmed, connecting channels");
 
         // Connect remaining ZMQ channels
+        let mut channel_connect_timer = OutcomeTimer::start(METRIC_KERNEL_START_CHANNEL_CONNECT);
         let peer_identity = peer_identity_for_session(&session_id)
             .map_err(|e| TineError::Internal(format!("peer identity error: {}", e)))?;
 
@@ -717,6 +740,8 @@ impl KernelManager {
             runtime_id: owner_id.to_string(),
             message: format!("failed to connect control: {}", e),
         })?;
+        channel_connect_timer.set_outcome("success");
+        drop(channel_connect_timer);
 
         let now_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -753,7 +778,9 @@ impl KernelManager {
         );
 
         // Send tine helper functions into the kernel namespace
+        let mut setup_timer = OutcomeTimer::start(METRIC_KERNEL_START_SETUP_CODE);
         self.send_setup_code(owner_id).await?;
+        setup_timer.set_outcome("success");
 
         Ok(())
     }
@@ -825,6 +852,7 @@ impl KernelManager {
     where
         F: FnMut(&str, &str),
     {
+        let mut total_timer = OutcomeTimer::start(METRIC_KERNEL_EXECUTE_TOTAL);
         let kernel = self
             .kernels
             .get(owner_id)
@@ -853,6 +881,7 @@ impl KernelManager {
         let mut outputs: Vec<NodeOutput> = Vec::new();
         let mut exec_error: Option<KernelExecutionError> = None;
 
+        let mut iopub_wait_timer = OutcomeTimer::start(METRIC_KERNEL_EXECUTE_IOPUB_WAIT);
         loop {
             let msg = match tokio::time::timeout(Duration::from_secs(30), kernel.iopub.read()).await {
                 Ok(Ok(msg)) => {
@@ -930,21 +959,31 @@ impl KernelManager {
                 _ => {} // ExecuteInput, ClearOutput, etc.
             }
         }
+        iopub_wait_timer.set_outcome("success");
+        drop(iopub_wait_timer);
 
         // Read shell reply to stay in sync
-        match tokio::time::timeout(Duration::from_secs(5), kernel.shell.read()).await {
+        let mut shell_reply_timer = OutcomeTimer::start(METRIC_KERNEL_EXECUTE_SHELL_REPLY);
+        let shell_reply_outcome = match tokio::time::timeout(Duration::from_secs(5), kernel.shell.read()).await {
             Ok(Ok(reply)) => {
                 debug!(owner = %owner_id, msg_type = reply.message_type(), "shell reply");
+                "success"
             }
             Ok(Err(e)) => {
                 warn!(owner = %owner_id, error = %e, "shell reply error");
+                "comm_error"
             }
             Err(_) => {
                 warn!(owner = %owner_id, "shell reply timed out");
+                "timeout"
             }
-        }
+        };
+        shell_reply_timer.set_outcome(shell_reply_outcome);
+        drop(shell_reply_timer);
 
         kernel.set_executing(false);
+        let total_outcome = if exec_error.is_some() { "kernel_error" } else { "success" };
+        total_timer.set_outcome(total_outcome);
         Ok(KernelExecutionResult {
             stdout,
             stderr,

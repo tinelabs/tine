@@ -3,17 +3,32 @@ import assert from "node:assert/strict";
 
 import {
   activeBranchPathCellIds,
+  appendTerminalEvent,
+  branchRequiresReplay,
   buildExecutionStatusEvent,
+  deriveRuntimeUi,
   describeExecutionProgress,
   executionStatusLevel,
+  fileTreeRefreshKey,
   fileQuery,
   hasHttpOrigin,
+  markReplayRequiredCellStatuses,
+  nextAsyncRequestId,
   normalizeFileTreePath,
   normalizeSavedExperimentTreePayload,
   pickActiveBranchId,
+  registerPendingFileTreeRefresh,
+  reconnectResyncTargets,
+  resolvePollWindowExpiry,
   resolveApiBaseUrl,
   resolveApiUrl,
   resolveWebSocketUrl,
+  shouldHydrateTerminalLogs,
+  shouldRequestExecutionResync,
+  shouldApplyScopedRequestResult,
+  shouldCoalesceTerminalEvents,
+  shouldReplaceTerminalEvent,
+  shouldRenderStderr,
   watchedDirForPath,
 } from "./app-helpers.js";
 
@@ -109,6 +124,72 @@ test("watchedDirForPath maps root and nested file events to file-tree keys", () 
   assert.equal(watchedDirForPath("/nested/deeper/foo.txt"), "nested/deeper");
 });
 
+test("fileTreeRefreshKey scopes refreshes by project and normalized directory", () => {
+  assert.equal(fileTreeRefreshKey("", null), "workspace:.");
+  assert.equal(fileTreeRefreshKey("/nested/", "project-a"), "project-a:nested");
+  assert.equal(fileTreeRefreshKey("nested/deeper", "project-a"), "project-a:nested/deeper");
+});
+
+test("registerPendingFileTreeRefresh coalesces duplicate directory refreshes", () => {
+  const first = registerPendingFileTreeRefresh(new Set(), "nested", "project-a");
+  assert.equal(first.shouldSchedule, true);
+  assert.equal(first.refreshKey, "project-a:nested");
+
+  const duplicate = registerPendingFileTreeRefresh(
+    first.pendingRefreshKeys,
+    "/nested/",
+    "project-a",
+  );
+  assert.equal(duplicate.shouldSchedule, false);
+  assert.equal(duplicate.pendingRefreshKeys.size, 1);
+
+  const sibling = registerPendingFileTreeRefresh(
+    duplicate.pendingRefreshKeys,
+    "nested/deeper",
+    "project-a",
+  );
+  assert.equal(sibling.shouldSchedule, true);
+  assert.equal(sibling.pendingRefreshKeys.size, 2);
+});
+
+test("nextAsyncRequestId monotonically increments request generations", () => {
+  assert.equal(nextAsyncRequestId(), 1);
+  assert.equal(nextAsyncRequestId(0), 1);
+  assert.equal(nextAsyncRequestId(4), 5);
+  assert.equal(nextAsyncRequestId(-10), 1);
+  assert.equal(nextAsyncRequestId(Number.NaN), 1);
+});
+
+test("shouldApplyScopedRequestResult only accepts the latest matching scoped result", () => {
+  assert.equal(
+    shouldApplyScopedRequestResult({
+      requestId: 3,
+      latestRequestId: 3,
+      requestScope: "project-a",
+      currentScope: "project-a",
+    }),
+    true,
+  );
+  assert.equal(
+    shouldApplyScopedRequestResult({
+      requestId: 2,
+      latestRequestId: 3,
+      requestScope: "project-a",
+      currentScope: "project-a",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldApplyScopedRequestResult({
+      requestId: 3,
+      latestRequestId: 3,
+      requestScope: "project-a",
+      currentScope: "project-b",
+    }),
+    false,
+  );
+});
+
 test("pickActiveBranchId preserves valid active branch and falls back to root", () => {
   const tree = {
     root_branch_id: "main",
@@ -143,6 +224,32 @@ test("pickActiveBranchId falls back to persisted runtime branch before root", ()
   assert.equal(
     pickActiveBranchId(tree, null, { active_branch_id: "missing" }),
     "main",
+  );
+});
+
+test("branchRequiresReplay allows a fresh branch run after intentional kernel shutdown", () => {
+  assert.equal(
+    branchRequiresReplay({
+      treeId: "tree_1",
+      branchId: "main",
+      runtimeState: { kernel_state: "needs_replay" },
+      runtimeHealth: { has_live_kernel: false },
+      executionStatuses: {},
+    }),
+    false,
+  );
+});
+
+test("branchRequiresReplay still blocks replay-required live kernels", () => {
+  assert.equal(
+    branchRequiresReplay({
+      treeId: "tree_1",
+      branchId: "main",
+      runtimeState: { kernel_state: "needs_replay" },
+      runtimeHealth: { has_live_kernel: true },
+      executionStatuses: {},
+    }),
+    true,
   );
 });
 
@@ -301,7 +408,7 @@ test("buildExecutionStatusEvent summarizes environment preparation for the outpu
         nodeId: null,
         runtimeId: null,
       },
-      message: "Branch main preparing environment…",
+      message: "preparing environment…",
     },
   );
 });
@@ -323,7 +430,7 @@ test("buildExecutionStatusEvent includes queue position changes", () => {
         nodeId: null,
         runtimeId: null,
       },
-      message: "Execution exec_1 queued. Position 1.",
+      message: "queued. Position 1.",
     },
   );
 });
@@ -342,5 +449,497 @@ test("buildExecutionStatusEvent suppresses duplicate status logs", () => {
       { treeId: "tree_1", branchId: "main" },
     ),
     null,
+  );
+});
+
+test("buildExecutionStatusEvent marks queued branches skipped after earlier branch failure", () => {
+  assert.deepEqual(
+    buildExecutionStatusEvent(
+      { execution_id: "exec_2", tree_id: "tree_1", branch_id: "branch_2", phase: "queued", status: "queued" },
+      {
+        execution_id: "exec_2",
+        tree_id: "tree_1",
+        branch_id: "branch_2",
+        phase: "failed",
+        status: "failed",
+        node_statuses: {},
+      },
+      { treeId: "tree_1", branchId: "branch_2" },
+    ),
+    {
+      level: "warn",
+      kind: "execution",
+      status: "rejected",
+      scope: {
+        executionId: "exec_2",
+        treeId: "tree_1",
+        branchId: "branch_2",
+        nodeId: null,
+        runtimeId: null,
+      },
+      message: "stopped after earlier branch failure",
+    },
+  );
+});
+
+test("shouldRenderStderr suppresses stderr when it duplicates structured traceback", () => {
+  assert.equal(
+    shouldRenderStderr({
+      stderr:
+        "Cell In[2], line 3\n  print i\n  ^\nSyntaxError: Missing parentheses in call to 'print'. Did you mean print(...)?",
+      error: {
+        ename: "SyntaxError",
+        evalue: "Missing parentheses in call to 'print'. Did you mean print(...)?",
+        traceback: [
+          "(1093641009.py, line 3)",
+          "",
+          "Cell In[2], line 3",
+          "  print i",
+          "  ^",
+          "SyntaxError: Missing parentheses in call to 'print'. Did you mean print(...)?",
+        ],
+      },
+    }),
+    false,
+  );
+});
+
+test("shouldRenderStderr keeps stderr when it contains additional non-error output", () => {
+  assert.equal(
+    shouldRenderStderr({
+      stderr: "warning: deprecated path\ncustom stderr line",
+      error: {
+        ename: "ValueError",
+        evalue: "boom",
+        traceback: ["ValueError: boom"],
+      },
+    }),
+    true,
+  );
+});
+
+test("shouldRequestExecutionResync requests recovery for node events missing target context", () => {
+  assert.equal(
+    shouldRequestExecutionResync({
+      eventType: "NodeStarted",
+      executionId: "exec_1",
+      cellKey: null,
+      executionTarget: null,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldRequestExecutionResync({
+      eventType: "NodeStarted",
+      executionId: "exec_1",
+      cellKey: "tree_1_main_step1",
+      executionTarget: null,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldRequestExecutionResync({
+      eventType: "ExecutionStarted",
+      executionId: "exec_1",
+      cellKey: null,
+      executionTarget: null,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldRequestExecutionResync({
+      eventType: "NodeCompleted",
+      executionId: "exec_1",
+      cellKey: null,
+      executionTarget: { treeId: "tree_1", branchId: "main" },
+    }),
+    false,
+  );
+});
+
+test("shouldHydrateTerminalLogs only hydrates terminal logs once when no logs are loaded", () => {
+  assert.equal(
+    shouldHydrateTerminalLogs({
+      status: "done",
+      logs: null,
+      hydrationKey: "tree_1:main:cell_1:done",
+      loadedHydrationKey: null,
+      isTreeExecutionRuntime: true,
+      treeId: "tree_1",
+      branchId: "main",
+    }),
+    true,
+  );
+  assert.equal(
+    shouldHydrateTerminalLogs({
+      status: "done",
+      logs: { stdout: "ready", stderr: "", outputs: [], error: null, metrics: {} },
+      hydrationKey: "tree_1:main:cell_1:done",
+      loadedHydrationKey: null,
+      isTreeExecutionRuntime: true,
+      treeId: "tree_1",
+      branchId: "main",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldHydrateTerminalLogs({
+      status: "done",
+      logs: null,
+      hydrationKey: "tree_1:main:cell_1:done",
+      loadedHydrationKey: "tree_1:main:cell_1:done",
+      isTreeExecutionRuntime: true,
+      treeId: "tree_1",
+      branchId: "main",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldHydrateTerminalLogs({
+      status: "running",
+      logs: null,
+      hydrationKey: "tree_1:main:cell_1:running",
+      loadedHydrationKey: null,
+      isTreeExecutionRuntime: true,
+      treeId: "tree_1",
+      branchId: "main",
+    }),
+    false,
+  );
+});
+
+test("shouldCoalesceTerminalEvents matches equivalent terminal entries", () => {
+  assert.equal(
+    shouldCoalesceTerminalEvents(
+      {
+        kind: "node",
+        status: "failed",
+        level: "warn",
+        scope: { executionId: "exec_1", treeId: "tree_1", branchId: "main", nodeId: "step1" },
+        stream: null,
+        message: null,
+        error: { ename: "ValueError", evalue: "boom" },
+      },
+      {
+        kind: "node",
+        status: "failed",
+        level: "error",
+        scope: { executionId: "exec_1", treeId: "tree_1", branchId: "main", nodeId: "step1" },
+        stream: null,
+        message: null,
+        error: { ename: "ValueError", evalue: "boom" },
+      },
+    ),
+    true,
+  );
+});
+
+test("appendTerminalEvent coalesces equivalent entries and keeps stronger severity", () => {
+  const coalesced = appendTerminalEvent(
+    [
+      {
+        id: "term-1",
+        ts: 1,
+        kind: "node",
+        status: "failed",
+        level: "warn",
+        scope: { executionId: "exec_1", treeId: "tree_1", branchId: "main", nodeId: "step1" },
+        stream: null,
+        message: null,
+        metrics: null,
+        error: { ename: "ValueError", evalue: "boom", traceback: [] },
+        duration_ms: null,
+      },
+    ],
+    {
+      id: "term-2",
+      ts: 2,
+      kind: "node",
+      status: "failed",
+      level: "error",
+      scope: { executionId: "exec_1", treeId: "tree_1", branchId: "main", nodeId: "step1" },
+      stream: null,
+      message: null,
+      metrics: null,
+      error: { ename: "ValueError", evalue: "boom", traceback: [] },
+      duration_ms: null,
+    },
+  );
+
+  assert.equal(coalesced.length, 1);
+  assert.equal(coalesced[0].level, "error");
+  assert.equal(coalesced[0].id, "term-2");
+});
+
+test("shouldReplaceTerminalEvent matches warn-to-terminal-error escalation on same target", () => {
+  assert.equal(
+    shouldReplaceTerminalEvent(
+      {
+        kind: "node",
+        status: "cancellation_requested",
+        level: "warn",
+        scope: { executionId: "exec_1", treeId: "tree_1", branchId: "main", nodeId: "step1" },
+      },
+      {
+        kind: "node",
+        status: "failed",
+        level: "error",
+        scope: { executionId: "exec_1", treeId: "tree_1", branchId: "main", nodeId: "step1" },
+      },
+    ),
+    true,
+  );
+});
+
+test("appendTerminalEvent replaces immediate warning with terminal error for same target", () => {
+  const coalesced = appendTerminalEvent(
+    [
+      {
+        id: "term-1",
+        ts: 1,
+        kind: "node",
+        status: "cancellation_requested",
+        level: "warn",
+        scope: { executionId: "exec_1", treeId: "tree_1", branchId: "main", nodeId: "step1" },
+        stream: null,
+        message: "step1 cancellation requested",
+        metrics: null,
+        error: null,
+        duration_ms: null,
+      },
+    ],
+    {
+      id: "term-2",
+      ts: 2,
+      kind: "node",
+      status: "failed",
+      level: "error",
+      scope: { executionId: "exec_1", treeId: "tree_1", branchId: "main", nodeId: "step1" },
+      stream: null,
+      message: "step1 failed",
+      metrics: null,
+      error: { ename: "ValueError", evalue: "boom", traceback: [] },
+      duration_ms: null,
+    },
+  );
+
+  assert.equal(coalesced.length, 1);
+  assert.equal(coalesced[0].level, "error");
+  assert.equal(coalesced[0].status, "failed");
+  assert.equal(coalesced[0].id, "term-2");
+});
+
+test("branchRequiresReplay returns true for replay-required runtime health or execution status", () => {
+  assert.equal(
+    branchRequiresReplay({
+      treeId: "tree_1",
+      branchId: "main",
+      runtimeState: { kernel_state: "needs_replay" },
+      executionStatuses: {},
+    }),
+    true,
+  );
+
+  assert.equal(
+    branchRequiresReplay({
+      treeId: "tree_1",
+      branchId: "main",
+      runtimeState: { kernel_state: "ready" },
+      executionStatuses: {
+        exec_1: {
+          tree_id: "tree_1",
+          branch_id: "main",
+          runtime: { replay_required: true },
+        },
+      },
+    }),
+    true,
+  );
+
+  assert.equal(
+    branchRequiresReplay({
+      treeId: "tree_1",
+      branchId: "main",
+      runtimeState: { kernel_state: "ready" },
+      executionStatuses: {
+        exec_1: {
+          tree_id: "tree_1",
+          branch_id: "other",
+          runtime: { replay_required: true },
+        },
+      },
+    }),
+    false,
+  );
+});
+
+test("markReplayRequiredCellStatuses only marks completed and cached branch cells stale", () => {
+  assert.deepEqual(
+    markReplayRequiredCellStatuses(
+      {
+        tree_1_main_step1: "done",
+        tree_1_main_step2: "cached",
+        tree_1_main_step3: "running",
+        tree_1_other_step1: "done",
+      },
+      {
+        treeId: "tree_1",
+        branchId: "main",
+        nodeIds: ["step1", "step2", "step3"],
+      },
+    ),
+    {
+      tree_1_main_step1: "stale",
+      tree_1_main_step2: "stale",
+      tree_1_main_step3: "running",
+      tree_1_other_step1: "done",
+    },
+  );
+});
+
+test("resolvePollWindowExpiry preserves running state without synthetic timeout when disconnected", () => {
+  assert.deepEqual(
+    resolvePollWindowExpiry({ currentStatus: "running", wsConnected: false }),
+    {
+      nextStatus: "running",
+      shouldUpdateStatus: false,
+      shouldInjectSyntheticError: false,
+      logLevel: "warn",
+      logMessage: "poll window ended while disconnected; preserving current state until resync",
+    },
+  );
+});
+
+test("resolvePollWindowExpiry keeps websocket-connected polling non-terminal", () => {
+  assert.deepEqual(
+    resolvePollWindowExpiry({ currentStatus: "running", wsConnected: true }),
+    {
+      nextStatus: "running",
+      shouldUpdateStatus: false,
+      shouldInjectSyntheticError: false,
+      logLevel: "info",
+      logMessage: "poll window ended; waiting for WebSocket updates",
+    },
+  );
+});
+
+test("reconnectResyncTargets returns only actively tracked executions with targets", () => {
+  assert.deepEqual(
+    reconnectResyncTargets({
+      activePollIds: {
+        exec_1: true,
+        exec_2: false,
+        exec_3: true,
+      },
+      executionTargets: {
+        exec_1: { treeId: "tree_1", branchId: "main" },
+        exec_3: { treeId: "tree_2", branchId: "alt" },
+      },
+    }),
+    [
+      {
+        executionId: "exec_1",
+        target: { treeId: "tree_1", branchId: "main" },
+      },
+      {
+        executionId: "exec_3",
+        target: { treeId: "tree_2", branchId: "alt" },
+      },
+    ],
+  );
+});
+
+
+test("deriveRuntimeUi: busy execution wins over kernel state", () => {
+  const ui = deriveRuntimeUi({
+    kernelState: "ready",
+    hasLiveKernel: true,
+    isBusy: true,
+  });
+  assert.equal(ui.tone, "busy");
+  assert.equal(ui.runBlocked, false);
+  assert.deepEqual(ui.menuActions, []);
+});
+
+test("deriveRuntimeUi: kernel_lost surfaces restart-only", () => {
+  const ui = deriveRuntimeUi({
+    kernelState: "kernel_lost",
+    hasLiveKernel: false,
+    isBusy: false,
+  });
+  assert.equal(ui.tone, "error");
+  assert.equal(ui.runBlocked, true);
+  assert.deepEqual(
+    ui.menuActions.map((a) => a.id),
+    ["restart"],
+  );
+});
+
+test("deriveRuntimeUi: switching has no actions and blocks runs", () => {
+  const ui = deriveRuntimeUi({
+    kernelState: "switching",
+    hasLiveKernel: true,
+    isBusy: false,
+  });
+  assert.equal(ui.tone, "busy");
+  assert.equal(ui.runBlocked, true);
+  assert.deepEqual(ui.menuActions, []);
+});
+
+test("deriveRuntimeUi: kernel-off (no live kernel) shows muted with no actions", () => {
+  const ui = deriveRuntimeUi({
+    kernelState: "ready",
+    hasLiveKernel: false,
+    isBusy: false,
+  });
+  assert.equal(ui.tone, "muted");
+  assert.equal(ui.runBlocked, false);
+  assert.deepEqual(ui.menuActions, []);
+});
+
+test("deriveRuntimeUi: needs_replay with live kernel offers restart and shutdown", () => {
+  const ui = deriveRuntimeUi({
+    kernelState: "needs_replay",
+    hasLiveKernel: true,
+    isBusy: false,
+  });
+  assert.equal(ui.tone, "warn");
+  assert.equal(ui.runBlocked, true);
+  assert.deepEqual(
+    ui.menuActions.map((a) => a.id),
+    ["restart", "shutdown"],
+  );
+  assert.equal(
+    ui.menuActions.find((a) => a.id === "shutdown").kind,
+    "danger",
+  );
+});
+
+test("deriveRuntimeUi: ready kernel offers full menu", () => {
+  const ui = deriveRuntimeUi({
+    kernelState: "ready",
+    hasLiveKernel: true,
+    isBusy: false,
+  });
+  assert.equal(ui.tone, "ready");
+  assert.equal(ui.runBlocked, false);
+  assert.deepEqual(
+    ui.menuActions.map((a) => a.id),
+    ["restart", "shutdown"],
+  );
+});
+
+test("deriveRuntimeUi: tolerates missing/garbage inputs", () => {
+  const empty = deriveRuntimeUi();
+  assert.equal(empty.tone, "muted");
+  assert.deepEqual(empty.menuActions, []);
+  const garbage = deriveRuntimeUi({
+    kernelState: "  KERNEL_LOST  ",
+    hasLiveKernel: false,
+  });
+  assert.equal(garbage.tone, "error");
+  assert.deepEqual(
+    garbage.menuActions.map((a) => a.id),
+    ["restart"],
   );
 });

@@ -104,6 +104,21 @@ pub trait WorkspaceApi: Send + Sync {
         tree_id: &ExperimentTreeId,
     ) -> Option<TreeRuntimeState>;
 
+    /// Inspect current tree-kernel health and runtime metadata.
+    async fn inspect_tree_kernel(
+        &self,
+        tree_id: &ExperimentTreeId,
+    ) -> TineResult<RuntimeHealthSnapshot>;
+
+    /// Shut down a tree-owned kernel and require replay before the next execution.
+    async fn shutdown_tree_kernel(
+        &self,
+        tree_id: &ExperimentTreeId,
+    ) -> TineResult<TreeRuntimeState>;
+
+    /// Restart a tree-owned kernel.
+    async fn restart_tree_kernel(&self, tree_id: &ExperimentTreeId) -> TineResult<()>;
+
     /// Execute a single cell within a branch context.
     async fn execute_cell_in_experiment_tree_branch(
         &self,

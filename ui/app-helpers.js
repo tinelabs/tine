@@ -77,6 +77,118 @@ export function resolveWebSocketUrl(locationLike, baseUrl) {
   return `${locationLike?.protocol === "https:" ? "wss" : "ws"}://${locationLike?.host || ""}/ws`;
 }
 
+function stripAnsiText(text) {
+  return String(text || "").replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function normalizeLogText(text) {
+  return stripAnsiText(text).trim();
+}
+
+export function shouldRenderStderr(logs) {
+  const stderr = normalizeLogText(logs?.stderr || "");
+  if (!stderr) return false;
+
+  const error = logs?.error || null;
+  if (!error) return true;
+
+  const errorSummary = normalizeLogText(
+    `${error.ename || "Error"}${error.evalue ? `: ${error.evalue}` : ""}`,
+  );
+  const traceback = normalizeLogText(
+    Array.isArray(error.traceback) ? error.traceback.join("\n") : "",
+  );
+
+  if (stderr === errorSummary || stderr === traceback) {
+    return false;
+  }
+  if (traceback && (traceback.includes(stderr) || stderr.includes(traceback))) {
+    return false;
+  }
+
+  return true;
+}
+
+function terminalEventSeverity(level) {
+  switch (String(level || "info").trim().toLowerCase()) {
+    case "error":
+      return 3;
+    case "warn":
+    case "warning":
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+function sameTerminalScope(left = {}, right = {}) {
+  return (
+    (left.executionId || null) === (right.executionId || null) &&
+    (left.runtimeId || null) === (right.runtimeId || null) &&
+    (left.treeId || null) === (right.treeId || null) &&
+    (left.branchId || null) === (right.branchId || null) &&
+    (left.nodeId || null) === (right.nodeId || null)
+  );
+}
+
+function isTerminalFailureStatus(status) {
+  return ["failed", "timed_out", "rejected"].includes(
+    String(status || "").trim().toLowerCase(),
+  );
+}
+
+export function shouldCoalesceTerminalEvents(previousEvent, nextEvent) {
+  if (!previousEvent || !nextEvent) return false;
+  return (
+    String(previousEvent.kind || "") === String(nextEvent.kind || "") &&
+    String(previousEvent.status || "") === String(nextEvent.status || "") &&
+    String(previousEvent.stream || "") === String(nextEvent.stream || "") &&
+    String(previousEvent.message || "") === String(nextEvent.message || "") &&
+    String(previousEvent.error?.ename || "") === String(nextEvent.error?.ename || "") &&
+    String(previousEvent.error?.evalue || "") === String(nextEvent.error?.evalue || "") &&
+    sameTerminalScope(previousEvent.scope, nextEvent.scope)
+  );
+}
+
+export function shouldReplaceTerminalEvent(previousEvent, nextEvent) {
+  if (!previousEvent || !nextEvent) return false;
+
+  return (
+    String(previousEvent.kind || "") === String(nextEvent.kind || "") &&
+    sameTerminalScope(previousEvent.scope, nextEvent.scope) &&
+    terminalEventSeverity(nextEvent.level) > terminalEventSeverity(previousEvent.level) &&
+    isTerminalFailureStatus(nextEvent.status)
+  );
+}
+
+export function appendTerminalEvent(events, nextEvent, maxEvents = 400) {
+  const existingEvents = Array.isArray(events) ? events : [];
+  if (!nextEvent) return existingEvents.slice(-maxEvents);
+
+  const previousEvent = existingEvents[existingEvents.length - 1] || null;
+  if (
+    !shouldCoalesceTerminalEvents(previousEvent, nextEvent) &&
+    !shouldReplaceTerminalEvent(previousEvent, nextEvent)
+  ) {
+    return [...existingEvents, nextEvent].slice(-maxEvents);
+  }
+
+  const keepNext = terminalEventSeverity(nextEvent.level) >= terminalEventSeverity(previousEvent.level);
+  const mergedEvent = keepNext
+    ? {
+        ...previousEvent,
+        ...nextEvent,
+        id: nextEvent.id || previousEvent.id,
+      }
+    : {
+        ...nextEvent,
+        ...previousEvent,
+        id: previousEvent.id,
+      };
+
+  return [...existingEvents.slice(0, -1), mergedEvent].slice(-maxEvents);
+}
+
 export function normalizeFileTreePath(path) {
   if (!path || path === "/" || path === ".") return "";
   return String(path).replace(/^\/+/, "").replace(/\/+$/, "");
@@ -87,6 +199,27 @@ export function watchedDirForPath(path) {
   const idx = normalized.lastIndexOf("/");
   if (idx < 0) return "";
   return normalizeFileTreePath(normalized.slice(0, idx));
+}
+
+export function fileTreeRefreshKey(dirPath = "", projectId = null) {
+  const dirKey = normalizeFileTreePath(dirPath);
+  return `${projectId || "workspace"}:${dirKey || "."}`;
+}
+
+export function registerPendingFileTreeRefresh(
+  pendingRefreshKeys,
+  dirPath = "",
+  projectId = null,
+) {
+  const nextPendingRefreshKeys = new Set(pendingRefreshKeys || []);
+  const refreshKey = fileTreeRefreshKey(dirPath, projectId);
+  const shouldSchedule = !nextPendingRefreshKeys.has(refreshKey);
+  nextPendingRefreshKeys.add(refreshKey);
+  return {
+    refreshKey,
+    shouldSchedule,
+    pendingRefreshKeys: nextPendingRefreshKeys,
+  };
 }
 
 export function pickActiveBranchId(tree, currentBranchId, runtimeState = null) {
@@ -147,6 +280,213 @@ export function normalizeSavedExperimentTreePayload(payload, fallbackDefinition 
   return fallbackDefinition;
 }
 
+export function branchRequiresReplay({
+  treeId,
+  branchId,
+  runtimeState = null,
+  runtimeHealth = null,
+  executionStatuses = null,
+}) {
+  const kernelState = String(
+    runtimeState?.kernel_state || runtimeState?.kernelState || "",
+  )
+    .trim()
+    .toLowerCase();
+  const hasLiveKernel =
+    runtimeHealth?.has_live_kernel ?? runtimeHealth?.hasLiveKernel ?? null;
+  if (["kernel_lost", "switching"].includes(kernelState)) {
+    return true;
+  }
+  if (kernelState === "needs_replay" && hasLiveKernel !== false) {
+    return true;
+  }
+
+  return Object.values(executionStatuses || {}).some((status) => {
+    const statusTreeId = status?.tree_id || status?.treeId || null;
+    const statusBranchId = status?.branch_id || status?.branchId || null;
+    const runtimeHasLiveKernel =
+      status?.runtime?.has_live_kernel ?? status?.runtime?.hasLiveKernel ?? null;
+    return (
+      statusTreeId === treeId &&
+      statusBranchId === branchId &&
+      Boolean(status?.runtime?.replay_required) &&
+      runtimeHasLiveKernel !== false
+    );
+  });
+}
+
+export function markReplayRequiredCellStatuses(
+  cellStatuses,
+  { treeId, branchId, nodeIds = [] },
+) {
+  let changed = false;
+  const nextStatuses = { ...cellStatuses };
+  for (const nodeId of nodeIds) {
+    const cellKey = `${treeId}_${branchId}_${nodeId}`;
+    if (["done", "cached"].includes(nextStatuses[cellKey])) {
+      nextStatuses[cellKey] = "stale";
+      changed = true;
+    }
+  }
+  return changed ? nextStatuses : cellStatuses;
+}
+
+export function resolvePollWindowExpiry({ currentStatus, wsConnected }) {
+  const normalizedStatus = currentStatus == null
+    ? null
+    : String(currentStatus).trim().toLowerCase();
+  if (wsConnected) {
+    return {
+      nextStatus: normalizedStatus,
+      shouldUpdateStatus: false,
+      shouldInjectSyntheticError: false,
+      logLevel: "info",
+      logMessage: "poll window ended; waiting for WebSocket updates",
+    };
+  }
+
+  return {
+    nextStatus: normalizedStatus,
+    shouldUpdateStatus: false,
+    shouldInjectSyntheticError: false,
+    logLevel: "warn",
+    logMessage: "poll window ended while disconnected; preserving current state until resync",
+  };
+}
+
+export function reconnectResyncTargets({
+  activePollIds = {},
+  executionTargets = {},
+}) {
+  return Object.entries(activePollIds)
+    .filter(([, active]) => active !== false)
+    .map(([executionId]) => ({
+      executionId,
+      target: executionTargets[executionId] || null,
+    }))
+    .filter((item) => Boolean(item.executionId));
+}
+
+export function nextAsyncRequestId(previousId = 0) {
+  const normalizedPreviousId = Number(previousId);
+  if (!Number.isFinite(normalizedPreviousId) || normalizedPreviousId < 0) {
+    return 1;
+  }
+  return Math.floor(normalizedPreviousId) + 1;
+}
+
+export function shouldApplyScopedRequestResult({
+  requestId,
+  latestRequestId,
+  requestScope = null,
+  currentScope = null,
+}) {
+  if (!Number.isFinite(Number(requestId)) || !Number.isFinite(Number(latestRequestId))) {
+    return false;
+  }
+  if (Number(requestId) !== Number(latestRequestId)) {
+    return false;
+  }
+  return String(requestScope || "") === String(currentScope || "");
+}
+
+export function nodeStatusToCellStatus(status) {
+  switch (String(status || "")) {
+    case "queued":
+    case "pending":
+      return "queued";
+    case "running":
+      return "running";
+    case "completed":
+      return "done";
+    case "cache_hit":
+      return "cached";
+    case "failed":
+    case "interrupted":
+      return "failed";
+    case "skipped":
+      return "idle";
+    default:
+      return null;
+  }
+}
+
+function snapshotCellKey({ runtimeId = null, treeId = null, branchId = null, nodeId }) {
+  if (!nodeId) return null;
+  if (treeId && branchId) return `${treeId}_${branchId}_${nodeId}`;
+  const fallbackRuntimeId = treeId || runtimeId;
+  return fallbackRuntimeId ? `${fallbackRuntimeId}_${nodeId}` : null;
+}
+
+export function applyExecutionSnapshotToState(
+  state,
+  { executionId, status, target = null, runtimeId = null },
+) {
+  if (!executionId || !status) return state;
+
+  const previousState = state || {};
+  const treeId = status.tree_id || target?.treeId || null;
+  const branchId = status.branch_id || target?.branchId || null;
+  const targetKind = status.target_kind || target?.targetKind || null;
+  const normalizedStatus = {
+    ...status,
+    execution_id: status.execution_id || executionId,
+    tree_id: treeId,
+    branch_id: branchId,
+    target_kind: targetKind,
+  };
+  const nextExecutionTargets = {
+    ...(previousState.executionTargets || {}),
+    [executionId]: {
+      treeId,
+      branchId,
+      targetKind,
+    },
+  };
+  const nextExecutionStatuses = {
+    ...(previousState.executionStatuses || {}),
+    [executionId]: normalizedStatus,
+  };
+  const nextCellStatuses = { ...(previousState.cellStatuses || {}) };
+
+  for (const nodeId of Object.keys(status.node_statuses || {})) {
+    const cellKey = snapshotCellKey({ runtimeId, treeId, branchId, nodeId });
+    if (!cellKey) continue;
+    const nextStatus = nodeStatusToCellStatus(status.node_statuses?.[nodeId]);
+    if (nextStatus) nextCellStatuses[cellKey] = nextStatus;
+  }
+
+  return {
+    ...previousState,
+    executionTargets: nextExecutionTargets,
+    executionStatuses: nextExecutionStatuses,
+    cellStatuses: nextCellStatuses,
+  };
+}
+
+export function finishTrackedExecutionState(state, executionId) {
+  if (!executionId) return state;
+  const previousState = state || {};
+  const activePollIds = { ...(previousState.activePollIds || {}) };
+  delete activePollIds[executionId];
+  const executionTargets = { ...(previousState.executionTargets || {}) };
+  const executionStatuses = { ...(previousState.executionStatuses || {}) };
+  delete executionTargets[executionId];
+  delete executionStatuses[executionId];
+  const activeCellExecutions = { ...(previousState.activeCellExecutions || {}) };
+  for (const [cellKey, currentExecutionId] of Object.entries(activeCellExecutions)) {
+    if (currentExecutionId === executionId) delete activeCellExecutions[cellKey];
+  }
+
+  return {
+    ...previousState,
+    activePollIds,
+    executionTargets,
+    executionStatuses,
+    activeCellExecutions,
+  };
+}
+
 const EXECUTION_PHASE_LABELS = {
   queued: "Queued",
   preparing_environment: "Preparing environment",
@@ -174,16 +514,6 @@ function normalizedExecutionPhaseParts(status) {
 function lowerCaseFirst(text) {
   if (!text) return "";
   return text.charAt(0).toLowerCase() + text.slice(1);
-}
-
-function executionTargetLabel(status, executionTarget) {
-  const branchId = status?.branch_id || executionTarget?.branchId || null;
-  const treeId = status?.tree_id || executionTarget?.treeId || null;
-  const executionId = status?.execution_id || null;
-  if (branchId) return `Branch ${branchId}`;
-  if (treeId) return `Tree ${treeId}`;
-  if (executionId) return `Execution ${executionId}`;
-  return "Execution";
 }
 
 export function describeExecutionProgress(status, fallbackCellStatus = "idle") {
@@ -261,8 +591,28 @@ export function buildExecutionStatusEvent(previousStatus, nextStatus, executionT
     return null;
   }
 
+  const skippedAfterEarlierBranchFailure =
+    effectivePhase === "failed" &&
+    (previous.phase === "queued" || previous.lifecycle === "queued") &&
+    Object.keys(nextStatus.node_statuses || {}).length === 0;
+
+  if (skippedAfterEarlierBranchFailure) {
+    return {
+      level: "warn",
+      kind: "execution",
+      status: "rejected",
+      scope: {
+        executionId: nextStatus.execution_id || null,
+        treeId: nextStatus.tree_id || executionTarget?.treeId || null,
+        branchId: nextStatus.branch_id || executionTarget?.branchId || null,
+        nodeId: null,
+        runtimeId: null,
+      },
+      message: "stopped after earlier branch failure",
+    };
+  }
+
   const progress = describeExecutionProgress(nextStatus, next.lifecycle || "idle");
-  const label = executionTargetLabel(nextStatus, executionTarget);
   return {
     level: executionStatusLevel(nextStatus),
     kind: "execution",
@@ -274,6 +624,137 @@ export function buildExecutionStatusEvent(previousStatus, nextStatus, executionT
       nodeId: null,
       runtimeId: null,
     },
-    message: `${label} ${lowerCaseFirst(progress.message)}`,
+    message: lowerCaseFirst(progress.message),
+  };
+}
+
+export function shouldRequestExecutionResync({
+  eventType,
+  executionId,
+  cellKey,
+  executionTarget = null,
+}) {
+  if (!executionId) return false;
+  if (cellKey) return false;
+  if (executionTarget?.treeId && executionTarget?.branchId) return false;
+  return [
+    "NodeStarted",
+    "NodeStream",
+    "NodeDisplayData",
+    "NodeDisplayUpdate",
+    "NodeCompleted",
+    "NodeCacheHit",
+    "NodeFailed",
+  ].includes(String(eventType || ""));
+}
+
+function hasRenderableLogs(logs) {
+  return !!(
+    logs &&
+    (logs.stdout ||
+      logs.stderr ||
+      logs.error ||
+      (Array.isArray(logs.outputs) && logs.outputs.length) ||
+      (logs.metrics && Object.keys(logs.metrics).length) ||
+      logs.duration_ms != null)
+  );
+}
+
+export function shouldHydrateTerminalLogs({
+  status,
+  logs,
+  hydrationKey,
+  loadedHydrationKey,
+  isTreeExecutionRuntime,
+  treeId,
+  branchId,
+}) {
+  const normalizedStatus = String(status || "").trim().toLowerCase();
+  if (!["done", "failed", "cached"].includes(normalizedStatus)) {
+    return false;
+  }
+  if (!isTreeExecutionRuntime || !treeId || !branchId || !hydrationKey) {
+    return false;
+  }
+  if (loadedHydrationKey === hydrationKey) {
+    return false;
+  }
+  if (hasRenderableLogs(logs)) {
+    return false;
+  }
+  return true;
+}
+
+const RUNTIME_UI_DEFAULT = Object.freeze({
+  tone: "muted",
+  label: "Off",
+  title: "Kernel off. The next branch run starts from a fresh kernel.",
+  runBlocked: false,
+  menuActions: [],
+});
+
+const RESTART_ACTION = Object.freeze({
+  id: "restart",
+  label: "Restart kernel",
+  kind: "normal",
+});
+const SHUTDOWN_ACTION = Object.freeze({
+  id: "shutdown",
+  label: "Turn off kernel",
+  kind: "danger",
+});
+
+export function deriveRuntimeUi({
+  kernelState = "",
+  hasLiveKernel = false,
+  isBusy = false,
+} = {}) {
+  const state = String(kernelState || "").trim().toLowerCase();
+  if (isBusy) {
+    return {
+      tone: "busy",
+      label: "Busy",
+      title: "Kernel busy. A run is using this branch runtime.",
+      runBlocked: false,
+      menuActions: [],
+    };
+  }
+  if (state === "kernel_lost") {
+    return {
+      tone: "error",
+      label: "Lost",
+      title: "Kernel lost. Restart to recover this runtime.",
+      runBlocked: true,
+      menuActions: [RESTART_ACTION],
+    };
+  }
+  if (state === "switching") {
+    return {
+      tone: "busy",
+      label: "Preparing",
+      title: "Preparing runtime. Branch context is being prepared.",
+      runBlocked: true,
+      menuActions: [],
+    };
+  }
+  if (!hasLiveKernel) {
+    return { ...RUNTIME_UI_DEFAULT };
+  }
+  if (state === "needs_replay") {
+    return {
+      tone: "warn",
+      label: "Replay required",
+      title:
+        "Replay required. Live kernel context is stale. Restart or turn it off to start clean.",
+      runBlocked: true,
+      menuActions: [RESTART_ACTION, SHUTDOWN_ACTION],
+    };
+  }
+  return {
+    tone: "ready",
+    label: "Ready",
+    title: "Kernel ready.",
+    runBlocked: false,
+    menuActions: [RESTART_ACTION, SHUTDOWN_ACTION],
   };
 }

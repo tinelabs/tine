@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -350,6 +352,12 @@ async fn open_temp_workspace_with_max_kernels(max_kernels: usize) -> (TempDir, W
     (tmp, ws)
 }
 
+async fn open_workspace_with_store(tmp: &TempDir, store: Arc<dyn ArtifactStore>) -> Workspace {
+    Workspace::open(tmp.path().to_path_buf(), store, 4)
+        .await
+        .expect("failed to open workspace")
+}
+
 fn is_terminal_execution_status(status: &tine_core::ExecutionStatus) -> bool {
     matches!(
         status.status,
@@ -593,6 +601,125 @@ fn two_cell_tree() -> ExperimentTreeDef {
         budget: None,
         created_at: chrono::Utc::now(),
     }
+}
+
+fn read_counter(path: &Path) -> u64 {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn cached_single_cell_tree(
+    tree_id: &str,
+    counter_path: &Path,
+    code_marker: &str,
+) -> ExperimentTreeDef {
+    let mut tree = trivial_tree();
+    let counter_literal = serde_json::to_string(&counter_path.to_string_lossy().to_string())
+        .expect("failed to serialize counter path");
+    tree.id = ExperimentTreeId::new(tree_id);
+    tree.name = tree_id.to_string();
+    tree.cells[0].tree_id = tree.id.clone();
+    tree.cells[0].cache = true;
+    tree.cells[0].code.source = format!(
+        "from pathlib import Path\n_counter_path = Path({counter_literal})\ncount = int(_counter_path.read_text()) if _counter_path.exists() else 0\ncount += 1\n_counter_path.write_text(str(count))\nstep1 = count\nprint(step1, flush=True)\n# {code_marker}\n"
+    );
+    tree
+}
+
+fn cached_two_cell_tree(
+    tree_id: &str,
+    root_counter_path: &Path,
+    leaf_counter_path: &Path,
+    root_value: u64,
+) -> ExperimentTreeDef {
+    let mut tree = two_cell_tree();
+    let root_literal = serde_json::to_string(&root_counter_path.to_string_lossy().to_string())
+        .expect("failed to serialize root counter path");
+    let leaf_literal = serde_json::to_string(&leaf_counter_path.to_string_lossy().to_string())
+        .expect("failed to serialize leaf counter path");
+    tree.id = ExperimentTreeId::new(tree_id);
+    tree.name = tree_id.to_string();
+    for cell in &mut tree.cells {
+        cell.tree_id = tree.id.clone();
+        cell.cache = true;
+    }
+    tree.cells[0].code.source = format!(
+        "from pathlib import Path\n_root_counter_path = Path({root_literal})\nroot_count = int(_root_counter_path.read_text()) if _root_counter_path.exists() else 0\nroot_count += 1\n_root_counter_path.write_text(str(root_count))\nstep1 = {root_value}\nprint(step1, flush=True)\n"
+    );
+    tree.cells[1].code.source = format!(
+        "from pathlib import Path\n_leaf_counter_path = Path({leaf_literal})\nleaf_count = int(_leaf_counter_path.read_text()) if _leaf_counter_path.exists() else 0\nleaf_count += 1\n_leaf_counter_path.write_text(str(leaf_count))\nstep2 = step1 + 1\nprint(step2, flush=True)\n"
+    );
+    tree
+}
+
+async fn execute_branch_and_wait(
+    ws: &Workspace,
+    tree_id: &ExperimentTreeId,
+    branch_id: &BranchId,
+) -> tine_core::ExecutionStatus {
+    let execution_id = ws
+        .execute_branch_in_experiment_tree(tree_id, branch_id)
+        .await
+        .expect("failed to execute branch");
+    wait_for_execution_finished(ws, &execution_id).await
+}
+
+fn delete_content_addressed_artifact(tmp: &TempDir) {
+    let artifact_dir = tmp.path().join(".tine").join("artifacts");
+    let entries = fs::read_dir(&artifact_dir).expect("failed to read artifact dir");
+    let content_addressed: Vec<_> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .map(|name| name.len() == 64 && !name.contains('.'))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(
+        content_addressed.len(),
+        1,
+        "expected exactly one content-addressed artifact, found {:?}",
+        content_addressed
+            .iter()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+    );
+    fs::remove_file(content_addressed[0].path()).expect("failed to delete cached artifact");
+}
+
+fn content_addressed_artifact_path(tmp: &TempDir) -> PathBuf {
+    let artifact_dir = tmp.path().join(".tine").join("artifacts");
+    let entries = fs::read_dir(&artifact_dir).expect("failed to read artifact dir");
+    let content_addressed: Vec<_> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .map(|name| name.len() == 64 && !name.contains('.'))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(
+        content_addressed.len(),
+        1,
+        "expected exactly one content-addressed artifact, found {:?}",
+        content_addressed
+            .iter()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+    );
+    content_addressed[0].path()
+}
+
+fn corrupt_content_addressed_artifact(tmp: &TempDir) {
+    let artifact_path = content_addressed_artifact_path(tmp);
+    fs::write(&artifact_path, b"not-a-valid-cloudpickle-payload")
+        .expect("failed to corrupt cached artifact");
 }
 
 // ===========================================================================
@@ -1961,6 +2088,220 @@ async fn test_mark_tree_kernel_lost_clears_materialization() {
     assert!(stored.materialized_path_cell_ids.is_empty());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_shutdown_tree_kernel_cancels_running_execution_and_requires_replay() {
+    let (_tmp, ws) = open_temp_workspace().await;
+    let tree_id = ExperimentTreeId::new("shutdown-api-tree");
+    let branch_id = BranchId::new("main");
+    let cell_id = CellId::new("step1");
+    let tree = ExperimentTreeDef {
+        id: tree_id.clone(),
+        name: "shutdown-api-tree".to_string(),
+        project_id: None,
+        root_branch_id: branch_id.clone(),
+        branches: vec![BranchDef {
+            id: branch_id.clone(),
+            name: "main".to_string(),
+            parent_branch_id: None,
+            branch_point_cell_id: None,
+            cell_order: vec![cell_id.clone()],
+            display: HashMap::new(),
+        }],
+        cells: vec![CellDef {
+            id: cell_id.clone(),
+            tree_id: tree_id.clone(),
+            branch_id: branch_id.clone(),
+            name: "step1".to_string(),
+            code: NodeCode {
+                source: "import time\nprint('starting shutdown api test', flush=True)\ntime.sleep(20)\nprint('should not reach shutdown api end', flush=True)\nstep1 = 42\n".to_string(),
+                language: "python".to_string(),
+            },
+            upstream_cell_ids: vec![],
+            declared_outputs: vec![SlotName::new("step1")],
+            cache: false,
+            map_over: None,
+            map_concurrency: None,
+            tags: HashMap::new(),
+            revision_id: None,
+            state: CellRuntimeState::Clean,
+        }],
+        environment: Default::default(),
+        execution_mode: ExecutionMode::Parallel,
+        budget: None,
+        created_at: chrono::Utc::now(),
+    };
+    ws.save_experiment_tree(&tree).await.unwrap();
+
+    let execution_id = ws
+        .execute_branch_in_experiment_tree(&tree_id, &branch_id)
+        .await
+        .unwrap();
+
+    let running_status = wait_for_node_running(&ws, &execution_id, &NodeId::new("step1")).await;
+    assert_eq!(running_status.tree_id.as_ref(), Some(&tree_id));
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let shutdown_state = ws.shutdown_tree_kernel(&tree_id).await.unwrap();
+    assert_eq!(shutdown_state.kernel_state, TreeKernelState::NeedsReplay);
+    assert!(shutdown_state.materialized_path_cell_ids.is_empty());
+    assert_eq!(shutdown_state.last_prepared_cell_id, None);
+
+    let final_status = wait_for_execution_finished(&ws, &execution_id).await;
+    assert_eq!(final_status.tree_id.as_ref(), Some(&tree_id));
+    assert_eq!(final_status.status, ExecutionLifecycleStatus::Cancelled);
+    assert_eq!(final_status.phase, tine_core::ExecutionPhase::Cancelled);
+    assert!(final_status.cancellation_requested_at.is_some());
+    assert_eq!(
+        final_status.node_statuses.get(&NodeId::new("step1")),
+        Some(&NodeStatus::Interrupted)
+    );
+
+    let logs = ws
+        .logs_for_tree_cell(&tree_id, &branch_id, &cell_id)
+        .await
+        .unwrap();
+    assert!(
+        logs.stdout.contains("starting shutdown api test"),
+        "expected partial stdout to persist after shutdown, got {:?}",
+        logs.stdout
+    );
+    assert!(
+        !logs.stdout.contains("should not reach shutdown api end"),
+        "unexpected post-shutdown stdout in {:?}",
+        logs.stdout
+    );
+
+    let stored = ws.get_tree_runtime_state(&tree_id).await.unwrap();
+    assert_eq!(stored.kernel_state, TreeKernelState::NeedsReplay);
+    assert!(stored.materialized_path_cell_ids.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_inspect_tree_kernel_with_no_kernel_returns_empty_snapshot() {
+    let (_tmp, ws) = open_temp_workspace().await;
+    let tree_id = ExperimentTreeId::new("inspect-empty-tree");
+    let branch_id = BranchId::new("main");
+    let cell_id = CellId::new("cell_1");
+    let tree = ExperimentTreeDef {
+        id: tree_id.clone(),
+        name: "inspect-empty-tree".to_string(),
+        project_id: None,
+        root_branch_id: branch_id.clone(),
+        branches: vec![BranchDef {
+            id: branch_id.clone(),
+            name: "main".to_string(),
+            parent_branch_id: None,
+            branch_point_cell_id: None,
+            cell_order: vec![cell_id.clone()],
+            display: HashMap::new(),
+        }],
+        cells: vec![CellDef {
+            id: cell_id.clone(),
+            tree_id: tree_id.clone(),
+            branch_id: branch_id.clone(),
+            name: "cell_1".to_string(),
+            code: NodeCode {
+                source: "cell_1 = 1".to_string(),
+                language: "python".to_string(),
+            },
+            upstream_cell_ids: vec![],
+            declared_outputs: vec![SlotName::new("cell_1")],
+            cache: false,
+            map_over: None,
+            map_concurrency: None,
+            tags: HashMap::new(),
+            revision_id: None,
+            state: CellRuntimeState::Clean,
+        }],
+        environment: Default::default(),
+        execution_mode: ExecutionMode::Parallel,
+        budget: None,
+        created_at: chrono::Utc::now(),
+    };
+    ws.save_experiment_tree(&tree).await.unwrap();
+
+    let snap = ws.inspect_tree_kernel(&tree_id).await.unwrap();
+    assert_eq!(snap.tree_id, tree_id);
+    assert!(!snap.has_live_kernel, "fresh tree must report no live kernel");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_inspect_tree_kernel_after_execution_reports_live_kernel_then_replay_after_shutdown() {
+    let (_tmp, ws) = open_temp_workspace().await;
+    let tree_id = ExperimentTreeId::new("inspect-live-tree");
+    let branch_id = BranchId::new("main");
+    let cell_id = CellId::new("cell_1");
+    let tree = ExperimentTreeDef {
+        id: tree_id.clone(),
+        name: "inspect-live-tree".to_string(),
+        project_id: None,
+        root_branch_id: branch_id.clone(),
+        branches: vec![BranchDef {
+            id: branch_id.clone(),
+            name: "main".to_string(),
+            parent_branch_id: None,
+            branch_point_cell_id: None,
+            cell_order: vec![cell_id.clone()],
+            display: HashMap::new(),
+        }],
+        cells: vec![CellDef {
+            id: cell_id.clone(),
+            tree_id: tree_id.clone(),
+            branch_id: branch_id.clone(),
+            name: "cell_1".to_string(),
+            code: NodeCode {
+                source: "cell_1 = 1".to_string(),
+                language: "python".to_string(),
+            },
+            upstream_cell_ids: vec![],
+            declared_outputs: vec![SlotName::new("cell_1")],
+            cache: false,
+            map_over: None,
+            map_concurrency: None,
+            tags: HashMap::new(),
+            revision_id: None,
+            state: CellRuntimeState::Clean,
+        }],
+        environment: Default::default(),
+        execution_mode: ExecutionMode::Parallel,
+        budget: None,
+        created_at: chrono::Utc::now(),
+    };
+    ws.save_experiment_tree(&tree).await.unwrap();
+
+    let exec_id = ws
+        .execute_branch_in_experiment_tree(&tree_id, &branch_id)
+        .await
+        .unwrap();
+    let _ = wait_for_execution_finished(&ws, &exec_id).await;
+
+    let live = ws.inspect_tree_kernel(&tree_id).await.unwrap();
+    assert_eq!(live.tree_id, tree_id);
+    assert!(
+        live.has_live_kernel,
+        "expected live kernel after successful execution: {:?}",
+        live
+    );
+    assert!(!live.replay_required);
+
+    ws.shutdown_tree_kernel(&tree_id).await.unwrap();
+
+    let after = ws.inspect_tree_kernel(&tree_id).await.unwrap();
+    assert!(
+        !after.has_live_kernel,
+        "kernel must report dead after shutdown_tree_kernel: {:?}",
+        after
+    );
+    assert!(
+        after.replay_required,
+        "replay must be required after shutdown: {:?}",
+        after
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn test_root_branch_single_cell_execute_uses_tree_runtime() {
@@ -2372,6 +2713,214 @@ print(step1)
 
 #[tokio::test]
 #[serial]
+#[ignore]
+async fn test_cache_hit_reuses_artifact_without_reexecuting_leaf() {
+    let (tmp, ws) = open_temp_workspace().await;
+    let counter_path = tmp.path().join("cache-hit-counter.txt");
+    let tree = cached_single_cell_tree("cache-hit-tree", &counter_path, "v1");
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+    let branch_id = tree.root_branch_id.clone();
+
+    let status1 = execute_branch_and_wait(&ws, &tree_id, &branch_id).await;
+    assert_eq!(status1.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(read_counter(&counter_path), 1);
+
+    let status2 = execute_branch_and_wait(&ws, &tree_id, &branch_id).await;
+    assert_eq!(status2.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(read_counter(&counter_path), 1);
+    assert_eq!(
+        status2.node_statuses.get(&NodeId::new("step1")),
+        Some(&NodeStatus::CacheHit)
+    );
+}
+
+#[tokio::test]
+#[serial]
+#[ignore]
+async fn test_cache_miss_when_leaf_source_changes() {
+    let (tmp, ws) = open_temp_workspace().await;
+    let counter_path = tmp.path().join("cache-code-change-counter.txt");
+    let tree = cached_single_cell_tree("cache-code-change-tree", &counter_path, "v1");
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+    let branch_id = tree.root_branch_id.clone();
+
+    let status1 = execute_branch_and_wait(&ws, &tree_id, &branch_id).await;
+    assert_eq!(status1.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(read_counter(&counter_path), 1);
+
+    ws.update_cell_code_in_experiment_tree(
+        &tree_id,
+        &CellId::new("step1"),
+        &cached_single_cell_tree("cache-code-change-tree", &counter_path, "v2").cells[0]
+            .code
+            .source,
+    )
+    .await
+    .unwrap();
+
+    let status2 = execute_branch_and_wait(&ws, &tree_id, &branch_id).await;
+    assert_eq!(status2.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(read_counter(&counter_path), 2);
+    assert_eq!(
+        status2.node_statuses.get(&NodeId::new("step1")),
+        Some(&NodeStatus::Completed)
+    );
+}
+
+#[tokio::test]
+#[serial]
+#[ignore]
+async fn test_cache_miss_when_upstream_output_changes() {
+    let (tmp, ws) = open_temp_workspace().await;
+    let root_counter_path = tmp.path().join("cache-input-root-counter.txt");
+    let leaf_counter_path = tmp.path().join("cache-input-leaf-counter.txt");
+    let tree = cached_two_cell_tree(
+        "cache-input-change-tree",
+        &root_counter_path,
+        &leaf_counter_path,
+        10,
+    );
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+    let branch_id = tree.root_branch_id.clone();
+
+    let status1 = execute_branch_and_wait(&ws, &tree_id, &branch_id).await;
+    assert_eq!(status1.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(read_counter(&root_counter_path), 1);
+    assert_eq!(read_counter(&leaf_counter_path), 1);
+
+    let updated_tree = cached_two_cell_tree(
+        "cache-input-change-tree",
+        &root_counter_path,
+        &leaf_counter_path,
+        20,
+    );
+    ws.update_cell_code_in_experiment_tree(
+        &tree_id,
+        &CellId::new("step1"),
+        &updated_tree.cells[0].code.source,
+    )
+    .await
+    .unwrap();
+
+    let status2 = execute_branch_and_wait(&ws, &tree_id, &branch_id).await;
+    assert_eq!(status2.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(read_counter(&root_counter_path), 2);
+    assert_eq!(read_counter(&leaf_counter_path), 2);
+    assert_eq!(
+        status2.node_statuses.get(&NodeId::new("step1")),
+        Some(&NodeStatus::Completed)
+    );
+    assert_eq!(
+        status2.node_statuses.get(&NodeId::new("step2")),
+        Some(&NodeStatus::Completed)
+    );
+}
+
+#[tokio::test]
+#[serial]
+#[ignore]
+async fn test_cache_restart_reuses_existing_artifact_after_workspace_reopen() {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let store: Arc<dyn ArtifactStore> = Arc::new(MemoryArtifactStore::new());
+    let counter_path = tmp.path().join("cache-restart-counter.txt");
+
+    let ws = open_workspace_with_store(&tmp, store.clone()).await;
+    let tree = cached_single_cell_tree("cache-restart-tree", &counter_path, "v1");
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+    let branch_id = tree.root_branch_id.clone();
+
+    let status1 = execute_branch_and_wait(&ws, &tree_id, &branch_id).await;
+    assert_eq!(status1.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(read_counter(&counter_path), 1);
+    ws.shutdown().await.unwrap();
+    drop(ws);
+
+    let reopened = open_workspace_with_store(&tmp, store).await;
+    let status2 = execute_branch_and_wait(&reopened, &tree_id, &branch_id).await;
+    assert_eq!(status2.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(read_counter(&counter_path), 1);
+    assert_eq!(
+        status2.node_statuses.get(&NodeId::new("step1")),
+        Some(&NodeStatus::CacheHit)
+    );
+}
+
+#[tokio::test]
+#[serial]
+#[ignore]
+async fn test_cache_missing_artifact_after_restart_does_not_report_cache_hit() {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let store: Arc<dyn ArtifactStore> = Arc::new(MemoryArtifactStore::new());
+    let counter_path = tmp.path().join("cache-missing-artifact-counter.txt");
+
+    let ws = open_workspace_with_store(&tmp, store.clone()).await;
+    let tree = cached_single_cell_tree("cache-missing-artifact-tree", &counter_path, "v1");
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+    let branch_id = tree.root_branch_id.clone();
+
+    let status1 = execute_branch_and_wait(&ws, &tree_id, &branch_id).await;
+    assert_eq!(status1.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(read_counter(&counter_path), 1);
+    ws.shutdown().await.unwrap();
+    drop(ws);
+
+    delete_content_addressed_artifact(&tmp);
+
+    let reopened = open_workspace_with_store(&tmp, store).await;
+    let status2 = execute_branch_and_wait(&reopened, &tree_id, &branch_id).await;
+
+    assert_eq!(status2.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(
+        read_counter(&counter_path),
+        2,
+        "missing cached artifact should force re-execution instead of a false cache hit"
+    );
+    assert_ne!(
+        status2.node_statuses.get(&NodeId::new("step1")),
+        Some(&NodeStatus::CacheHit),
+        "missing cached artifact should not be reported as CacheHit"
+    );
+}
+
+#[tokio::test]
+#[serial]
+#[ignore]
+async fn test_cache_corrupted_artifact_after_restart_does_not_report_cache_hit() {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let store: Arc<dyn ArtifactStore> = Arc::new(MemoryArtifactStore::new());
+    let counter_path = tmp.path().join("cache-corrupted-artifact-counter.txt");
+
+    let ws = open_workspace_with_store(&tmp, store.clone()).await;
+    let tree = cached_single_cell_tree("cache-corrupted-artifact-tree", &counter_path, "v1");
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+    let branch_id = tree.root_branch_id.clone();
+
+    let status1 = execute_branch_and_wait(&ws, &tree_id, &branch_id).await;
+    assert_eq!(status1.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(read_counter(&counter_path), 1);
+    ws.shutdown().await.unwrap();
+    drop(ws);
+
+    corrupt_content_addressed_artifact(&tmp);
+
+    let reopened = open_workspace_with_store(&tmp, store).await;
+    let status2 = execute_branch_and_wait(&reopened, &tree_id, &branch_id).await;
+
+    assert_eq!(status2.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(
+        read_counter(&counter_path),
+        2,
+        "corrupted cached artifact should force re-execution instead of a false cache hit"
+    );
+    assert_ne!(
+        status2.node_statuses.get(&NodeId::new("step1")),
+        Some(&NodeStatus::CacheHit),
+        "corrupted cached artifact should not be reported as CacheHit"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn test_move_cell_in_experiment_tree_branch() {
     let (_tmp, ws) = open_temp_workspace().await;
     let tree = two_cell_tree();
@@ -2732,5 +3281,422 @@ async fn test_mark_tree_kernel_lost_fails_running_branch_execution() {
         ),
         "unexpected kernel-lost error kind {:?}",
         error
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore]
+async fn test_restart_tree_kernel_waits_for_running_branch_execution_to_finish() {
+    let (_tmp, ws) = open_temp_workspace().await;
+    let tree_id = ExperimentTreeId::new("mid-branch-restart-tree");
+    let branch_id = BranchId::new("main");
+    let tree = ExperimentTreeDef {
+        id: tree_id.clone(),
+        name: "mid-branch-restart-tree".to_string(),
+        project_id: None,
+        root_branch_id: branch_id.clone(),
+        branches: vec![BranchDef {
+            id: branch_id.clone(),
+            name: "main".to_string(),
+            parent_branch_id: None,
+            branch_point_cell_id: None,
+            cell_order: vec![CellId::new("step1"), CellId::new("step2")],
+            display: HashMap::new(),
+        }],
+        cells: vec![
+            CellDef {
+                id: CellId::new("step1"),
+                tree_id: tree_id.clone(),
+                branch_id: branch_id.clone(),
+                name: "step1".to_string(),
+                code: NodeCode {
+                    source: "shared = 41\nstep1 = shared\nprint('prepared shared', flush=True)\n"
+                        .to_string(),
+                    language: "python".to_string(),
+                },
+                upstream_cell_ids: vec![],
+                declared_outputs: vec![SlotName::new("step1")],
+                cache: false,
+                map_over: None,
+                map_concurrency: None,
+                tags: HashMap::new(),
+                revision_id: None,
+                state: CellRuntimeState::Clean,
+            },
+            CellDef {
+                id: CellId::new("step2"),
+                tree_id: tree_id.clone(),
+                branch_id: branch_id.clone(),
+                name: "step2".to_string(),
+                code: NodeCode {
+                    source: "import time\nprint('step2 started', flush=True)\ntime.sleep(20)\nstep2 = shared + 1\nprint(step2, flush=True)\n"
+                        .to_string(),
+                    language: "python".to_string(),
+                },
+                upstream_cell_ids: vec![CellId::new("step1")],
+                declared_outputs: vec![SlotName::new("step2")],
+                cache: false,
+                map_over: None,
+                map_concurrency: None,
+                tags: HashMap::new(),
+                revision_id: None,
+                state: CellRuntimeState::Clean,
+            },
+        ],
+        environment: Default::default(),
+        execution_mode: ExecutionMode::Parallel,
+        budget: None,
+        created_at: chrono::Utc::now(),
+    };
+    ws.save_experiment_tree(&tree).await.unwrap();
+
+    let execution_id = ws
+        .execute_branch_in_experiment_tree(&tree_id, &branch_id)
+        .await
+        .unwrap();
+
+    let running_status = wait_for_node_running(&ws, &execution_id, &NodeId::new("step2")).await;
+    assert_eq!(running_status.tree_id.as_ref(), Some(&tree_id));
+
+    assert!(
+        timeout(Duration::from_millis(200), ws.restart_tree_kernel(&tree_id))
+            .await
+            .is_err(),
+        "expected restart_tree_kernel to remain blocked while step2 is still running"
+    );
+
+    let final_status = wait_for_execution_finished(&ws, &execution_id).await;
+    assert_eq!(
+        final_status.status,
+        ExecutionLifecycleStatus::Completed,
+        "expected running execution to complete before queued restart proceeds"
+    );
+    assert_eq!(
+        final_status.node_statuses.get(&NodeId::new("step2")),
+        Some(&NodeStatus::Completed),
+        "expected running execution to complete successfully before restart"
+    );
+
+    ws.restart_tree_kernel(&tree_id).await.unwrap();
+
+    let logs = ws
+        .logs_for_tree_cell(&tree_id, &branch_id, &CellId::new("step2"))
+        .await
+        .unwrap();
+    assert!(
+        logs.stdout.contains("42"),
+        "expected original execution to emit 42 before restart, got {:?}",
+        logs.stdout
+    );
+    assert!(
+        logs.error.is_none(),
+        "did not expect errors while restart waited for execution completion: {:?}",
+        logs.error
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore]
+async fn test_large_output_execution_preserves_stream_and_final_logs() {
+    let (_tmp, ws) = open_temp_workspace().await;
+    let tree_id = ExperimentTreeId::new("large-output-tree");
+    let branch_id = BranchId::new("main");
+    let cell_id = CellId::new("step1");
+    let tree = ExperimentTreeDef {
+        id: tree_id.clone(),
+        name: "large-output-tree".to_string(),
+        project_id: None,
+        root_branch_id: branch_id.clone(),
+        branches: vec![BranchDef {
+            id: branch_id.clone(),
+            name: "main".to_string(),
+            parent_branch_id: None,
+            branch_point_cell_id: None,
+            cell_order: vec![cell_id.clone()],
+            display: HashMap::new(),
+        }],
+        cells: vec![CellDef {
+            id: cell_id.clone(),
+            tree_id: tree_id.clone(),
+            branch_id: branch_id.clone(),
+            name: "step1".to_string(),
+            code: NodeCode {
+                source: "for i in range(1500):\n    print(f'LARGE_STREAM_{i:04d}', flush=True)\nstep1 = 1500\n"
+                    .to_string(),
+                language: "python".to_string(),
+            },
+            upstream_cell_ids: vec![],
+            declared_outputs: vec![SlotName::new("step1")],
+            cache: false,
+            map_over: None,
+            map_concurrency: None,
+            tags: HashMap::new(),
+            revision_id: None,
+            state: CellRuntimeState::Clean,
+        }],
+        environment: Default::default(),
+        execution_mode: ExecutionMode::Parallel,
+        budget: None,
+        created_at: chrono::Utc::now(),
+    };
+    ws.save_experiment_tree(&tree).await.unwrap();
+
+    let mut rx = ws.subscribe_events();
+    let execution_id = ws
+        .execute_branch_in_experiment_tree(&tree_id, &branch_id)
+        .await
+        .unwrap();
+
+    let mut saw_first = false;
+    let mut saw_last = false;
+    let mut stream_chunks = 0usize;
+    let event_exec_id = execution_id.clone();
+    let event_task = tokio::spawn(async move {
+        loop {
+            match timeout(Duration::from_secs(30), rx.recv()).await {
+                Ok(Ok(ExecutionEvent::NodeStream {
+                    execution_id,
+                    node_id,
+                    text,
+                    ..
+                })) if execution_id == event_exec_id && node_id == NodeId::new("step1") => {
+                    stream_chunks += 1;
+                    saw_first |= text.contains("LARGE_STREAM_0000");
+                    saw_last |= text.contains("LARGE_STREAM_1499");
+                }
+                Ok(Ok(ExecutionEvent::ExecutionCompleted { execution_id, .. }))
+                    if execution_id == event_exec_id =>
+                {
+                    break (saw_first, saw_last, stream_chunks);
+                }
+                Ok(Ok(ExecutionEvent::ExecutionFailed {
+                    execution_id,
+                    failed_nodes,
+                    ..
+                }))
+                    if execution_id == event_exec_id =>
+                {
+                    panic!(
+                        "large output execution failed unexpectedly; failed_nodes={failed_nodes:?}"
+                    );
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
+                    panic!("lagged while waiting for large output stream, skipped {skipped}");
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    panic!("event channel closed while waiting for large output stream");
+                }
+                Err(_) => panic!("timed out waiting for large output stream events"),
+            }
+        }
+    });
+
+    let final_status = wait_for_execution_finished(&ws, &execution_id).await;
+    assert_eq!(final_status.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(
+        final_status.node_statuses.get(&NodeId::new("step1")),
+        Some(&NodeStatus::Completed)
+    );
+
+    let (saw_first, saw_last, stream_chunks) = event_task.await.unwrap();
+    assert!(saw_first, "expected stream events to include the first output line");
+    assert!(saw_last, "expected stream events to include the last output line");
+    assert!(stream_chunks > 0, "expected at least one NodeStream event");
+
+    let logs = ws
+        .logs_for_tree_cell(&tree_id, &branch_id, &cell_id)
+        .await
+        .unwrap();
+    assert!(
+        logs.stdout.contains("LARGE_STREAM_0000"),
+        "expected persisted logs to include the first output line"
+    );
+    assert!(
+        logs.stdout.contains("LARGE_STREAM_1499"),
+        "expected persisted logs to include the last output line"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WI-1: kernel runtime performance histograms
+// ---------------------------------------------------------------------------
+//
+// Verifies that the per-stage timing histograms added in WI-1 fire on the
+// real execution path. Uses a process-global Prometheus recorder installed
+// on first use — ignored by default because it requires a live kernel.
+
+fn ensure_metrics_recorder() -> &'static metrics_exporter_prometheus::PrometheusHandle {
+    static HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
+        std::sync::OnceLock::new();
+    HANDLE.get_or_init(tine_observe::init_metrics)
+}
+
+#[tokio::test]
+#[serial]
+#[ignore]
+async fn test_wi1_perf_histograms_fire_on_cold_and_warm_execute() {
+    let handle = ensure_metrics_recorder();
+
+    let (_tmp, ws) = open_temp_workspace().await;
+    let tree = trivial_tree();
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+
+    // First execution drives cold kernel start + environment ensure + artifact persist.
+    let exec1 = ws
+        .execute_branch_in_experiment_tree(&tree_id, &tree.root_branch_id)
+        .await
+        .unwrap();
+    let status1 = wait_for_execution_finished(&ws, &exec1).await;
+    assert_eq!(status1.status, ExecutionLifecycleStatus::Completed);
+
+    // Second execution drives the warm execute path.
+    let exec2 = ws
+        .execute_branch_in_experiment_tree(&tree_id, &tree.root_branch_id)
+        .await
+        .unwrap();
+    let status2 = wait_for_execution_finished(&ws, &exec2).await;
+    assert_eq!(status2.status, ExecutionLifecycleStatus::Completed);
+
+    let rendered = handle.render();
+
+    // Every histogram added in WI-1 should appear in the Prometheus output
+    // with a non-zero sample count. We match on `<metric>_count` since the
+    // Prometheus text format emits that for every histogram observation.
+    let required_histograms = [
+        "tine_ensure_tree_environment_total_seconds",
+        "tine_ensure_tree_environment_lock_wait_seconds",
+        "tine_ensure_tree_environment_pip_check_seconds",
+        "tine_ensure_tree_environment_sync_seconds",
+        "tine_ensure_tree_environment_preflight_seconds",
+        "tine_kernel_start_total_seconds",
+        "tine_kernel_start_spawn_seconds",
+        "tine_kernel_start_heartbeat_connect_seconds",
+        "tine_kernel_start_heartbeat_ready_seconds",
+        "tine_kernel_start_channel_connect_seconds",
+        "tine_kernel_start_setup_code_seconds",
+        "tine_kernel_execute_total_seconds",
+        "tine_kernel_execute_iopub_wait_seconds",
+        "tine_kernel_execute_shell_reply_seconds",
+        "tine_artifact_persist_total_seconds",
+        "tine_artifact_persist_slot_count",
+    ];
+    for name in &required_histograms {
+        let count_line = format!("{}_count", name);
+        assert!(
+            rendered.contains(&count_line),
+            "expected histogram `{}` to appear in metrics output; rendered=\n{}",
+            name,
+            rendered
+        );
+    }
+
+    // Every timer-style histogram emitted via OutcomeTimer should carry an
+    // `outcome` label so failure paths show up in dashboards. The two
+    // count-style histograms (replay_cells, persist_slot_count) are the
+    // exception.
+    let outcome_labeled = [
+        "tine_ensure_tree_environment_total_seconds",
+        "tine_ensure_tree_environment_lock_wait_seconds",
+        "tine_ensure_tree_environment_pip_check_seconds",
+        "tine_ensure_tree_environment_sync_seconds",
+        "tine_ensure_tree_environment_preflight_seconds",
+        "tine_kernel_start_total_seconds",
+        "tine_kernel_start_spawn_seconds",
+        "tine_kernel_start_heartbeat_connect_seconds",
+        "tine_kernel_start_heartbeat_ready_seconds",
+        "tine_kernel_start_channel_connect_seconds",
+        "tine_kernel_start_setup_code_seconds",
+        "tine_kernel_execute_total_seconds",
+        "tine_kernel_execute_iopub_wait_seconds",
+        "tine_kernel_execute_shell_reply_seconds",
+        "tine_artifact_persist_total_seconds",
+    ];
+    for name in &outcome_labeled {
+        let labeled = format!("{}_count{{outcome=", name);
+        assert!(
+            rendered.contains(&labeled),
+            "expected histogram `{}` to carry an outcome label; rendered=\n{}",
+            name,
+            rendered
+        );
+    }
+
+}
+
+#[tokio::test]
+#[serial]
+#[ignore]
+async fn test_wi1_perf_histograms_fire_on_replay_execute() {
+    let handle = ensure_metrics_recorder();
+
+    let (_tmp, ws) = open_temp_workspace().await;
+    let tree_id = ws.save_experiment_tree(&two_cell_tree()).await.unwrap().id;
+    let root_branch_id = BranchId::new("main");
+    let branch_id = ws
+        .create_branch_in_experiment_tree(
+            &tree_id,
+            &root_branch_id,
+            "branch-perf-replay".to_string(),
+            &CellId::new("step2"),
+            CellDef {
+                id: CellId::new("branch_perf_replay_cell"),
+                tree_id: tree_id.clone(),
+                branch_id: root_branch_id.clone(),
+                name: "Branch perf replay cell".to_string(),
+                code: NodeCode {
+                    source: "branch_perf_replay = step2 + 1".to_string(),
+                    language: "python".to_string(),
+                },
+                upstream_cell_ids: vec![CellId::new("step2")],
+                declared_outputs: vec![SlotName::new("branch_perf_replay")],
+                cache: false,
+                map_over: None,
+                map_concurrency: None,
+                tags: HashMap::new(),
+                revision_id: None,
+                state: CellRuntimeState::Clean,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (_exec_id, logs) = ws
+        .execute_cell_in_experiment_tree_branch(
+            &tree_id,
+            &branch_id,
+            &CellId::new("branch_perf_replay_cell"),
+        )
+        .await
+        .unwrap();
+    assert!(logs.error.is_none());
+
+    let rendered = handle.render();
+    assert!(
+        rendered.contains("tine_prepare_context_total_seconds_count"),
+        "expected prepare-context total histogram in metrics output; rendered=\n{}",
+        rendered
+    );
+    assert!(
+        rendered.contains("tine_prepare_context_replay_seconds_count"),
+        "expected prepare-context replay histogram in metrics output; rendered=\n{}",
+        rendered
+    );
+    assert!(
+        rendered.contains("tine_prepare_context_replay_cells_count"),
+        "expected replay-cells histogram in metrics output; rendered=\n{}",
+        rendered
+    );
+    assert!(
+        rendered.contains("tine_prepare_context_total_seconds_count{outcome=\"restart_replay\""),
+        "expected replay execute to emit restart_replay outcome; rendered=\n{}",
+        rendered
+    );
+    assert!(
+        rendered.contains("tine_prepare_context_replay_seconds_count{outcome=\"success\""),
+        "expected replay timer to emit success outcome; rendered=\n{}",
+        rendered
     );
 }

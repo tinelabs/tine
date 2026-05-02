@@ -162,6 +162,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(restart_experiment_tree_kernel),
         )
         .route(
+            "/api/experiment-trees/{id}/shutdown-kernel",
+            post(shutdown_experiment_tree_kernel),
+        )
+        .route(
             "/api/experiment-trees/{id}/branches",
             post(create_experiment_tree_branch),
         )
@@ -354,6 +358,17 @@ async fn restart_experiment_tree_kernel(
     state
         .workspace
         .restart_tree_kernel(&ExperimentTreeId::new(id))
+        .await?;
+    Ok(StatusCode::OK)
+}
+
+async fn shutdown_experiment_tree_kernel(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    state
+        .workspace
+        .shutdown_tree_kernel(&ExperimentTreeId::new(id))
         .await?;
     Ok(StatusCode::OK)
 }
@@ -994,15 +1009,30 @@ fn local_server_url(addr: SocketAddr) -> String {
     }
 }
 
-pub fn default_projects_root(workspace_dir: &std::path::Path) -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let documents = home.join("Documents");
-        if documents.exists() || cfg!(target_os = "macos") {
-            return documents.join("Tine");
-        }
+fn default_projects_root_for_home(workspace_dir: &std::path::Path, home: Option<&std::path::Path>) -> PathBuf {
+    let Some(home) = home else {
+        return workspace_dir.join("projects");
+    };
+
+    // Avoid protected-folder prompts on macOS during startup. The dashboard
+    // asks for the default projects root immediately, so touching
+    // ~/Documents here can trigger a TCC permission prompt before the user has
+    // chosen any folder.
+    if cfg!(target_os = "macos") {
         return home.join("Tine");
     }
-    workspace_dir.join("projects")
+
+    let documents = home.join("Documents");
+    if documents.exists() {
+        return documents.join("Tine");
+    }
+
+    home.join("Tine")
+}
+
+pub fn default_projects_root(workspace_dir: &std::path::Path) -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    default_projects_root_for_home(workspace_dir, home.as_deref())
 }
 
 fn native_directory_picker_available() -> bool {
@@ -1226,6 +1256,8 @@ impl axum::response::IntoResponse for AppError {
 mod tests {
     use super::*;
 
+    use std::fs;
+
     use async_trait::async_trait;
     use axum::body::{to_bytes, Body};
     use axum::http::{Method, Request};
@@ -1249,6 +1281,42 @@ mod tests {
                 data: DashMap::new(),
             }
         }
+    }
+
+    #[test]
+    fn default_projects_root_uses_workspace_projects_when_home_missing() {
+        let workspace_dir = PathBuf::from("/tmp/tine-workspace");
+        assert_eq!(
+            default_projects_root_for_home(&workspace_dir, None),
+            workspace_dir.join("projects")
+        );
+    }
+
+    #[test]
+    fn default_projects_root_avoids_documents_on_macos() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let home = tmp.path().join("home");
+        let documents = home.join("Documents");
+        fs::create_dir_all(&documents).expect("failed to create documents dir");
+
+        let resolved = default_projects_root_for_home(tmp.path(), Some(&home));
+
+        if cfg!(target_os = "macos") {
+            assert_eq!(resolved, home.join("Tine"));
+        } else {
+            assert_eq!(resolved, documents.join("Tine"));
+        }
+    }
+
+    #[test]
+    fn default_projects_root_falls_back_to_home_when_documents_missing() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).expect("failed to create home dir");
+
+        let resolved = default_projects_root_for_home(tmp.path(), Some(&home));
+
+        assert_eq!(resolved, home.join("Tine"));
     }
 
     #[async_trait]
@@ -2499,9 +2567,13 @@ mod tests {
             send_json(&app, Method::GET, "/api/system/default-projects-dir", None).await;
         assert_eq!(default_projects_dir.status(), StatusCode::OK);
         let default_projects_dir_body: serde_json::Value = read_json(default_projects_dir).await;
-        assert!(default_projects_dir_body["path"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty()));
+        let expected_projects_dir = default_projects_root(workspace.workspace_root())
+            .display()
+            .to_string();
+        assert_eq!(
+            default_projects_dir_body["path"].as_str(),
+            Some(expected_projects_dir.as_str())
+        );
         assert!(default_projects_dir_body["native_picker_available"].is_boolean());
 
         let doctor = send_json(&app, Method::GET, "/api/system/doctor", None).await;
@@ -2515,6 +2587,234 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.name == "runtime preflight" || !check.ok));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_shutdown_kernel_over_http_cancels_running_execution_and_requires_replay() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store: Arc<dyn ArtifactStore> = Arc::new(MemoryArtifactStore::new());
+        let workspace = Arc::new(
+            Workspace::open(tmp.path().to_path_buf(), store, 4)
+                .await
+                .expect("failed to open workspace"),
+        );
+        let state = Arc::new(AppState {
+            workspace: workspace.clone(),
+            metrics_handle: None,
+            ui_dir: PathBuf::from("ui"),
+            api_base_url: "http://127.0.0.1:9473".to_string(),
+        });
+        let app = build_router(state);
+
+        let create_tree = send_json(
+            &app,
+            Method::POST,
+            "/api/experiment-trees",
+            Some(create_tree_payload("shutdown-http", None)),
+        )
+        .await;
+        assert_eq!(create_tree.status(), StatusCode::CREATED);
+        let tree: ExperimentTreeDef = read_json(create_tree).await;
+        let tree_id = tree.id.clone();
+
+        let code = send_json(
+            &app,
+            Method::POST,
+            &format!(
+                "/api/experiment-trees/{}/branches/main/cells/cell_1/code",
+                tree_id.as_str()
+            ),
+            Some(serde_json::json!({
+                "source": "import time\nprint('starting shutdown http test', flush=True)\ntime.sleep(20)\nprint('should not reach shutdown http end', flush=True)\ncell_1 = 1\n"
+            })),
+        )
+        .await;
+        assert_eq!(code.status(), StatusCode::OK);
+
+        let execute = send_json(
+            &app,
+            Method::POST,
+            &format!("/api/experiment-trees/{}/branches/main/execute", tree_id.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(execute.status(), StatusCode::ACCEPTED);
+        let execute_body: ExecutionAccepted = read_json(execute).await;
+        let execution_id = execute_body.execution_id.as_str().to_string();
+
+        let mut saw_running = false;
+        for _ in 0..240 {
+            let status = send_json(
+                &app,
+                Method::GET,
+                &format!("/api/executions/{execution_id}"),
+                None,
+            )
+            .await;
+            assert_eq!(status.status(), StatusCode::OK);
+            let status: tine_core::ExecutionStatus = read_json(status).await;
+            if matches!(
+                status.node_statuses.get(&tine_core::NodeId::new("cell_1")),
+                Some(tine_core::NodeStatus::Running)
+            ) {
+                saw_running = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        assert!(
+            saw_running,
+            "timed out waiting for execution to enter running state before shutdown"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let shutdown = send_json(
+            &app,
+            Method::POST,
+            &format!(
+                "/api/experiment-trees/{}/shutdown-kernel",
+                tree_id.as_str()
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(shutdown.status(), StatusCode::OK);
+
+        let status = loop {
+            let status = send_json(
+                &app,
+                Method::GET,
+                &format!("/api/executions/{execution_id}"),
+                None,
+            )
+            .await;
+            assert_eq!(status.status(), StatusCode::OK);
+            let status: tine_core::ExecutionStatus = read_json(status).await;
+            if status.finished_at.is_some()
+                && status.status == tine_core::ExecutionLifecycleStatus::Cancelled
+            {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        assert_eq!(status.tree_id.as_ref(), Some(&tree_id));
+        assert_eq!(status.status, tine_core::ExecutionLifecycleStatus::Cancelled);
+        assert_eq!(status.phase, tine_core::ExecutionPhase::Cancelled);
+        assert!(status.cancellation_requested_at.is_some());
+        assert_eq!(
+            status.node_statuses.get(&tine_core::NodeId::new("cell_1")),
+            Some(&tine_core::NodeStatus::Interrupted)
+        );
+
+        let runtime_state = send_json(
+            &app,
+            Method::GET,
+            &format!("/api/experiment-trees/{}/runtime-state", tree_id.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(runtime_state.status(), StatusCode::OK);
+        let runtime_state: Option<tine_core::TreeRuntimeState> = read_json(runtime_state).await;
+        let runtime_state = runtime_state.expect("expected runtime state after shutdown");
+        assert_eq!(runtime_state.kernel_state, tine_core::TreeKernelState::NeedsReplay);
+        assert!(runtime_state.materialized_path_cell_ids.is_empty());
+
+        let logs_response = send_json(
+            &app,
+            Method::GET,
+            &format!(
+                "/api/experiment-trees/{}/branches/main/cells/cell_1/logs",
+                tree_id.as_str()
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(logs_response.status(), StatusCode::OK);
+        let logs: tine_core::NodeLogs = read_json(logs_response).await;
+        assert!(
+            logs.stdout.contains("starting shutdown http test"),
+            "expected partial stdout to persist on shutdown, got {:?}",
+            logs.stdout
+        );
+        assert!(
+            !logs.stdout.contains("should not reach shutdown http end"),
+            "unexpected post-shutdown output in {:?}",
+            logs.stdout
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_inspect_kernel_over_http_returns_snapshot() {
+        let (_tmp, app) = test_app().await;
+
+        let create_tree = send_json(
+            &app,
+            Method::POST,
+            "/api/experiment-trees",
+            Some(create_tree_payload("inspect-http", None)),
+        )
+        .await;
+        assert_eq!(create_tree.status(), StatusCode::CREATED);
+        let tree: ExperimentTreeDef = read_json(create_tree).await;
+        let tree_id = tree.id.clone();
+
+        let snap_resp = send_json(
+            &app,
+            Method::GET,
+            &format!("/api/experiment-trees/{}/inspect-kernel", tree_id.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(snap_resp.status(), StatusCode::OK);
+        let snap: tine_core::RuntimeHealthSnapshot = read_json(snap_resp).await;
+        assert_eq!(snap.tree_id, tree_id);
+        assert!(
+            !snap.has_live_kernel,
+            "fresh tree must report no live kernel over HTTP"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_restart_kernel_over_http_succeeds_when_no_kernel_running() {
+        let (_tmp, app) = test_app().await;
+
+        let create_tree = send_json(
+            &app,
+            Method::POST,
+            "/api/experiment-trees",
+            Some(create_tree_payload("restart-http", None)),
+        )
+        .await;
+        assert_eq!(create_tree.status(), StatusCode::CREATED);
+        let tree: ExperimentTreeDef = read_json(create_tree).await;
+        let tree_id = tree.id.clone();
+
+        let restart = send_json(
+            &app,
+            Method::POST,
+            &format!("/api/experiment-trees/{}/restart-kernel", tree_id.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(restart.status(), StatusCode::OK);
+
+        let snap_resp = send_json(
+            &app,
+            Method::GET,
+            &format!("/api/experiment-trees/{}/inspect-kernel", tree_id.as_str()),
+            None,
+        )
+        .await;
+        assert_eq!(snap_resp.status(), StatusCode::OK);
+        let snap: tine_core::RuntimeHealthSnapshot = read_json(snap_resp).await;
+        assert!(
+            !snap.has_live_kernel,
+            "restart on a never-started kernel must leave it not-live: {:?}",
+            snap
+        );
     }
 
     #[tokio::test]
