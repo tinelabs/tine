@@ -3,7 +3,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/tine?label=PyPI)](https://pypi.org/project/tine/)
 [![PyPI downloads](https://static.pepy.tech/badge/tine)](https://pepy.tech/project/tine)
 [![CI](https://img.shields.io/github/actions/workflow/status/tinelabs/tine/ci.yml?branch=main&label=CI)](https://github.com/tinelabs/tine/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/tinelabs/tine)](https://github.com/tinelabs/tine/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0-97ca00.svg)](./LICENSE)
 [![Python](https://img.shields.io/pypi/pyversions/tine)](https://pypi.org/project/tine/)
 
 A branching notebook runtime for AI and humans.
