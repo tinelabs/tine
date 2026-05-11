@@ -129,8 +129,7 @@ mod tests {
         }
         let r = h.render();
         assert!(
-            r.contains("test_outcome_timer_error_seconds_count")
-                && r.contains("outcome=\"error\""),
+            r.contains("test_outcome_timer_error_seconds_count") && r.contains("outcome=\"error\""),
             "expected error sample, got:\n{}",
             r
         );

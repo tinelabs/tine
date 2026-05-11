@@ -119,25 +119,37 @@ html, body, #root {
     "sidebar main";
 }
 
-.server-fallback-chip {
+.mcp-connect-chip {
   display: inline-flex;
   align-items: center;
-  gap: 0.25rem;
+  justify-content: center;
+  gap: 0.3rem;
   height: 22px;
   padding: 0 0.5rem;
-  border-radius: 999px;
-  background: rgba(234, 179, 8, 0.14);
-  border: 1px solid rgba(234, 179, 8, 0.45);
+  border-radius: 6px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
   color: var(--fg);
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 0.72rem;
   line-height: 1;
   cursor: pointer;
   user-select: none;
-  transition: background 120ms ease;
+  white-space: nowrap;
+  transition: background 120ms ease, border-color 120ms ease;
 }
 
-.server-fallback-chip:hover {
+.mcp-connect-chip:hover {
+  background: var(--bg-hover);
+  border-color: var(--fg-2);
+}
+
+.mcp-connect-chip.fallback {
+  background: rgba(234, 179, 8, 0.14);
+  border-color: rgba(234, 179, 8, 0.45);
+}
+
+.mcp-connect-chip.fallback:hover {
   background: rgba(234, 179, 8, 0.24);
 }
 

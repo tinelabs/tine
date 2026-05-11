@@ -6,6 +6,7 @@ import {
   appendTerminalEvent,
   branchRequiresReplay,
   buildExecutionStatusEvent,
+  desktopMcpCommand,
   deriveRuntimeUi,
   describeExecutionProgress,
   executionStatusLevel,
@@ -106,6 +107,18 @@ test("resolveWebSocketUrl preserves browser ws and desktop absolute ws behavior"
   assert.equal(
     resolveWebSocketUrl({ protocol: "tauri:", host: "tauri.localhost" }, "http://127.0.0.1:63125"),
     "ws://127.0.0.1:63125/ws",
+  );
+});
+
+test("desktopMcpCommand uses the actual embedded server port", () => {
+  assert.equal(desktopMcpCommand(null), null);
+  assert.equal(
+    desktopMcpCommand({ port: 9473, preferredPort: 9473, fellBack: false }),
+    "tine-mcp --api-url http://127.0.0.1:9473",
+  );
+  assert.equal(
+    desktopMcpCommand({ port: 63125, preferredPort: 9473, fellBack: true }),
+    "tine-mcp --api-url http://127.0.0.1:63125",
   );
 });
 

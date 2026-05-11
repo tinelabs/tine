@@ -22,9 +22,8 @@ fn sync_png(source_path: &Path, output_path: &Path) {
         Err(_) => true,
     };
     if needs_write {
-        fs::write(output_path, source).unwrap_or_else(|e| {
-            panic!("failed to write {}: {}", output_path.display(), e)
-        });
+        fs::write(output_path, source)
+            .unwrap_or_else(|e| panic!("failed to write {}: {}", output_path.display(), e));
     }
 }
 
@@ -46,13 +45,8 @@ fn main() {
     let png_icon_path = icons_dir.join("icon.png");
     let ico_icon_path = icons_dir.join("icon.ico");
 
-    fs::create_dir_all(&runtime_dir).unwrap_or_else(|e| {
-        panic!(
-            "failed to create {}: {}",
-            runtime_dir.display(),
-            e
-        )
-    });
+    fs::create_dir_all(&runtime_dir)
+        .unwrap_or_else(|e| panic!("failed to create {}: {}", runtime_dir.display(), e));
 
     sync_png(&source_png_path, &png_icon_path);
     if !icns_icon_path.exists() {
@@ -63,13 +57,8 @@ fn main() {
     }
 
     let version = repo_version(&manifest_dir);
-    let template = fs::read_to_string(&template_path).unwrap_or_else(|e| {
-        panic!(
-            "failed to read {}: {}",
-            template_path.display(),
-            e
-        )
-    });
+    let template = fs::read_to_string(&template_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {}", template_path.display(), e));
     let rendered = template.replace("{{VERSION}}", &version);
 
     // Avoid unnecessary writes so tauri-build does not see a spurious change.
@@ -78,15 +67,16 @@ fn main() {
         Err(_) => true,
     };
     if needs_write {
-        fs::write(&config_path, rendered).unwrap_or_else(|e| {
-            panic!("failed to write {}: {}", config_path.display(), e)
-        });
+        fs::write(&config_path, rendered)
+            .unwrap_or_else(|e| panic!("failed to write {}: {}", config_path.display(), e));
     }
 
     println!("cargo:rerun-if-changed=tauri.conf.template.json");
     println!("cargo:rerun-if-changed={}", entitlements_path.display());
-    println!("cargo:rerun-if-changed={}", manifest_dir.join("..")
-        .join("..").join("VERSION").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("..").join("..").join("VERSION").display()
+    );
     println!("cargo:rerun-if-changed={}", source_png_path.display());
 
     tauri_build::build()

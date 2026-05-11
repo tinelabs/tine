@@ -1,9 +1,9 @@
+use serde::Deserialize;
 use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
-use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
@@ -49,10 +49,9 @@ struct RuntimePinsManifest {
 fn runtime_package_pins() -> &'static [RuntimePackagePin] {
     static PINS: OnceLock<Vec<RuntimePackagePin>> = OnceLock::new();
     PINS.get_or_init(|| {
-        let manifest: RuntimePinsManifest = serde_json::from_str(include_str!(
-            "../../../scripts/release/runtime_pins.json"
-        ))
-        .expect("runtime_pins.json should be valid JSON");
+        let manifest: RuntimePinsManifest =
+            serde_json::from_str(include_str!("../../../scripts/release/runtime_pins.json"))
+                .expect("runtime_pins.json should be valid JSON");
         manifest.desktop_runtime.baseline_packages
     })
     .as_slice()
@@ -283,7 +282,7 @@ impl EnvironmentManager {
                 uses_bundled_python,
                 &mut logs,
             )
-                .await?;
+            .await?;
             let required_packages = required_runtime_packages().to_vec();
             self.sync_packages(&runtime_id, &venv_dir, &required_packages, &mut logs)
                 .await?;
@@ -545,10 +544,7 @@ impl EnvironmentManager {
                 message: format!("failed to create venv parent dir: {}", e),
             })?;
         let mut command = Command::new(&python_command.program);
-        command
-            .args(&python_command.args)
-            .arg("-m")
-            .arg("venv");
+        command.args(&python_command.args).arg("-m").arg("venv");
         if !cfg!(windows) {
             command.arg("--symlinks");
             logs.push("Creating venv with symlinked executables".to_string());
@@ -556,13 +552,10 @@ impl EnvironmentManager {
         if inherit_site_packages {
             command.arg("--system-site-packages");
             logs.push(
-                "Bundled runtime detected; creating venv with inherited site-packages"
-                    .to_string(),
+                "Bundled runtime detected; creating venv with inherited site-packages".to_string(),
             );
         }
-        command
-            .arg(venv_dir)
-            .current_dir(&self.workspace_root);
+        command.arg(venv_dir).current_dir(&self.workspace_root);
         let output = command
             .output()
             .await
@@ -1150,7 +1143,10 @@ mod tests {
             None => std::env::remove_var("TINE_WRAPPER_PYTHON"),
         }
 
-        let displays: Vec<_> = commands.into_iter().map(|command| command.display).collect();
+        let displays: Vec<_> = commands
+            .into_iter()
+            .map(|command| command.display)
+            .collect();
         assert_eq!(displays.len(), 2);
         assert_eq!(displays[0], override_python);
         assert_eq!(displays[1], bundled);

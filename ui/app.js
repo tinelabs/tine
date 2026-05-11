@@ -77,6 +77,7 @@ import {
   applyExecutionSnapshotToState,
   branchRequiresReplay,
   buildExecutionStatusEvent,
+  desktopMcpCommand,
   deriveRuntimeUi,
   describeExecutionProgress,
   fileTreeRefreshKey,
@@ -3336,7 +3337,7 @@ function Titlebar() {
         >
           <${MoonStar} size=${15} strokeWidth=${2} />
         </button>
-        <${ServerFallbackChip} />
+        <${McpConnectChip} />
         <span
           class="ws-indicator ${ws ? "connected" : ""}"
           title=${ws ? "Connected" : "Disconnected"}
@@ -4569,24 +4570,28 @@ function App() {
   `;
 }
 
-function ServerFallbackChip() {
+function McpConnectChip() {
   const info = useStore((s) => s.serverInfo);
-  if (!info || !info.fellBack) return null;
-  const mcpCommand = `tine-mcp --api-url http://127.0.0.1:${info.port}`;
+  const mcpCommand = desktopMcpCommand(info);
+  if (!mcpCommand) return null;
   const copy = () => {
     navigator.clipboard
       ?.writeText(mcpCommand)
       .then(() => showToast("MCP command copied"))
       .catch(() => showToast("Copy failed"));
   };
+  const title = info.fellBack
+    ? `Port ${info.preferredPort} was in use. Click to copy MCP command: ${mcpCommand}`
+    : `Click to copy MCP command: ${mcpCommand}`;
   return html`
     <button
-      class="server-fallback-chip"
+      class="mcp-connect-chip ${info.fellBack ? "fallback" : ""}"
       onClick=${copy}
-      title=${`Port ${info.preferredPort} was in use. Click to copy: ${mcpCommand}`}
-      aria-label=${`Server on port ${info.port}. Click to copy MCP command.`}
+      title=${title}
+      aria-label=${`MCP server command for port ${info.port}. Click to copy.`}
     >
-      :${info.port}
+      <${Copy} size=${12} strokeWidth=${2} />
+      MCP :${info.port}
     </button>
   `;
 }

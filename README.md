@@ -68,7 +68,25 @@ The desktop app uses the same local backend as `pip install tine` — only the w
 
 ## Use with AI agents
 
-Tine is MCP-native. Generate a config for your agent host of choice:
+Tine is MCP-native. The MCP adapter connects your agent host to a running Tine
+API server.
+
+If you use the desktop app from a `.dmg` or `.msi`, open Tine first. The app
+starts the local API at `http://127.0.0.1:9473` unless that port is already in
+use, then falls back to another local port. The title bar shows an `MCP :<port>`
+button with the actual port; click it to copy the matching `tine-mcp --api-url
+...` command.
+
+The desktop bundle's private Python runtime is for notebooks and kernels; it
+does not install a global MCP command for VS Code, Cursor, or Claude to launch.
+Install the small Python wrapper once so your agent host can start the MCP
+stdio process:
+
+```bash
+pip install tine
+```
+
+Then generate a config for your agent host of choice:
 
 ```bash
 tine mcp print-config --host vscode --api-url http://127.0.0.1:9473
@@ -96,7 +114,7 @@ A typical agent setup:
 
 ```bash
 pip install tine
-tine serve --open
+tine serve --open  # or open the Tine desktop app
 tine mcp register --host vscode --api-url http://127.0.0.1:9473
 ```
 

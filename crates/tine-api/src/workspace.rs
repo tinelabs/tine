@@ -1,24 +1,25 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use sqlx::sqlite::SqlitePool;
-use tokio::sync::{Mutex, Notify, RwLock};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
+use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, RwLock};
 use tracing::{error, info, warn};
 
 use crate::branch_projection::{branch_lineage, plan_branch_transition, BranchProjection};
 use tine_catalog::DataCatalog;
 use tine_core::{
-    ArtifactKey, ArtifactStore, BranchDef, BranchId, BranchIsolationMode,
-    BranchTargetInspection, CellDef, CellId, CellRuntimeState, ExecutableTreeBranch,
-    ExecutableTreeCell, ExecutionAccepted, ExecutionEvent, ExecutionId,
-    ExecutionLifecycleStatus, ExecutionPhase, ExecutionQueueTelemetry, ExecutionStatus, ExecutionTargetKind,
-    ExecutionTargetRef, ExperimentTreeDef, ExperimentTreeId, IsolationResult, NodeCacheKey,
-    NodeCode, NodeError, NodeId, NodeLogs, NodeStatus, PreparedContext, ProjectDef, ProjectId,
-    RuntimeHealthSnapshot, SlotName, TineError, TineResult, TreeKernelState, TreeRuntimeState,
-    WorkspaceApi,
+    ArtifactKey, ArtifactStore, BranchDef, BranchId, BranchIsolationMode, BranchTargetInspection,
+    CellDef, CellId, CellRuntimeState, ExecutableTreeBranch, ExecutableTreeCell, ExecutionAccepted,
+    ExecutionEvent, ExecutionId, ExecutionLifecycleStatus, ExecutionPhase, ExecutionQueueTelemetry,
+    ExecutionStatus, ExecutionTargetKind, ExecutionTargetRef, ExperimentTreeDef, ExperimentTreeId,
+    IsolationResult, NodeCacheKey, NodeCode, NodeError, NodeId, NodeLogs, NodeStatus,
+    PreparedContext, ProjectDef, ProjectId, RuntimeHealthSnapshot, SlotName, TineError, TineResult,
+    TreeKernelState, TreeRuntimeState, WorkspaceApi,
 };
 use tine_env::{EnvironmentManager, TreeEnvironmentDescriptor};
 use tine_kernel::{KernelIsolationOutcome, KernelLifecycleEvent, KernelManager};
@@ -27,6 +28,38 @@ use tine_observe::{
     METRIC_PREPARE_CONTEXT_TOTAL,
 };
 use tine_scheduler::Scheduler;
+
+use dashmap::DashMap;
+
+/// In-memory buffer for streamed cell output (`NodeStream` events). Streams
+/// are appended here on the hot path; the buffer is drained into the
+/// persisted `executions.node_logs` blob whenever a non-stream event for
+/// the same execution arrives, or when the execution finishes. This avoids
+/// the O(N²) read-modify-write that would otherwise happen for every
+/// stream chunk against the cumulative log blob — see the regression test
+/// `persist_execution_event_snapshot_streaming_does_not_scale_quadratically`.
+type StreamingLogBuffer = DashMap<ExecutionId, HashMap<NodeId, NodeLogs>>;
+
+/// Per-execution mutex registry. Both `persist_execution_event_snapshot`
+/// (event-driven) and `flush_streaming_buffer_for_execution` (periodic)
+/// do read-modify-write of `executions.node_logs`. Without coordination,
+/// the slower writer can overwrite the faster writer's update — losing
+/// either streamed chunks or terminal-event metadata. This registry hands
+/// out an `Arc<tokio::sync::Mutex<()>>` per execution so both paths
+/// serialize their critical section per row. Entries are not cleaned up
+/// on execution finish; per-execution memory is one Arc<Mutex<()>>
+/// (≈ 64 bytes) which is bounded by total executions ever observed.
+type ExecutionLockRegistry = DashMap<ExecutionId, Arc<TokioMutex<()>>>;
+
+fn execution_persist_lock(
+    locks: &ExecutionLockRegistry,
+    execution_id: &ExecutionId,
+) -> Arc<TokioMutex<()>> {
+    locks
+        .entry(execution_id.clone())
+        .or_insert_with(|| Arc::new(TokioMutex::new(())))
+        .clone()
+}
 
 /// Parse SQLite datetime strings (both `YYYY-MM-DD HH:MM:SS` and RFC3339).
 fn parse_sqlite_datetime(s: &str) -> chrono::DateTime<chrono::Utc> {
@@ -92,18 +125,45 @@ pub struct Workspace {
     tree_runtime_states: Arc<RwLock<HashMap<ExperimentTreeId, TreeRuntimeState>>>,
     execution_queue_state: Arc<Mutex<ExecutionQueueState>>,
     execution_queue_notify: Arc<Notify>,
+    /// In-memory buffer for streaming `NodeStream` chunks. Flushed into the
+    /// persisted blob whenever a non-stream event for the same execution
+    /// arrives. See `persist_execution_event_snapshot` and the regression
+    /// test it documents.
+    streaming_log_buffer: Arc<StreamingLogBuffer>,
+    /// Per-execution mutex registry serializing read-modify-write of
+    /// `executions.node_logs` across the event-driven persist path and
+    /// the periodic flush path. Without this, the two paths race and one
+    /// can overwrite the other's update — see the regression test
+    /// `flush_and_persist_must_not_lose_data_under_concurrent_access`.
+    execution_persist_locks: Arc<ExecutionLockRegistry>,
+    /// Shutdown signal for the execution-event bridge. On `shutdown()` we
+    /// notify the bridge so it can drain any events still queued in its
+    /// `broadcast::Receiver` before we tear down the rest of the
+    /// workspace. Without this, queued events would be silently lost —
+    /// see the regression test
+    /// `shutdown_drains_pending_bridge_events_before_aborting`.
+    bridge_shutdown_signal: Arc<Notify>,
     max_concurrent_executions: usize,
     max_queue_depth: usize,
     kernel_monitor_handle: tokio::task::JoinHandle<()>,
     kernel_lifecycle_handle: tokio::task::JoinHandle<()>,
-    execution_event_bridge_handle: tokio::task::JoinHandle<()>,
+    /// Wrapped in `Mutex<Option<_>>` so `shutdown()` (`&self`) can take
+    /// ownership of the handle and `await` it after signaling the bridge
+    /// to drain. Drop-time abort still works via a sync mutex try_lock.
+    execution_event_bridge_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    streaming_log_flush_handle: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for Workspace {
     fn drop(&mut self) {
         self.kernel_monitor_handle.abort();
         self.kernel_lifecycle_handle.abort();
-        self.execution_event_bridge_handle.abort();
+        if let Ok(mut guard) = self.execution_event_bridge_handle.try_lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+        self.streaming_log_flush_handle.abort();
     }
 }
 
@@ -224,7 +284,11 @@ impl Workspace {
                     })
                     .await?;
                     return Ok(true);
-                } else if queue.pending.iter().any(|queued_id| queued_id == execution_id) {
+                } else if queue
+                    .pending
+                    .iter()
+                    .any(|queued_id| queued_id == execution_id)
+                {
                     true
                 } else {
                     return Ok(false);
@@ -272,7 +336,10 @@ impl Workspace {
     ) -> TineResult<bool> {
         let pending_snapshot = {
             let mut queue = execution_queue_state.lock().await;
-            let Some(position) = queue.pending.iter().position(|queued_id| queued_id == execution_id)
+            let Some(position) = queue
+                .pending
+                .iter()
+                .position(|queued_id| queued_id == execution_id)
             else {
                 return Ok(false);
             };
@@ -509,23 +576,69 @@ impl Workspace {
         target: &ExecutionTargetRef,
         outcome: tine_core::ExecutionOutcome,
     ) {
-        let existing: Option<(String,)> = sqlx::query_as("SELECT status FROM executions WHERE id = ?")
-            .bind(execution_id.as_str())
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-        if let Some((status_json,)) = existing {
+        let existing: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT status, node_logs FROM executions WHERE id = ?")
+                .bind(execution_id.as_str())
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        let mut existing_started_at =
+            Utc::now() - chrono::Duration::milliseconds(outcome.duration_ms as i64);
+        let mut merged_node_statuses = outcome.node_statuses.clone();
+        let mut merged_node_logs = outcome.node_logs.clone();
+        if let Some((status_json, node_logs_json)) = existing {
             if let Ok(status) = serde_json::from_str::<ExecutionStatus>(&status_json) {
                 let status = Self::normalize_execution_status(status);
                 if status.finished_at.is_some() || status.cancellation_requested_at.is_some() {
                     return;
                 }
+                existing_started_at = status.started_at;
+                for (node_id, node_status) in status.node_statuses {
+                    merged_node_statuses.entry(node_id).or_insert(node_status);
+                }
+            }
+            let existing_logs: HashMap<NodeId, NodeLogs> = node_logs_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .unwrap_or_default();
+            for (node_id, existing_log) in existing_logs {
+                let target = merged_node_logs.entry(node_id).or_default();
+                if target.stdout.is_empty() {
+                    target.stdout = existing_log.stdout;
+                } else if !existing_log.stdout.is_empty() {
+                    target.stdout = format!("{}{}", existing_log.stdout, target.stdout);
+                }
+                if target.stderr.is_empty() {
+                    target.stderr = existing_log.stderr;
+                } else if !existing_log.stderr.is_empty() {
+                    target.stderr = format!("{}{}", existing_log.stderr, target.stderr);
+                }
+                if target.outputs.is_empty() {
+                    target.outputs = existing_log.outputs;
+                } else if !existing_log.outputs.is_empty() {
+                    let mut outputs = existing_log.outputs;
+                    outputs.extend(target.outputs.clone());
+                    target.outputs = outputs;
+                }
+                if target.error.is_none() {
+                    target.error = existing_log.error;
+                }
+                if target.duration_ms.is_none() {
+                    target.duration_ms = existing_log.duration_ms;
+                }
+                if target.metrics.is_empty() {
+                    target.metrics = existing_log.metrics;
+                } else {
+                    for (name, value) in existing_log.metrics {
+                        target.metrics.entry(name).or_insert(value);
+                    }
+                }
             }
         }
 
         let terminal_status =
-            Self::terminal_status_from_outcome(&outcome.node_statuses, &outcome.node_logs);
+            Self::terminal_status_from_outcome(&merged_node_statuses, &merged_node_logs);
         let status = ExecutionStatus {
             execution_id: execution_id.clone(),
             tree_id: Some(tree_id.clone()),
@@ -538,12 +651,12 @@ impl Workspace {
             queue: None,
             runtime: None,
             cancellation_requested_at: None,
-            node_statuses: outcome.node_statuses,
-            started_at: Utc::now() - chrono::Duration::milliseconds(outcome.duration_ms as i64),
+            node_statuses: merged_node_statuses,
+            started_at: existing_started_at,
             finished_at: Some(Utc::now()),
         };
         let status_json = serde_json::to_string(&status).unwrap_or_default();
-        let logs_json = serde_json::to_string(&outcome.node_logs).unwrap_or_default();
+        let logs_json = serde_json::to_string(&merged_node_logs).unwrap_or_default();
 
         let _ = sqlx::query(
             "UPDATE executions SET status = ?, node_logs = ?, finished_at = datetime('now') WHERE id = ?",
@@ -554,7 +667,7 @@ impl Workspace {
         .execute(pool)
         .await;
 
-        for (node_id, logs) in &outcome.node_logs {
+        for (node_id, logs) in &merged_node_logs {
             for (name, value) in &logs.metrics {
                 let _ = sqlx::query(
                     "INSERT INTO metrics (execution_id, node_id, metric_name, metric_value, step) \
@@ -577,19 +690,26 @@ impl Workspace {
         branch_id: &BranchId,
         target: &ExecutionTargetRef,
     ) {
-        let existing: Option<(String,)> = sqlx::query_as("SELECT status FROM executions WHERE id = ?")
-            .bind(execution_id.as_str())
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-        if let Some((status_json,)) = existing {
+        let existing: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT status, node_logs FROM executions WHERE id = ?")
+                .bind(execution_id.as_str())
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        let mut existing_started_at = Utc::now();
+        let mut existing_node_statuses = HashMap::new();
+        let mut existing_logs_json: Option<String> = None;
+        if let Some((status_json, node_logs_json)) = existing {
             if let Ok(status) = serde_json::from_str::<ExecutionStatus>(&status_json) {
                 let status = Self::normalize_execution_status(status);
                 if status.finished_at.is_some() || status.cancellation_requested_at.is_some() {
                     return;
                 }
+                existing_started_at = status.started_at;
+                existing_node_statuses = status.node_statuses;
             }
+            existing_logs_json = node_logs_json;
         }
 
         let status = ExecutionStatus {
@@ -604,15 +724,16 @@ impl Workspace {
             queue: None,
             runtime: None,
             cancellation_requested_at: None,
-            node_statuses: HashMap::new(),
-            started_at: Utc::now(),
+            node_statuses: existing_node_statuses,
+            started_at: existing_started_at,
             finished_at: Some(Utc::now()),
         };
         let status_json = serde_json::to_string(&status).unwrap_or_default();
         let _ = sqlx::query(
-            "UPDATE executions SET status = ?, finished_at = datetime('now') WHERE id = ?",
+            "UPDATE executions SET status = ?, node_logs = COALESCE(?, node_logs), finished_at = datetime('now') WHERE id = ?",
         )
         .bind(&status_json)
+        .bind(existing_logs_json)
         .bind(execution_id.as_str())
         .execute(pool)
         .await;
@@ -628,7 +749,9 @@ impl Workspace {
         {
             ExecutionLifecycleStatus::Failed
         } else if !node_statuses.is_empty()
-            && node_statuses.values().all(|node_status| matches!(node_status, NodeStatus::Interrupted))
+            && node_statuses
+                .values()
+                .all(|node_status| matches!(node_status, NodeStatus::Interrupted))
         {
             ExecutionLifecycleStatus::Cancelled
         } else {
@@ -636,14 +759,18 @@ impl Workspace {
         }
     }
 
-    fn terminal_status_from_nodes(node_statuses: &HashMap<NodeId, NodeStatus>) -> ExecutionLifecycleStatus {
+    fn terminal_status_from_nodes(
+        node_statuses: &HashMap<NodeId, NodeStatus>,
+    ) -> ExecutionLifecycleStatus {
         if node_statuses
             .values()
             .any(|node_status| matches!(node_status, NodeStatus::Failed))
         {
             ExecutionLifecycleStatus::Failed
         } else if !node_statuses.is_empty()
-            && node_statuses.values().all(|node_status| matches!(node_status, NodeStatus::Interrupted))
+            && node_statuses
+                .values()
+                .all(|node_status| matches!(node_status, NodeStatus::Interrupted))
         {
             ExecutionLifecycleStatus::Cancelled
         } else {
@@ -682,7 +809,14 @@ impl Workspace {
             return status;
         }
 
-        if matches!(status.phase, ExecutionPhase::Completed | ExecutionPhase::Failed | ExecutionPhase::Cancelled | ExecutionPhase::TimedOut | ExecutionPhase::Rejected) {
+        if matches!(
+            status.phase,
+            ExecutionPhase::Completed
+                | ExecutionPhase::Failed
+                | ExecutionPhase::Cancelled
+                | ExecutionPhase::TimedOut
+                | ExecutionPhase::Rejected
+        ) {
             status.phase = ExecutionPhase::Running;
         }
 
@@ -696,9 +830,10 @@ impl Workspace {
                 status.phase = ExecutionPhase::Running;
             }
         } else if !status.node_statuses.is_empty()
-            && status.node_statuses.values().all(|node_status| {
-                matches!(node_status, NodeStatus::Pending | NodeStatus::Queued)
-            })
+            && status
+                .node_statuses
+                .values()
+                .all(|node_status| matches!(node_status, NodeStatus::Pending | NodeStatus::Queued))
         {
             status.status = ExecutionLifecycleStatus::Queued;
             status.phase = ExecutionPhase::Queued;
@@ -707,10 +842,7 @@ impl Workspace {
         status
     }
 
-    async fn runtime_health_snapshot(
-        &self,
-        tree_id: &ExperimentTreeId,
-    ) -> RuntimeHealthSnapshot {
+    async fn runtime_health_snapshot(&self, tree_id: &ExperimentTreeId) -> RuntimeHealthSnapshot {
         let current_runtime_state = self.get_tree_runtime_state(tree_id).await;
         let has_live_kernel = self.kernel_mgr.has_tree_kernel(tree_id);
         let tree_kernel_state = current_runtime_state
@@ -723,7 +855,11 @@ impl Workspace {
             tree_kernel_state: tree_kernel_state.clone(),
             replay_required: matches!(
                 tree_kernel_state,
-                Some(TreeKernelState::NeedsReplay | TreeKernelState::KernelLost | TreeKernelState::Switching)
+                Some(
+                    TreeKernelState::NeedsReplay
+                        | TreeKernelState::KernelLost
+                        | TreeKernelState::Switching
+                )
             ),
             active_branch_id: current_runtime_state
                 .as_ref()
@@ -929,7 +1065,8 @@ impl Workspace {
             return Ok(());
         }
         update(&mut status);
-        let updated_status_json = serde_json::to_string(&status).map_err(TineError::Serialization)?;
+        let updated_status_json =
+            serde_json::to_string(&status).map_err(TineError::Serialization)?;
         sqlx::query(
             "UPDATE executions SET status = ?, finished_at = COALESCE(finished_at, ?) WHERE id = ?",
         )
@@ -988,17 +1125,21 @@ impl Workspace {
         status.queue_position = None;
 
         for (node_id, node_status) in status.node_statuses.iter_mut() {
-            if matches!(node_status, NodeStatus::Pending | NodeStatus::Queued | NodeStatus::Running)
-            {
+            if matches!(
+                node_status,
+                NodeStatus::Pending | NodeStatus::Queued | NodeStatus::Running
+            ) {
                 *node_status = NodeStatus::Interrupted;
-                let logs = node_logs.entry(node_id.clone()).or_insert_with(|| NodeLogs {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    outputs: Vec::new(),
-                    error: None,
-                    duration_ms: None,
-                    metrics: HashMap::new(),
-                });
+                let logs = node_logs
+                    .entry(node_id.clone())
+                    .or_insert_with(|| NodeLogs {
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        outputs: Vec::new(),
+                        error: None,
+                        duration_ms: None,
+                        metrics: HashMap::new(),
+                    });
                 if logs.stderr.is_empty() {
                     logs.stderr = reason.to_string();
                 } else if !logs.stderr.contains(reason) {
@@ -1040,14 +1181,16 @@ impl Workspace {
             }
 
             *node_status = NodeStatus::Interrupted;
-            let logs = node_logs.entry(node_id.clone()).or_insert_with(|| NodeLogs {
-                stdout: String::new(),
-                stderr: String::new(),
-                outputs: Vec::new(),
-                error: None,
-                duration_ms: None,
-                metrics: HashMap::new(),
-            });
+            let logs = node_logs
+                .entry(node_id.clone())
+                .or_insert_with(|| NodeLogs {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    outputs: Vec::new(),
+                    error: None,
+                    duration_ms: None,
+                    metrics: HashMap::new(),
+                });
             if logs.stderr.is_empty() {
                 logs.stderr = reason.to_string();
             } else if !logs.stderr.contains(reason) {
@@ -1268,6 +1411,34 @@ impl Workspace {
         }
 
         Ok(updated)
+    }
+
+    async fn collect_workspace_shutdown_tree_ids(&self) -> TineResult<Vec<ExperimentTreeId>> {
+        let mut tree_ids: HashSet<ExperimentTreeId> = self
+            .tree_runtime_states
+            .read()
+            .await
+            .keys()
+            .filter(|tree_id| self.kernel_mgr.has_tree_kernel(tree_id))
+            .cloned()
+            .collect();
+
+        let execution_tree_ids: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT DISTINCT tree_id FROM executions WHERE finished_at IS NULL")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| TineError::Database(e.to_string()))?;
+
+        for tree_id in execution_tree_ids.into_iter().flatten() {
+            let tree_id = ExperimentTreeId::new(tree_id);
+            if self.kernel_mgr.has_tree_kernel(&tree_id) {
+                tree_ids.insert(tree_id);
+            }
+        }
+
+        let mut tree_ids: Vec<_> = tree_ids.into_iter().collect();
+        tree_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        Ok(tree_ids)
     }
 
     async fn run_branch_execution(
@@ -1538,14 +1709,121 @@ impl Workspace {
         })
     }
 
+    /// Hot-path append for `NodeStream` chunks. Stream events arrive at the
+    /// rate the kernel is producing stdout/stderr (potentially thousands per
+    /// second on a chatty cell). Re-serializing the cumulative `node_logs`
+    /// blob to disk on every chunk is O(N²) and historically caused
+    /// 100+ ms/chunk persistence work on long-running cells, blocking the
+    /// shared SQLite pool and starving status reads.
+    ///
+    /// We keep stream state in memory and fold it into the next read-modify-
+    /// write that happens for any non-stream event (NodeStarted, NodeFailed,
+    /// terminal events, etc.). Logs read paths must merge this buffer.
+    fn buffer_streaming_chunk(
+        streaming: &StreamingLogBuffer,
+        execution_id: &ExecutionId,
+        node_id: &NodeId,
+        stream: &str,
+        text: &str,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let mut entry = streaming.entry(execution_id.clone()).or_default();
+        let logs = entry
+            .entry(node_id.clone())
+            .or_insert_with(NodeLogs::default);
+        match stream {
+            "stderr" => logs.stderr.push_str(text),
+            _ => logs.stdout.push_str(text),
+        }
+    }
+
+    /// Drain any buffered stream chunks for `execution_id` into `node_logs`.
+    /// Called as the first step of any non-stream event's read-modify-write
+    /// so the persisted blob picks up whatever streaming has accumulated.
+    fn drain_streaming_buffer_into(
+        streaming: &StreamingLogBuffer,
+        execution_id: &ExecutionId,
+        node_logs: &mut HashMap<NodeId, NodeLogs>,
+    ) -> HashMap<NodeId, NodeLogs> {
+        let Some((_, buffered)) = streaming.remove(execution_id) else {
+            return HashMap::new();
+        };
+        for (node_id, buffered_logs) in &buffered {
+            let entry = node_logs
+                .entry(node_id.clone())
+                .or_insert_with(NodeLogs::default);
+            entry.stdout.push_str(&buffered_logs.stdout);
+            entry.stderr.push_str(&buffered_logs.stderr);
+        }
+        buffered
+    }
+
+    /// Read-only overlay: append any unpersisted stream chunks for
+    /// `(execution_id, node_id)` into `target` without removing them from
+    /// the buffer. Used by log read paths so a poll during an in-flight
+    /// execution sees the latest state. Returns `true` if any data was
+    /// appended.
+    fn overlay_streaming_buffer(
+        streaming: &StreamingLogBuffer,
+        execution_id: &ExecutionId,
+        node_id: &NodeId,
+        target: &mut NodeLogs,
+    ) -> bool {
+        let Some(entry) = streaming.get(execution_id) else {
+            return false;
+        };
+        let Some(buffered) = entry.get(node_id) else {
+            return false;
+        };
+        if buffered.stdout.is_empty() && buffered.stderr.is_empty() {
+            return false;
+        }
+        target.stdout.push_str(&buffered.stdout);
+        target.stderr.push_str(&buffered.stderr);
+        true
+    }
+
+    #[cfg(test)]
     async fn persist_execution_event_snapshot(
         pool: &SqlitePool,
+        streaming: &StreamingLogBuffer,
         event: &ExecutionEvent,
     ) -> TineResult<()> {
+        Self::persist_execution_event_snapshot_locked(pool, streaming, None, event).await
+    }
+
+    /// Variant of `persist_execution_event_snapshot` that takes the
+    /// per-execution lock registry so the read-modify-write critical
+    /// section is serialized with the periodic flush path. The two-arg
+    /// form above is kept so existing call sites and tests don't need to
+    /// thread the registry; production callers should use this variant.
+    async fn persist_execution_event_snapshot_locked(
+        pool: &SqlitePool,
+        streaming: &StreamingLogBuffer,
+        locks: Option<&ExecutionLockRegistry>,
+        event: &ExecutionEvent,
+    ) -> TineResult<()> {
+        // Hot-path: streamed stdout/stderr chunks get appended to the in-
+        // memory buffer instead of round-tripping through the full
+        // executions.node_logs blob. This is the single biggest server-side
+        // bottleneck on long-running cells.
+        if let ExecutionEvent::NodeStream {
+            execution_id,
+            node_id,
+            stream,
+            text,
+            ..
+        } = event
+        {
+            Self::buffer_streaming_chunk(streaming, execution_id, node_id, stream, text);
+            return Ok(());
+        }
+
         let execution_id = match event {
             ExecutionEvent::ExecutionStarted { execution_id, .. }
             | ExecutionEvent::NodeStarted { execution_id, .. }
-            | ExecutionEvent::NodeStream { execution_id, .. }
             | ExecutionEvent::NodeDisplayData { execution_id, .. }
             | ExecutionEvent::NodeDisplayUpdate { execution_id, .. }
             | ExecutionEvent::ExecutionCompleted { execution_id, .. }
@@ -1554,6 +1832,16 @@ impl Workspace {
             | ExecutionEvent::NodeCacheHit { execution_id, .. }
             | ExecutionEvent::NodeFailed { execution_id, .. } => execution_id,
             _ => return Ok(()),
+        };
+
+        // Serialize this read-modify-write with the periodic flush path
+        // for the same execution. Without the lock the two paths can race
+        // and one can overwrite the other's update — see the regression
+        // test `flush_and_persist_must_not_lose_data_under_concurrent_access`.
+        let lock = locks.map(|registry| execution_persist_lock(registry, execution_id));
+        let _guard = match lock.as_ref() {
+            Some(arc) => Some(arc.lock().await),
+            None => None,
         };
 
         let row: Option<(String, Option<String>)> =
@@ -1568,35 +1856,42 @@ impl Workspace {
 
         let mut status: ExecutionStatus =
             Self::normalize_execution_status(serde_json::from_str(&status_json)?);
-        if status.finished_at.is_some() {
-            return Ok(());
-        }
+        let row_already_finished = status.finished_at.is_some();
         let mut node_logs: HashMap<NodeId, NodeLogs> = node_logs_json
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok())
             .unwrap_or_default();
+        // Fold any buffered stream chunks into the canonical blob before
+        // applying this event so a subsequent NodeCompleted/Failed/etc. sees
+        // the full log.
+        let drained_streaming_chunks =
+            Self::drain_streaming_buffer_into(streaming, execution_id, &mut node_logs);
 
         let cancellation_pending = status.cancellation_requested_at.is_some();
 
         match event {
             ExecutionEvent::ExecutionStarted { .. } => {
-                Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+                if !row_already_finished {
+                    Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+                }
             }
             ExecutionEvent::NodeStarted { node_id, .. } => {
-                Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
-                status
-                    .node_statuses
-                    .insert(node_id.clone(), NodeStatus::Running);
-                node_logs
-                    .entry(node_id.clone())
-                    .or_insert_with(|| NodeLogs {
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        outputs: Vec::new(),
-                        error: None,
-                        duration_ms: None,
-                        metrics: HashMap::new(),
-                    });
+                if !row_already_finished {
+                    Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+                    status
+                        .node_statuses
+                        .insert(node_id.clone(), NodeStatus::Running);
+                    node_logs
+                        .entry(node_id.clone())
+                        .or_insert_with(|| NodeLogs {
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            outputs: Vec::new(),
+                            error: None,
+                            duration_ms: None,
+                            metrics: HashMap::new(),
+                        });
+                }
             }
             ExecutionEvent::NodeStream {
                 node_id,
@@ -1642,10 +1937,12 @@ impl Workspace {
                 duration_ms,
                 ..
             } => {
-                Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
                 status
                     .node_statuses
                     .insert(node_id.clone(), NodeStatus::Completed);
+                if !row_already_finished {
+                    Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+                }
                 let logs = node_logs
                     .entry(node_id.clone())
                     .or_insert_with(|| NodeLogs {
@@ -1659,25 +1956,25 @@ impl Workspace {
                 logs.duration_ms = Some(*duration_ms);
             }
             ExecutionEvent::NodeCacheHit { node_id, .. } => {
-                Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
-                status
-                    .node_statuses
-                    .insert(node_id.clone(), NodeStatus::CacheHit);
+                if !row_already_finished {
+                    Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+                    status
+                        .node_statuses
+                        .insert(node_id.clone(), NodeStatus::CacheHit);
+                }
             }
             ExecutionEvent::NodeFailed { node_id, error, .. } => {
-                if !cancellation_pending {
+                if !row_already_finished && !cancellation_pending {
                     Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
                 }
-                status
-                    .node_statuses
-                    .insert(
-                        node_id.clone(),
-                        if cancellation_pending {
-                            NodeStatus::Interrupted
-                        } else {
-                            NodeStatus::Failed
-                        },
-                    );
+                status.node_statuses.insert(
+                    node_id.clone(),
+                    if cancellation_pending {
+                        NodeStatus::Interrupted
+                    } else {
+                        NodeStatus::Failed
+                    },
+                );
                 let logs = node_logs
                     .entry(node_id.clone())
                     .or_insert_with(|| NodeLogs {
@@ -1691,13 +1988,13 @@ impl Workspace {
                 logs.error = Some(error.clone());
             }
             ExecutionEvent::ExecutionCompleted { .. } => {
-                if !cancellation_pending {
+                if !row_already_finished && !cancellation_pending {
                     status.finished_at = Some(Utc::now());
                     Self::apply_execution_phase(&mut status, ExecutionPhase::Completed);
                 }
             }
             ExecutionEvent::ExecutionFailed { .. } => {
-                if !cancellation_pending {
+                if !row_already_finished && !cancellation_pending {
                     status.finished_at = Some(Utc::now());
                     let terminal_status =
                         Self::terminal_status_from_outcome(&status.node_statuses, &node_logs);
@@ -1708,27 +2005,29 @@ impl Workspace {
             _ => {}
         }
 
-        if cancellation_pending && status.finished_at.is_none() {
-            Self::apply_execution_phase(&mut status, ExecutionPhase::CancellationRequested);
-        }
+        if !row_already_finished {
+            if cancellation_pending && status.finished_at.is_none() {
+                Self::apply_execution_phase(&mut status, ExecutionPhase::CancellationRequested);
+            }
 
-        if !cancellation_pending
-            && status.finished_at.is_none()
-            && Self::execution_nodes_finished(&status)
-        {
-            status.finished_at = Some(Utc::now());
-            let terminal_status =
-                Self::terminal_status_from_outcome(&status.node_statuses, &node_logs);
-            status.status = terminal_status.clone();
-            status.phase = Self::terminal_phase_from_status(&terminal_status);
+            if !cancellation_pending
+                && status.finished_at.is_none()
+                && Self::execution_nodes_finished(&status)
+            {
+                status.finished_at = Some(Utc::now());
+                let terminal_status =
+                    Self::terminal_status_from_outcome(&status.node_statuses, &node_logs);
+                status.status = terminal_status.clone();
+                status.phase = Self::terminal_phase_from_status(&terminal_status);
+            }
         }
 
         let updated_status_json = serde_json::to_string(&status).unwrap_or_default();
         let updated_logs_json = serde_json::to_string(&node_logs).unwrap_or_default();
-        sqlx::query(
+        let update_result = sqlx::query(
             "UPDATE executions \
              SET status = ?, node_logs = ?, finished_at = COALESCE(finished_at, ?) \
-             WHERE id = ? AND finished_at IS NULL",
+             WHERE id = ?",
         )
         .bind(&updated_status_json)
         .bind(&updated_logs_json)
@@ -1736,32 +2035,294 @@ impl Workspace {
         .bind(execution_id.as_str())
         .execute(pool)
         .await
-        .map_err(|e| TineError::Database(e.to_string()))?;
+        .map_err(|e| TineError::Database(e.to_string()));
+
+        if update_result.is_err() {
+            Self::reinsert_drained_chunks_on_flush_failure(
+                streaming,
+                execution_id,
+                drained_streaming_chunks,
+            );
+        }
+        update_result?;
 
         Ok(())
     }
 
     fn spawn_execution_event_bridge(
         pool: SqlitePool,
+        streaming: Arc<StreamingLogBuffer>,
+        locks: Arc<ExecutionLockRegistry>,
         mut event_rx: tokio::sync::broadcast::Receiver<ExecutionEvent>,
+        shutdown: Arc<Notify>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            // Hold a future for the shutdown signal so we can race it
+            // against `event_rx.recv()` without losing notifications.
+            let shutdown_signal = shutdown.notified();
+            tokio::pin!(shutdown_signal);
+
             loop {
-                match event_rx.recv().await {
-                    Ok(event) => {
-                        if let Err(err) =
-                            Self::persist_execution_event_snapshot(&pool, &event).await
-                        {
-                            warn!(error = %err, "failed to persist incremental execution event");
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown_signal => {
+                        // Graceful shutdown: drain everything still queued
+                        // in the broadcast receiver before exiting so
+                        // terminal events and their associated logs land
+                        // in the DB. Bounded by the broadcast channel's
+                        // capacity, so this loop cannot run forever.
+                        Self::drain_bridge_queue(&pool, &streaming, &locks, &mut event_rx).await;
+                        break;
+                    }
+                    res = event_rx.recv() => {
+                        match res {
+                            Ok(event) => {
+                                if let Err(err) = Self::persist_execution_event_snapshot_locked(
+                                    &pool,
+                                    &streaming,
+                                    Some(&locks),
+                                    &event,
+                                )
+                                .await
+                                {
+                                    warn!(error = %err, "failed to persist incremental execution event");
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                warn!(skipped = skipped, "execution event bridge lagged behind");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(skipped = skipped, "execution event bridge lagged behind");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         })
+    }
+
+    /// Drain whatever is currently buffered in the bridge's broadcast
+    /// receiver and persist each event. Used during graceful shutdown so
+    /// queued events (especially terminal `NodeCompleted` /
+    /// `ExecutionCompleted` events that mutate `executions.status` and
+    /// `node_logs`) are not silently dropped when we abort the long-
+    /// running bridge task.
+    async fn drain_bridge_queue(
+        pool: &SqlitePool,
+        streaming: &StreamingLogBuffer,
+        locks: &ExecutionLockRegistry,
+        event_rx: &mut tokio::sync::broadcast::Receiver<ExecutionEvent>,
+    ) {
+        loop {
+            match event_rx.try_recv() {
+                Ok(event) => {
+                    if let Err(err) = Self::persist_execution_event_snapshot_locked(
+                        pool,
+                        streaming,
+                        Some(locks),
+                        &event,
+                    )
+                    .await
+                    {
+                        warn!(error = %err, "failed to persist event during bridge drain");
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    warn!(skipped = skipped, "execution event bridge drain saw lag");
+                }
+            }
+        }
+    }
+
+    /// Periodic flush task: drains the streaming buffer to disk every
+    /// `STREAMING_FLUSH_INTERVAL` so a server crash can lose at most one
+    /// flush window of buffered stdout/stderr instead of the entire run's
+    /// streamed output.
+    fn spawn_streaming_log_flush_task(
+        pool: SqlitePool,
+        streaming: Arc<StreamingLogBuffer>,
+        locks: Arc<ExecutionLockRegistry>,
+    ) -> tokio::task::JoinHandle<()> {
+        const STREAMING_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(STREAMING_FLUSH_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if let Err(err) =
+                    Self::flush_streaming_log_buffer_locked(&pool, &streaming, Some(&locks)).await
+                {
+                    warn!(error = %err, "periodic streaming log flush failed");
+                }
+            }
+        })
+    }
+
+    async fn flush_streaming_log_buffer_locked(
+        pool: &SqlitePool,
+        streaming: &StreamingLogBuffer,
+        locks: Option<&ExecutionLockRegistry>,
+    ) -> TineResult<()> {
+        // Snapshot the keys first so we can release the dashmap shard locks
+        // before doing per-row DB work, and so concurrent buffer appends
+        // for an execution_id we already started flushing aren't dropped.
+        let pending_ids: Vec<ExecutionId> =
+            streaming.iter().map(|entry| entry.key().clone()).collect();
+        for execution_id in pending_ids {
+            if let Err(err) = Self::flush_streaming_buffer_for_execution_locked(
+                pool,
+                streaming,
+                locks,
+                &execution_id,
+            )
+            .await
+            {
+                warn!(
+                    execution = %execution_id,
+                    error = %err,
+                    "failed to flush streaming buffer for execution"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn flush_streaming_buffer_for_execution_locked(
+        pool: &SqlitePool,
+        streaming: &StreamingLogBuffer,
+        locks: Option<&ExecutionLockRegistry>,
+        execution_id: &ExecutionId,
+    ) -> TineResult<()> {
+        // Acquire the per-execution lock so this read-modify-write is
+        // serialized with `persist_execution_event_snapshot_locked` for
+        // the same row. See the regression test
+        // `flush_and_persist_must_not_lose_data_under_concurrent_access`.
+        let lock = locks.map(|registry| execution_persist_lock(registry, execution_id));
+        let _guard = match lock.as_ref() {
+            Some(arc) => Some(arc.lock().await),
+            None => None,
+        };
+
+        // Cheap pre-check: nothing buffered for this execution → no work.
+        let has_data = streaming
+            .get(execution_id)
+            .map(|entry| {
+                entry
+                    .values()
+                    .any(|logs| !logs.stdout.is_empty() || !logs.stderr.is_empty())
+            })
+            .unwrap_or(false);
+        if !has_data {
+            // Drop any empty placeholder entry so we don't keep iterating it.
+            streaming.remove(execution_id);
+            return Ok(());
+        }
+
+        // Take ownership of the buffered chunks for this execution. If the
+        // persist below fails, we re-insert the drained chunks so the next
+        // flush retries them. See the regression test
+        // `flush_re_buffers_chunks_when_update_fails`.
+        let drained = streaming
+            .remove(execution_id)
+            .map(|(_, v)| v)
+            .unwrap_or_default();
+
+        let result =
+            Self::write_drained_chunks_to_executions_row(pool, execution_id, &drained).await;
+
+        if result.is_err() {
+            Self::reinsert_drained_chunks_on_flush_failure(streaming, execution_id, drained);
+        }
+        result
+    }
+
+    /// Writes the drained streaming chunks for `execution_id` into the
+    /// existing `executions.node_logs` blob in a read-modify-write.
+    /// Caller is responsible for re-buffering the drained chunks on
+    /// failure so transient DB errors don't permanently lose stdout.
+    async fn write_drained_chunks_to_executions_row(
+        pool: &SqlitePool,
+        execution_id: &ExecutionId,
+        drained: &HashMap<NodeId, NodeLogs>,
+    ) -> TineResult<()> {
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT status, node_logs FROM executions WHERE id = ?")
+                .bind(execution_id.as_str())
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| TineError::Database(e.to_string()))?;
+        let Some((_status_json, node_logs_json)) = row else {
+            // Row vanished (e.g. delete_experiment_tree race). Drained
+            // chunks are unrecoverable but the row is gone too, so this
+            // is not a data loss vs the user's intent.
+            return Ok(());
+        };
+
+        let mut node_logs: HashMap<NodeId, NodeLogs> = node_logs_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default();
+
+        // Append drained chunks to whatever was already persisted.
+        for (node_id, drained_logs) in drained {
+            let target = node_logs
+                .entry(node_id.clone())
+                .or_insert_with(NodeLogs::default);
+            target.stdout.push_str(&drained_logs.stdout);
+            target.stderr.push_str(&drained_logs.stderr);
+        }
+
+        let updated_logs_json =
+            serde_json::to_string(&node_logs).map_err(TineError::Serialization)?;
+        // No `finished_at IS NULL` guard: late stream chunks can legitimately
+        // arrive AFTER a terminal `NodeCompleted` event (the kernel can emit
+        // its last stdout flush between when the executor sends NodeCompleted
+        // and when the iopub stream actually drains).
+        let result = sqlx::query("UPDATE executions SET node_logs = ? WHERE id = ?")
+            .bind(&updated_logs_json)
+            .bind(execution_id.as_str())
+            .execute(pool)
+            .await
+            .map_err(|e| TineError::Database(e.to_string()))?;
+        if result.rows_affected() == 0 {
+            warn!(
+                execution = %execution_id,
+                "flush target row disappeared mid-write; drained stream chunks could not be persisted"
+            );
+        }
+        Ok(())
+    }
+
+    /// Re-insert previously drained chunks back into the streaming buffer
+    /// after a write failure. Drained chunks are placed BEFORE any chunks
+    /// that have been concurrently appended to the buffer entry since we
+    /// took ownership, preserving emission order (older chunks come first).
+    fn reinsert_drained_chunks_on_flush_failure(
+        streaming: &StreamingLogBuffer,
+        execution_id: &ExecutionId,
+        drained: HashMap<NodeId, NodeLogs>,
+    ) {
+        if drained.is_empty() {
+            return;
+        }
+        let mut entry = streaming.entry(execution_id.clone()).or_default();
+        for (node_id, drained_logs) in drained {
+            let target = entry.entry(node_id).or_insert_with(NodeLogs::default);
+            // Prepend drained text so that, in the buffer, drained chunks
+            // appear before any chunks appended concurrently with the
+            // failed flush. We rebuild the strings rather than using
+            // `insert_str(0, ...)` to keep the implementation simple.
+            let mut new_stdout = drained_logs.stdout;
+            new_stdout.push_str(&target.stdout);
+            target.stdout = new_stdout;
+            let mut new_stderr = drained_logs.stderr;
+            new_stderr.push_str(&target.stderr);
+            target.stderr = new_stderr;
+        }
+        warn!(
+            execution = %execution_id,
+            "flush failed; chunks re-buffered for next attempt"
+        );
     }
 
     pub async fn list_experiment_trees(&self) -> TineResult<Vec<ExperimentTreeDef>> {
@@ -2123,12 +2684,9 @@ impl Workspace {
         tree_id: &ExperimentTreeId,
     ) -> TineResult<TreeRuntimeState> {
         let cancellation_requested_at = Utc::now();
-        let marked = Self::mark_tree_shutdown_requested(
-            &self.pool,
-            tree_id,
-            cancellation_requested_at,
-        )
-        .await?;
+        let marked =
+            Self::mark_tree_shutdown_requested(&self.pool, tree_id, cancellation_requested_at)
+                .await?;
         match self.scheduler.interrupt_tree_kernel(tree_id).await {
             Ok(()) => {}
             Err(TineError::KernelNotFound { .. }) => {}
@@ -2244,7 +2802,9 @@ impl Workspace {
     ) -> TineResult<ExecutionAccepted> {
         let tree = workspace.get_experiment_tree(tree_id).await?;
         Self::validate_branch_membership(&tree, branch_id, cell_id)?;
-        let working_dir = workspace.file_base_for_project(tree.project_id.as_ref()).await?;
+        let working_dir = workspace
+            .file_base_for_project(tree.project_id.as_ref())
+            .await?;
         let plan = Self::build_tree_cell_execution_plan(&tree, branch_id, cell_id)?;
         let execution_id = ExecutionId::generate();
         let created_at = Utc::now();
@@ -2287,7 +2847,8 @@ impl Workspace {
                 max_concurrent_executions,
                 &execution_id_for_task,
             )
-            .await {
+            .await
+            {
                 Ok(can_run) => can_run,
                 Err(err) => {
                     error!(
@@ -2404,7 +2965,9 @@ impl Workspace {
                     let mut runtime_state = prepared.runtime_state;
                     runtime_state.kernel_state = TreeKernelState::Ready;
                     runtime_state.last_prepared_cell_id = Some(cell_id_for_task.clone());
-                    if let Err(err) = workspace_for_task.set_tree_runtime_state(runtime_state).await
+                    if let Err(err) = workspace_for_task
+                        .set_tree_runtime_state(runtime_state)
+                        .await
                     {
                         warn!(
                             tree = %tree_id_for_task,
@@ -2815,7 +3378,8 @@ impl Workspace {
                 max_concurrent_executions,
                 &eid,
             )
-            .await {
+            .await
+            {
                 Ok(can_run) => can_run,
                 Err(err) => {
                     error!(tree = %tid, branch = %bid, execution = %eid, error = %err, "failed while waiting for queued branch execution slot");
@@ -2868,22 +3432,33 @@ impl Workspace {
                 working_dir_for_task,
             )
             .await;
-            Self::release_execution_slot_with(
-                &queue_state_for_task,
-                &queue_notify_for_task,
-                &eid,
-            )
-            .await;
+            Self::release_execution_slot_with(&queue_state_for_task, &queue_notify_for_task, &eid)
+                .await;
         });
 
         Ok(exec_id)
     }
 
+    /// Execute all branches in the given experiment tree in deterministic order.
+    ///
+    /// **Execution Contract**:
+    /// A tree runtime may be reused only while its state remains truthful for the next requested branch path.
+    /// `run all` adds a stronger rule: sibling branches must execute in isolation from one another.
+    /// Namespace-guarded isolation is one strategy for preserving that invariant; contamination or any
+    /// indeterminate guard failure immediately invalidates runtime reuse and requires replay or restart
+    /// before further branch work.
     pub async fn execute_all_branches_in_experiment_tree(
         &self,
         tree_id: &ExperimentTreeId,
     ) -> TineResult<Vec<(BranchId, ExecutionId)>> {
         let tree = self.get_experiment_tree(tree_id).await?;
+        if self.get_tree_runtime_state(tree_id).await.is_none() {
+            self.set_tree_runtime_state(Self::default_tree_runtime_state(
+                tree_id,
+                &tree.root_branch_id,
+            ))
+            .await?;
+        }
         let working_dir = self.file_base_for_project(tree.project_id.as_ref()).await?;
         let branch_ids = Self::ordered_branch_ids(&tree)?;
 
@@ -2920,314 +3495,228 @@ impl Workspace {
         let tid = tree_id.clone();
         let event_tx = self.scheduler.event_sender();
         let working_dir_for_task = working_dir.clone();
-        let isolation_mode = self
-            .get_tree_runtime_state(tree_id)
-            .await
-            .map(|state| state.isolation_mode)
-            .unwrap_or_default();
         tokio::spawn(async move {
-            match isolation_mode {
-                BranchIsolationMode::Disabled => {
-                    let mut runs_iter = runs.into_iter();
-                    while let Some((branch_id, exec_id, executable_branch, target)) =
-                        runs_iter.next()
-                    {
-                        let can_run = match Self::wait_for_execution_slot_with(
-                            &pool,
-                            &execution_queue_state,
-                            &execution_queue_notify,
-                            max_concurrent_executions,
-                            &exec_id,
-                        )
-                        .await {
-                            Ok(can_run) => can_run,
-                            Err(err) => {
-                                error!(tree = %tid, branch = %branch_id, execution = %exec_id, error = %err, "failed while waiting for queued execute-all slot");
-                                Self::finalize_branch_execution_failure(
-                                    &pool,
-                                    &exec_id,
-                                    &tid,
-                                    &branch_id,
-                                    &target,
-                                )
-                                .await;
-                                continue;
-                            }
-                        };
-                        if !can_run {
-                            continue;
-                        }
-                        if kernel_mgr.has_tree_kernel(&tid) {
-                            if let Err(e) = kernel_mgr.shutdown_tree(&tid).await {
-                                error!(tree = %tid, branch = %branch_id, execution = %exec_id, error = %e, "failed to reset tree kernel before branch execution");
-                            }
-                        }
-                        let succeeded = Self::run_branch_execution(
-                            scheduler.clone(),
-                            pool.clone(),
-                            tid.clone(),
-                            branch_id.clone(),
-                            exec_id.clone(),
-                            executable_branch,
-                            target,
-                            HashMap::new(),
-                            working_dir_for_task.clone(),
+            let mut runs_iter = runs.into_iter();
+            while let Some((branch_id, exec_id, executable_branch, target)) = runs_iter.next() {
+                let can_run = match Self::wait_for_execution_slot_with(
+                    &pool,
+                    &execution_queue_state,
+                    &execution_queue_notify,
+                    max_concurrent_executions,
+                    &exec_id,
+                )
+                .await
+                {
+                    Ok(can_run) => can_run,
+                    Err(err) => {
+                        error!(tree = %tid, branch = %branch_id, execution = %exec_id, error = %err, "failed while waiting for queued guarded execute-all slot");
+                        Self::finalize_branch_execution_failure(
+                            &pool, &exec_id, &tid, &branch_id, &target,
                         )
                         .await;
-                        Self::release_execution_slot_with(
-                            &execution_queue_state,
-                            &execution_queue_notify,
-                            &exec_id,
-                        )
-                        .await;
-                        if !succeeded {
-                            warn!(tree = %tid, branch = %branch_id, execution = %exec_id, "stopping execute-all after first branch failure");
-                            for (remaining_branch_id, remaining_exec_id, _, remaining_target) in
-                                runs_iter
+                        continue;
+                    }
+                };
+                if !can_run {
+                    continue;
+                }
+
+                let mut restart_after_teardown = false;
+                let branch_id_for_isolation = branch_id.clone();
+                let session_id = exec_id.as_str().to_string();
+                let _ = event_tx.send(ExecutionEvent::IsolationAttempted {
+                    execution_id: exec_id.clone(),
+                    tree_id: tid.clone(),
+                    branch_id: branch_id.clone(),
+                });
+
+                if !kernel_mgr.has_tree_kernel(&tid) {
+                    let tree_env = TreeEnvironmentDescriptor::new(
+                        tid.clone(),
+                        executable_branch.project_id.clone(),
+                        executable_branch.environment.clone(),
+                    );
+                    match env_mgr.ensure_tree_environment(&tree_env).await {
+                        Ok(venv_dir) => {
+                            if let Err(err) = kernel_mgr
+                                .start_tree_kernel(&tid, &venv_dir, &working_dir_for_task)
+                                .await
                             {
-                                let _ = Self::dequeue_execution_with(
-                                    &pool,
-                                    &execution_queue_state,
-                                    &execution_queue_notify,
-                                    &remaining_exec_id,
-                                )
-                                .await;
-                                warn!(tree = %tid, branch = %remaining_branch_id, execution = %remaining_exec_id, "marking remaining run-all branch as failed after earlier branch failure");
-                                Self::finalize_branch_execution_failure(
-                                    &pool,
-                                    &remaining_exec_id,
-                                    &tid,
-                                    &remaining_branch_id,
-                                    &remaining_target,
-                                )
-                                .await;
+                                let _ = event_tx.send(ExecutionEvent::FallbackRestartTriggered {
+                                    execution_id: exec_id.clone(),
+                                    tree_id: tid.clone(),
+                                    branch_id: branch_id.clone(),
+                                    reason: format!("failed_to_start_guarded_kernel:{}", err),
+                                });
+                                restart_after_teardown = true;
                             }
-                            break;
+                        }
+                        Err(err) => {
+                            let _ = event_tx.send(ExecutionEvent::FallbackRestartTriggered {
+                                execution_id: exec_id.clone(),
+                                tree_id: tid.clone(),
+                                branch_id: branch_id.clone(),
+                                reason: format!("failed_to_prepare_guarded_environment:{}", err),
+                            });
+                            restart_after_teardown = true;
                         }
                     }
                 }
-                BranchIsolationMode::NamespaceGuarded => {
-                    let mut handles = Vec::with_capacity(runs.len());
-                    for (branch_id, exec_id, executable_branch, target) in runs {
-                        let scheduler = scheduler.clone();
-                        let kernel_mgr = kernel_mgr.clone();
-                        let env_mgr = env_mgr.clone();
-                        let pool = pool.clone();
-                        let execution_queue_state = execution_queue_state.clone();
-                        let execution_queue_notify = execution_queue_notify.clone();
-                        let tree_runtime_states = tree_runtime_states.clone();
-                        let tid = tid.clone();
-                        let event_tx = event_tx.clone();
-                        let working_dir_for_task = working_dir_for_task.clone();
-                        handles.push(tokio::spawn(async move {
-                            let can_run = match Self::wait_for_execution_slot_with(
-                                &pool,
-                                &execution_queue_state,
-                                &execution_queue_notify,
-                                max_concurrent_executions,
-                                &exec_id,
-                            )
-                            .await {
-                                Ok(can_run) => can_run,
-                                Err(err) => {
-                                    error!(tree = %tid, branch = %branch_id, execution = %exec_id, error = %err, "failed while waiting for queued guarded execute-all slot");
-                                    Self::finalize_branch_execution_failure(
-                                        &pool,
-                                        &exec_id,
-                                        &tid,
-                                        &branch_id,
-                                        &target,
-                                    )
-                                    .await;
-                                    return false;
-                                }
+
+                let mut begin_failure_outcome: Option<KernelIsolationOutcome> = None;
+                let mut used_namespace_guard = false;
+                if !restart_after_teardown {
+                    match kernel_mgr
+                        .begin_tree_branch_session(&tid, &session_id)
+                        .await
+                    {
+                        Ok(()) => {
+                            used_namespace_guard = true;
+                        }
+                        Err(err) => {
+                            let failed_outcome = KernelIsolationOutcome {
+                                contaminated: true,
+                                signals: vec!["session_begin_failed".to_string()],
+                                delta: tine_core::NamespaceDelta::default(),
                             };
-                            if !can_run {
-                                return false;
-                            }
-                            let restart_after_teardown = async {
-                                let mut restart_after_teardown = false;
-                                let branch_id_for_isolation = branch_id.clone();
-                                let session_id = exec_id.as_str().to_string();
-                                let _ = event_tx.send(ExecutionEvent::IsolationAttempted {
-                                    tree_id: tid.clone(),
-                                    branch_id: branch_id.clone(),
-                                });
-                                let should_restart = if !kernel_mgr.has_tree_kernel(&tid) {
-                                    let tree_env = TreeEnvironmentDescriptor::new(
-                                        tid.clone(),
-                                        executable_branch.project_id.clone(),
-                                        executable_branch.environment.clone(),
-                                    );
-                                    match env_mgr.ensure_tree_environment(&tree_env).await {
-                                        Ok(venv_dir) => {
-                                            if let Err(err) = kernel_mgr
-                                                .start_tree_kernel(
-                                                    &tid,
-                                                    &venv_dir,
-                                                    &working_dir_for_task,
-                                                )
-                                                .await
-                                            {
-                                                let _ = event_tx.send(
-                                                    ExecutionEvent::FallbackRestartTriggered {
-                                                        tree_id: tid.clone(),
-                                                        branch_id: branch_id.clone(),
-                                                        reason: format!(
-                                                            "failed_to_start_guarded_kernel:{}",
-                                                            err
-                                                        ),
-                                                    },
-                                                );
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        }
-                                        Err(err) => {
-                                            let _ = event_tx.send(
-                                                ExecutionEvent::FallbackRestartTriggered {
-                                                    tree_id: tid.clone(),
-                                                    branch_id: branch_id.clone(),
-                                                    reason: format!(
-                                                        "failed_to_prepare_guarded_environment:{}",
-                                                        err
-                                                    ),
-                                                },
-                                            );
-                                            true
-                                        }
-                                    }
-                                } else {
-                                    false
-                                };
-
-                                let mut used_namespace_guard = false;
-                                if !should_restart {
-                                    match kernel_mgr
-                                        .begin_tree_branch_session(&tid, &session_id)
-                                        .await
-                                    {
-                                        Ok(()) => {
-                                            used_namespace_guard = true;
-                                            tokio::task::yield_now().await;
-                                        }
-                                        Err(err) => {
-                                            let _ = event_tx.send(
-                                                ExecutionEvent::FallbackRestartTriggered {
-                                                    tree_id: tid.clone(),
-                                                    branch_id: branch_id.clone(),
-                                                    reason: format!(
-                                                        "failed_to_begin_branch_session:{}",
-                                                        err
-                                                    ),
-                                                },
-                                            );
-                                            if kernel_mgr.has_tree_kernel(&tid) {
-                                                let _ = kernel_mgr.shutdown_tree(&tid).await;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                Self::run_branch_execution(
-                                    scheduler,
-                                    pool.clone(),
-                                    tid.clone(),
-                                    branch_id.clone(),
-                                    exec_id.clone(),
-                                    executable_branch,
-                                    target,
-                                    HashMap::new(),
-                                    working_dir_for_task,
-                                )
-                                .await;
-
-                                if used_namespace_guard {
-                                    match kernel_mgr.end_tree_branch_session(&tid, &session_id).await {
-                                        Ok(outcome) => {
-                                            let _ = Self::record_isolation_result(
-                                                &pool,
-                                                &tree_runtime_states,
-                                                &tid,
-                                                &branch_id_for_isolation,
-                                                &outcome,
-                                            )
-                                            .await;
-                                            if outcome.contaminated {
-                                                let _ = event_tx.send(
-                                                    ExecutionEvent::ContaminationDetected {
-                                                        tree_id: tid.clone(),
-                                                        branch_id: branch_id_for_isolation.clone(),
-                                                        signals: outcome.signals.clone(),
-                                                    },
-                                                );
-                                                let _ = event_tx.send(
-                                                    ExecutionEvent::FallbackRestartTriggered {
-                                                        tree_id: tid.clone(),
-                                                        branch_id: branch_id_for_isolation.clone(),
-                                                        reason: "contamination_detected".to_string(),
-                                                    },
-                                                );
-                                                restart_after_teardown = true;
-                                            } else {
-                                                let _ = event_tx.send(ExecutionEvent::IsolationSucceeded {
-                                                    tree_id: tid.clone(),
-                                                    branch_id: branch_id_for_isolation.clone(),
-                                                    delta: outcome.delta.clone(),
-                                                });
-                                            }
-                                        }
-                                        Err(err) => {
-                                            let failed_outcome = KernelIsolationOutcome {
-                                                contaminated: true,
-                                                signals: vec!["session_end_failed".to_string()],
-                                                delta: tine_core::NamespaceDelta::default(),
-                                            };
-                                            let _ = Self::record_isolation_result(
-                                                &pool,
-                                                &tree_runtime_states,
-                                                &tid,
-                                                &branch_id_for_isolation,
-                                                &failed_outcome,
-                                            )
-                                            .await;
-                                            let _ = event_tx.send(
-                                                ExecutionEvent::FallbackRestartTriggered {
-                                                    tree_id: tid.clone(),
-                                                    branch_id: branch_id_for_isolation.clone(),
-                                                    reason: format!(
-                                                        "failed_to_end_branch_session:{}",
-                                                        err
-                                                    ),
-                                                },
-                                            );
-                                            restart_after_teardown = true;
-                                        }
-                                    }
-                                }
-
-                                restart_after_teardown
-                            }
-                            .await;
-                            Self::release_execution_slot_with(
-                                &execution_queue_state,
-                                &execution_queue_notify,
-                                &exec_id,
+                            begin_failure_outcome = Some(failed_outcome.clone());
+                            let _ = Self::record_isolation_result(
+                                &pool,
+                                &tree_runtime_states,
+                                &tid,
+                                &branch_id_for_isolation,
+                                &failed_outcome,
                             )
                             .await;
-                            restart_after_teardown
-                        }));
-                    }
-                    let mut restart_tree_after_guarded_run = false;
-                    for handle in handles {
-                        if let Ok(restart_requested) = handle.await {
-                            restart_tree_after_guarded_run |= restart_requested;
+                            let _ = event_tx.send(ExecutionEvent::FallbackRestartTriggered {
+                                execution_id: exec_id.clone(),
+                                tree_id: tid.clone(),
+                                branch_id: branch_id.clone(),
+                                reason: format!("failed_to_begin_branch_session:{}", err),
+                            });
+                            restart_after_teardown = true;
+                            if kernel_mgr.has_tree_kernel(&tid) {
+                                let _ = kernel_mgr.shutdown_tree(&tid).await;
+                            }
                         }
                     }
-                    if restart_tree_after_guarded_run && kernel_mgr.has_tree_kernel(&tid) {
-                        let _ = kernel_mgr.shutdown_tree(&tid).await;
+                }
+
+                let succeeded = Self::run_branch_execution(
+                    scheduler.clone(),
+                    pool.clone(),
+                    tid.clone(),
+                    branch_id.clone(),
+                    exec_id.clone(),
+                    executable_branch,
+                    target.clone(),
+                    HashMap::new(),
+                    working_dir_for_task.clone(),
+                )
+                .await;
+
+                if let Some(outcome) = begin_failure_outcome.as_ref() {
+                    let _ = Self::record_isolation_result(
+                        &pool,
+                        &tree_runtime_states,
+                        &tid,
+                        &branch_id_for_isolation,
+                        outcome,
+                    )
+                    .await;
+                }
+
+                if used_namespace_guard {
+                    match kernel_mgr.end_tree_branch_session(&tid, &session_id).await {
+                        Ok(outcome) => {
+                            let _ = Self::record_isolation_result(
+                                &pool,
+                                &tree_runtime_states,
+                                &tid,
+                                &branch_id_for_isolation,
+                                &outcome,
+                            )
+                            .await;
+                            if outcome.contaminated {
+                                let _ = event_tx.send(ExecutionEvent::ContaminationDetected {
+                                    execution_id: exec_id.clone(),
+                                    tree_id: tid.clone(),
+                                    branch_id: branch_id_for_isolation.clone(),
+                                    signals: outcome.signals.clone(),
+                                });
+                                let _ = event_tx.send(ExecutionEvent::FallbackRestartTriggered {
+                                    execution_id: exec_id.clone(),
+                                    tree_id: tid.clone(),
+                                    branch_id: branch_id_for_isolation.clone(),
+                                    reason: "contamination_detected".to_string(),
+                                });
+                                restart_after_teardown = true;
+                            } else {
+                                let _ = event_tx.send(ExecutionEvent::IsolationSucceeded {
+                                    execution_id: exec_id.clone(),
+                                    tree_id: tid.clone(),
+                                    branch_id: branch_id_for_isolation.clone(),
+                                    delta: outcome.delta.clone(),
+                                });
+                            }
+                        }
+                        Err(err) => {
+                            let failed_outcome = KernelIsolationOutcome {
+                                contaminated: true,
+                                signals: vec!["session_end_failed".to_string()],
+                                delta: tine_core::NamespaceDelta::default(),
+                            };
+                            let _ = Self::record_isolation_result(
+                                &pool,
+                                &tree_runtime_states,
+                                &tid,
+                                &branch_id_for_isolation,
+                                &failed_outcome,
+                            )
+                            .await;
+                            let _ = event_tx.send(ExecutionEvent::FallbackRestartTriggered {
+                                execution_id: exec_id.clone(),
+                                tree_id: tid.clone(),
+                                branch_id: branch_id_for_isolation.clone(),
+                                reason: format!("failed_to_end_branch_session:{}", err),
+                            });
+                            restart_after_teardown = true;
+                        }
                     }
+                }
+
+                Self::release_execution_slot_with(
+                    &execution_queue_state,
+                    &execution_queue_notify,
+                    &exec_id,
+                )
+                .await;
+
+                if restart_after_teardown && kernel_mgr.has_tree_kernel(&tid) {
+                    let _ = kernel_mgr.shutdown_tree(&tid).await;
+                }
+
+                if !succeeded {
+                    warn!(tree = %tid, branch = %branch_id, execution = %exec_id, "stopping execute-all after first branch failure");
+                    for (remaining_branch_id, remaining_exec_id, _, remaining_target) in runs_iter {
+                        let _ = Self::dequeue_execution_with(
+                            &pool,
+                            &execution_queue_state,
+                            &execution_queue_notify,
+                            &remaining_exec_id,
+                        )
+                        .await;
+                        warn!(tree = %tid, branch = %remaining_branch_id, execution = %remaining_exec_id, "marking remaining run-all branch as failed after earlier branch failure");
+                        Self::finalize_branch_execution_failure(
+                            &pool,
+                            &remaining_exec_id,
+                            &tid,
+                            &remaining_branch_id,
+                            &remaining_target,
+                        )
+                        .await;
+                    }
+                    break;
                 }
             }
         });
@@ -3481,8 +3970,7 @@ impl Workspace {
             }
         }
         let mut replay_timer = OutcomeTimer::start(METRIC_PREPARE_CONTEXT_REPLAY);
-        metrics::histogram!(METRIC_PREPARE_CONTEXT_REPLAY_CELLS)
-            .record(replay_prefix.len() as f64);
+        metrics::histogram!(METRIC_PREPARE_CONTEXT_REPLAY_CELLS).record(replay_prefix.len() as f64);
         for replay_cell_id in &replay_prefix {
             self.execute_tree_cell_for_target(&tree, branch_id, replay_cell_id)
                 .await?;
@@ -3696,7 +4184,11 @@ impl Workspace {
         // Open/create SQLite database
         let db_path = tine_dir.join("tine.db");
         let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
-        let pool = SqlitePool::connect(&db_url)
+        let connect_options = SqliteConnectOptions::from_str(&db_url)
+            .map_err(|e| TineError::Database(e.to_string()))?
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePool::connect_with(connect_options)
             .await
             .map_err(|e| TineError::Database(e.to_string()))?;
 
@@ -3781,8 +4273,21 @@ impl Workspace {
         let tree_runtime_states = Self::hydrate_tree_runtime_states(&pool).await?;
         let tree_runtime_states = Arc::new(RwLock::new(tree_runtime_states));
         let event_tx = scheduler.event_sender();
-        let execution_event_bridge_handle =
-            Self::spawn_execution_event_bridge(pool.clone(), scheduler.subscribe());
+        let streaming_log_buffer: Arc<StreamingLogBuffer> = Arc::new(DashMap::new());
+        let execution_persist_locks: Arc<ExecutionLockRegistry> = Arc::new(DashMap::new());
+        let bridge_shutdown_signal: Arc<Notify> = Arc::new(Notify::new());
+        let execution_event_bridge_handle = Self::spawn_execution_event_bridge(
+            pool.clone(),
+            streaming_log_buffer.clone(),
+            execution_persist_locks.clone(),
+            scheduler.subscribe(),
+            bridge_shutdown_signal.clone(),
+        );
+        let streaming_log_flush_handle = Self::spawn_streaming_log_flush_task(
+            pool.clone(),
+            streaming_log_buffer.clone(),
+            execution_persist_locks.clone(),
+        );
         let kernel_lifecycle_handle = Self::spawn_kernel_lifecycle_bridge(
             pool.clone(),
             tree_runtime_states.clone(),
@@ -3800,11 +4305,17 @@ impl Workspace {
             tree_runtime_states,
             execution_queue_state: Arc::new(Mutex::new(ExecutionQueueState::default())),
             execution_queue_notify: Arc::new(Notify::new()),
+            streaming_log_buffer,
+            execution_persist_locks,
+            bridge_shutdown_signal,
             max_concurrent_executions,
             max_queue_depth,
             kernel_monitor_handle,
             kernel_lifecycle_handle,
-            execution_event_bridge_handle,
+            execution_event_bridge_handle: std::sync::Mutex::new(Some(
+                execution_event_bridge_handle,
+            )),
+            streaming_log_flush_handle,
         })
     }
 
@@ -3823,13 +4334,58 @@ impl Workspace {
         &self.workspace_root
     }
 
-    /// Graceful shutdown: persist state, stop kernels.
+    /// Graceful shutdown: stop accepting work, cancel queued and
+    /// running executions through the tree shutdown path, persist
+    /// terminal state/logs, then stop kernels.
     pub async fn shutdown(&self) -> TineResult<()> {
         info!("shutting down workspace");
+
+        // Stop background producers first while keeping the execution
+        // bridge alive so any late terminal events emitted during kernel
+        // teardown still flow into the DB / streaming buffer.
         self.kernel_monitor_handle.abort();
-        self.kernel_lifecycle_handle.abort();
-        self.execution_event_bridge_handle.abort();
+
+        let tree_ids = self.collect_workspace_shutdown_tree_ids().await?;
+        for tree_id in tree_ids {
+            self.shutdown_tree_kernel(&tree_id).await?;
+        }
+
         self.kernel_mgr.shutdown_all().await?;
+
+        // Now that producers are quiesced, ask the bridge to drain the
+        // receiver and exit. This preserves events that were emitted
+        // during `shutdown_all()`.
+        self.bridge_shutdown_signal.notify_waiters();
+        let bridge_handle = self
+            .execution_event_bridge_handle
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some(handle) = bridge_handle {
+            // Bound how long we wait so a wedged bridge can't hang
+            // shutdown forever; 10s is generous given the broadcast
+            // channel's bounded capacity (1024).
+            match tokio::time::timeout(Duration::from_secs(10), handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => warn!(error = %err, "execution event bridge join error"),
+                Err(_) => warn!("execution event bridge drain exceeded 10s during shutdown"),
+            }
+        }
+
+        // Persist anything the bridge buffered while teardown was in
+        // progress before the flush task is aborted.
+        if let Err(err) = Self::flush_streaming_log_buffer_locked(
+            &self.pool,
+            &self.streaming_log_buffer,
+            Some(&self.execution_persist_locks),
+        )
+        .await
+        {
+            warn!(error = %err, "failed to flush streaming log buffer during shutdown");
+        }
+
+        self.kernel_lifecycle_handle.abort();
+        self.streaming_log_flush_handle.abort();
         self.pool.close().await;
         Ok(())
     }
@@ -4198,8 +4754,7 @@ impl WorkspaceApi for Workspace {
         branch_id: &BranchId,
         cell_id: &CellId,
     ) -> TineResult<()> {
-        Workspace::delete_cell_from_experiment_tree_branch(self, tree_id, branch_id, cell_id)
-            .await
+        Workspace::delete_cell_from_experiment_tree_branch(self, tree_id, branch_id, cell_id).await
     }
 
     async fn delete_experiment_tree_branch(
@@ -4210,10 +4765,7 @@ impl WorkspaceApi for Workspace {
         Workspace::delete_experiment_tree_branch(self, tree_id, branch_id).await
     }
 
-    async fn get_tree_runtime_state(
-        &self,
-        tree_id: &ExperimentTreeId,
-    ) -> Option<TreeRuntimeState> {
+    async fn get_tree_runtime_state(&self, tree_id: &ExperimentTreeId) -> Option<TreeRuntimeState> {
         Workspace::get_tree_runtime_state(self, tree_id).await
     }
 
@@ -4306,12 +4858,9 @@ impl WorkspaceApi for Workspace {
             if let Err(err) = Self::await_cancellation_settle(&pool, &execution_id).await {
                 warn!(execution = %execution_id, error = %err, "failed while waiting for cancelled execution to settle");
             }
-            if let Err(err) = Self::finalize_cancelled_execution(
-                &pool,
-                &execution_id,
-                cancellation_requested_at,
-            )
-            .await
+            if let Err(err) =
+                Self::finalize_cancelled_execution(&pool, &execution_id, cancellation_requested_at)
+                    .await
             {
                 warn!(execution = %execution_id, error = %err, "failed to finalize cancelled execution after interrupt");
             }
@@ -4341,8 +4890,12 @@ impl WorkspaceApi for Workspace {
         branch_id: &BranchId,
         cell_id: &CellId,
     ) -> TineResult<NodeLogs> {
-        let rows: Vec<(Option<String>,)> = sqlx::query_as(
-            "SELECT node_logs FROM executions \
+        // Look up the most recent execution row for (tree, branch) and pull
+        // its persisted logs. We then fold any unpersisted streaming chunks
+        // for that execution out of the in-memory buffer so the response
+        // reflects the latest live state.
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, node_logs FROM executions \
              WHERE tree_id = ? AND branch_id = ? AND target_kind = 'experiment_tree_branch' \
              ORDER BY rowid DESC LIMIT 50",
         )
@@ -4352,43 +4905,70 @@ impl WorkspaceApi for Workspace {
         .await
         .map_err(|e| TineError::Database(e.to_string()))?;
 
-        for (maybe_logs_json,) in &rows {
+        for (execution_id, maybe_logs_json) in &rows {
             if let Some(logs_json) = maybe_logs_json {
                 let all_logs: HashMap<String, NodeLogs> =
                     serde_json::from_str(logs_json).unwrap_or_default();
                 if let Some(logs) = all_logs.get(cell_id.as_str()) {
-                    return Ok(logs.clone());
+                    let mut merged = logs.clone();
+                    Self::overlay_streaming_buffer(
+                        &self.streaming_log_buffer,
+                        &ExecutionId::new(execution_id),
+                        &NodeId::new(cell_id.as_str()),
+                        &mut merged,
+                    );
+                    return Ok(merged);
                 }
+            }
+            // Even if persisted node_logs lacks this cell yet, any in-flight
+            // streaming chunks may still exist for it.
+            let mut empty = NodeLogs::default();
+            if Self::overlay_streaming_buffer(
+                &self.streaming_log_buffer,
+                &ExecutionId::new(execution_id),
+                &NodeId::new(cell_id.as_str()),
+                &mut empty,
+            ) {
+                return Ok(empty);
             }
         }
 
         // Fallback: search any execution for this tree by cell id
-        let fallback_rows: Vec<(Option<String>,)> = sqlx::query_as(
-            "SELECT node_logs FROM executions WHERE tree_id = ? ORDER BY rowid DESC LIMIT 50",
+        let fallback_rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, node_logs FROM executions WHERE tree_id = ? ORDER BY rowid DESC LIMIT 50",
         )
         .bind(tree_id.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| TineError::Database(e.to_string()))?;
 
-        for (maybe_logs_json,) in fallback_rows {
+        for (execution_id, maybe_logs_json) in fallback_rows {
             if let Some(logs_json) = maybe_logs_json {
                 let all_logs: HashMap<String, NodeLogs> =
                     serde_json::from_str(&logs_json).unwrap_or_default();
                 if let Some(logs) = all_logs.get(cell_id.as_str()) {
-                    return Ok(logs.clone());
+                    let mut merged = logs.clone();
+                    Self::overlay_streaming_buffer(
+                        &self.streaming_log_buffer,
+                        &ExecutionId::new(&execution_id),
+                        &NodeId::new(cell_id.as_str()),
+                        &mut merged,
+                    );
+                    return Ok(merged);
                 }
+            }
+            let mut empty = NodeLogs::default();
+            if Self::overlay_streaming_buffer(
+                &self.streaming_log_buffer,
+                &ExecutionId::new(&execution_id),
+                &NodeId::new(cell_id.as_str()),
+                &mut empty,
+            ) {
+                return Ok(empty);
             }
         }
 
-        Ok(NodeLogs {
-            stdout: String::new(),
-            stderr: String::new(),
-            outputs: Vec::new(),
-            error: None,
-            duration_ms: None,
-            metrics: HashMap::new(),
-        })
+        Ok(NodeLogs::default())
     }
 
     // -- Projects --
@@ -4842,7 +5422,10 @@ mod tests {
         assert_eq!(tree.cells[0].code.language, "python");
         assert!(tree.cells[0].code.source.is_empty());
 
-        workspace.shutdown().await.expect("failed to shut down workspace");
+        workspace
+            .shutdown()
+            .await
+            .expect("failed to shut down workspace");
     }
 
     #[tokio::test]
@@ -4928,6 +5511,877 @@ mod tests {
             .expect_err("expected queue backpressure");
         assert!(matches!(err, TineError::BudgetExceeded(_)));
 
-        workspace.shutdown().await.expect("failed to shut down workspace");
+        workspace
+            .shutdown()
+            .await
+            .expect("failed to shut down workspace");
+    }
+
+    /// Replicates the server-side root cause of MCP "failed to tool call"
+    /// cascades during long-running cells: every NodeStream event reads,
+    /// deserializes, mutates, serializes, and writes the entire node_logs
+    /// blob. As the log grows, per-event work scales with total log size,
+    /// producing O(N²) total work for N stream chunks. While the executor
+    /// is hammering this update path, status reads compete for the same
+    /// SQLite write lock and the same connection pool, slowing every poll.
+    ///
+    /// This test drives 200 NodeStream events of ~1 KiB each through the
+    /// real `persist_execution_event_snapshot` path and asserts the *total*
+    /// time stays bounded. Without the fix the test takes >10 s; with a
+    /// linear-time persistence path it should complete in well under 5 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persist_execution_event_snapshot_streaming_does_not_scale_quadratically() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store: Arc<dyn ArtifactStore> = Arc::new(NoopArtifactStore);
+        let workspace = Workspace::open(tmp.path().to_path_buf(), store, 1)
+            .await
+            .expect("failed to open workspace");
+
+        let tree_id = ExperimentTreeId::new("tree-stream");
+        let branch_id = BranchId::new("main");
+        let cell_id = CellId::new("cell_stream");
+        let execution_id = ExecutionId::new("exec-stream");
+        let target = Workspace::execution_target_for_tree_branch(&tree_id, &branch_id);
+
+        Workspace::insert_branch_execution_record(
+            &workspace.pool,
+            &execution_id,
+            &tree_id,
+            &branch_id,
+            &target,
+            &[cell_id.clone()],
+        )
+        .await
+        .expect("failed to insert execution record");
+
+        // Mark the execution as running so persist_execution_event_snapshot
+        // doesn't short-circuit on finished_at.
+        let started_event = ExecutionEvent::ExecutionStarted {
+            execution_id: execution_id.clone(),
+            tree_id: Some(tree_id.clone()),
+            branch_id: Some(branch_id.clone()),
+            target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+            target: Some(target.clone()),
+        };
+        Workspace::persist_execution_event_snapshot(
+            &workspace.pool,
+            &workspace.streaming_log_buffer,
+            &started_event,
+        )
+        .await
+        .expect("failed to persist started event");
+        let node_started_event = ExecutionEvent::NodeStarted {
+            execution_id: execution_id.clone(),
+            node_id: NodeId::new(cell_id.as_str()),
+            tree_id: Some(tree_id.clone()),
+            branch_id: Some(branch_id.clone()),
+            target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+            target: Some(target.clone()),
+        };
+        Workspace::persist_execution_event_snapshot(
+            &workspace.pool,
+            &workspace.streaming_log_buffer,
+            &node_started_event,
+        )
+        .await
+        .expect("failed to persist node started event");
+
+        // 2000 chunks × 4 KiB ≈ 8 MiB cumulative log. Calibrated against
+        // observed real workloads: a multi-fold LightGBM training run prints
+        // ~4 KiB per boosting round and a 2-3 minute fit easily produces
+        // thousands of rounds of output. Each NodeStream event under the
+        // current implementation reads the full accumulated logs blob,
+        // mutates it in memory, serializes it, and writes the whole thing
+        // back, which is O(N²) total work for N chunks.
+        const STREAM_CHUNKS: usize = 2000;
+        const CHUNK_BYTES: usize = 4096;
+        let chunk_payload = "x".repeat(CHUNK_BYTES);
+
+        let start = std::time::Instant::now();
+        for _ in 0..STREAM_CHUNKS {
+            let event = ExecutionEvent::NodeStream {
+                execution_id: execution_id.clone(),
+                node_id: NodeId::new(cell_id.as_str()),
+                tree_id: Some(tree_id.clone()),
+                branch_id: Some(branch_id.clone()),
+                target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+                target: Some(target.clone()),
+                stream: "stdout".to_string(),
+                text: chunk_payload.clone(),
+            };
+            Workspace::persist_execution_event_snapshot(
+                &workspace.pool,
+                &workspace.streaming_log_buffer,
+                &event,
+            )
+            .await
+            .expect("failed to persist stream event");
+        }
+        let total = start.elapsed();
+        eprintln!(
+            "persist_execution_event_snapshot streamed {STREAM_CHUNKS} chunks in {:.2}s ({:.2}ms/chunk)",
+            total.as_secs_f64(),
+            total.as_secs_f64() * 1000.0 / STREAM_CHUNKS as f64,
+        );
+
+        // Hard upper bound. On the current quadratic implementation this
+        // typically blows past 10s on commodity hardware. The fix should
+        // bring it well under 5s.
+        assert!(
+            total < std::time::Duration::from_secs(5),
+            "stream-event persistence is too slow: {STREAM_CHUNKS} chunks took {:.2}s; \
+             expected linear-time persistence to finish well under 5s",
+            total.as_secs_f64(),
+        );
+
+        // Bonus assertion: while the bridge is hammering writes, a status()
+        // read should still complete promptly. Run one final status query
+        // and assert it lands within 250ms — this is the symptom most
+        // visible to MCP clients.
+        let status_start = std::time::Instant::now();
+        let _status = workspace
+            .status(&execution_id)
+            .await
+            .expect("status failed");
+        let status_elapsed = status_start.elapsed();
+        eprintln!(
+            "status() after streaming: {:.2}ms",
+            status_elapsed.as_secs_f64() * 1000.0,
+        );
+        assert!(
+            status_elapsed < std::time::Duration::from_millis(250),
+            "status() after streaming took {:.2}ms — should be fast even under streaming load",
+            status_elapsed.as_secs_f64() * 1000.0,
+        );
+
+        workspace
+            .shutdown()
+            .await
+            .expect("failed to shut down workspace");
+    }
+
+    /// Regression for the durability concern raised against the streaming
+    /// buffer: chunks held only in memory must not be lost on a graceful
+    /// `Workspace::shutdown()`. We simulate streaming output without ever
+    /// emitting a non-stream event (worst case for the previous design),
+    /// shut down, reopen the workspace pointing at the same on-disk SQLite
+    /// file, and assert the persisted node_logs blob contains the chunk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_buffer_chunks_persist_across_workspace_shutdown_and_reopen() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store: Arc<dyn ArtifactStore> = Arc::new(NoopArtifactStore);
+        let workspace = Workspace::open(tmp.path().to_path_buf(), store.clone(), 1)
+            .await
+            .expect("failed to open workspace");
+
+        let tree_id = ExperimentTreeId::new("tree-shutdown-flush");
+        let branch_id = BranchId::new("main");
+        let cell_id = CellId::new("cell_only");
+        let execution_id = ExecutionId::new("exec-shutdown-flush");
+        let target = Workspace::execution_target_for_tree_branch(&tree_id, &branch_id);
+
+        Workspace::insert_branch_execution_record(
+            &workspace.pool,
+            &execution_id,
+            &tree_id,
+            &branch_id,
+            &target,
+            &[cell_id.clone()],
+        )
+        .await
+        .expect("failed to insert execution record");
+
+        // Move the execution into Running so the persist path doesn't
+        // short-circuit on finished_at.
+        let started_event = ExecutionEvent::ExecutionStarted {
+            execution_id: execution_id.clone(),
+            tree_id: Some(tree_id.clone()),
+            branch_id: Some(branch_id.clone()),
+            target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+            target: Some(target.clone()),
+        };
+        Workspace::persist_execution_event_snapshot(
+            &workspace.pool,
+            &workspace.streaming_log_buffer,
+            &started_event,
+        )
+        .await
+        .expect("failed to persist started event");
+        let node_started_event = ExecutionEvent::NodeStarted {
+            execution_id: execution_id.clone(),
+            node_id: NodeId::new(cell_id.as_str()),
+            tree_id: Some(tree_id.clone()),
+            branch_id: Some(branch_id.clone()),
+            target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+            target: Some(target.clone()),
+        };
+        Workspace::persist_execution_event_snapshot(
+            &workspace.pool,
+            &workspace.streaming_log_buffer,
+            &node_started_event,
+        )
+        .await
+        .expect("failed to persist node started event");
+
+        // Drive a stream chunk into the buffer ONLY. No subsequent non-stream
+        // event arrives before shutdown — this is the worst case for the
+        // in-memory buffer.
+        const SENTINEL: &str = "STREAMED_CHUNK_THAT_MUST_SURVIVE_SHUTDOWN";
+        let stream_event = ExecutionEvent::NodeStream {
+            execution_id: execution_id.clone(),
+            node_id: NodeId::new(cell_id.as_str()),
+            tree_id: Some(tree_id.clone()),
+            branch_id: Some(branch_id.clone()),
+            target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+            target: Some(target.clone()),
+            stream: "stdout".to_string(),
+            text: SENTINEL.to_string(),
+        };
+        Workspace::persist_execution_event_snapshot(
+            &workspace.pool,
+            &workspace.streaming_log_buffer,
+            &stream_event,
+        )
+        .await
+        .expect("failed to buffer stream event");
+
+        // Graceful shutdown — must drain the streaming buffer before the
+        // bridge task is aborted, otherwise the chunk is lost.
+        workspace
+            .shutdown()
+            .await
+            .expect("failed to shut down workspace");
+
+        // Re-open the same on-disk workspace. The persisted node_logs blob
+        // for this execution must include the streamed sentinel.
+        let reopened = Workspace::open(tmp.path().to_path_buf(), store, 1)
+            .await
+            .expect("failed to reopen workspace");
+
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT node_logs FROM executions WHERE id = ?")
+                .bind(execution_id.as_str())
+                .fetch_optional(&reopened.pool)
+                .await
+                .expect("failed to read execution row");
+
+        let logs_json = row
+            .expect("execution row missing after reopen")
+            .0
+            .expect("node_logs column should be populated after shutdown drain");
+
+        assert!(
+            logs_json.contains(SENTINEL),
+            "streamed chunk was lost across shutdown — node_logs after reopen: {logs_json}"
+        );
+
+        reopened
+            .shutdown()
+            .await
+            .expect("failed to shut down reopened workspace");
+    }
+
+    /// Regression test for the persist/flush race: the periodic flush task
+    /// and a non-stream event (e.g. NodeCompleted) both do
+    /// read-modify-write on `executions.node_logs`. Without coordination,
+    /// the slower writer can clobber the faster writer's update — losing
+    /// either the streamed chunks or the terminal-event metadata.
+    /// We force the race deterministically by running both ops concurrently
+    /// over many iterations and asserting both contributions survive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_and_persist_must_not_lose_data_under_concurrent_access() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store: Arc<dyn ArtifactStore> = Arc::new(NoopArtifactStore);
+        let workspace = Workspace::open(tmp.path().to_path_buf(), store, 1)
+            .await
+            .expect("failed to open workspace");
+
+        let tree_id = ExperimentTreeId::new("tree-race");
+        let branch_id = BranchId::new("main");
+        let cell_id = CellId::new("cell_race");
+        let target = Workspace::execution_target_for_tree_branch(&tree_id, &branch_id);
+
+        // Run the race many iterations to catch interleavings reliably.
+        const ITERATIONS: usize = 30;
+        for iteration in 0..ITERATIONS {
+            let execution_id = ExecutionId::new(format!("exec-race-{iteration}"));
+            Workspace::insert_branch_execution_record(
+                &workspace.pool,
+                &execution_id,
+                &tree_id,
+                &branch_id,
+                &target,
+                &[cell_id.clone()],
+            )
+            .await
+            .expect("failed to insert execution record");
+
+            // Bring the execution into Running so persist doesn't short-circuit.
+            Workspace::persist_execution_event_snapshot(
+                &workspace.pool,
+                &workspace.streaming_log_buffer,
+                &ExecutionEvent::ExecutionStarted {
+                    execution_id: execution_id.clone(),
+                    tree_id: Some(tree_id.clone()),
+                    branch_id: Some(branch_id.clone()),
+                    target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+                    target: Some(target.clone()),
+                },
+            )
+            .await
+            .unwrap();
+            Workspace::persist_execution_event_snapshot(
+                &workspace.pool,
+                &workspace.streaming_log_buffer,
+                &ExecutionEvent::NodeStarted {
+                    execution_id: execution_id.clone(),
+                    node_id: NodeId::new(cell_id.as_str()),
+                    tree_id: Some(tree_id.clone()),
+                    branch_id: Some(branch_id.clone()),
+                    target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+                    target: Some(target.clone()),
+                },
+            )
+            .await
+            .unwrap();
+
+            // Pre-buffer some streamed chunks the flush should drain.
+            let sentinel = format!("STREAMED_CHUNK_{iteration}");
+            Workspace::persist_execution_event_snapshot(
+                &workspace.pool,
+                &workspace.streaming_log_buffer,
+                &ExecutionEvent::NodeStream {
+                    execution_id: execution_id.clone(),
+                    node_id: NodeId::new(cell_id.as_str()),
+                    tree_id: Some(tree_id.clone()),
+                    branch_id: Some(branch_id.clone()),
+                    target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+                    target: Some(target.clone()),
+                    stream: "stdout".to_string(),
+                    text: sentinel.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+            // Race: NodeCompleted (sets duration_ms = 42) AND a periodic flush
+            // happen concurrently against the same execution row.
+            let pool = workspace.pool.clone();
+            let buf = workspace.streaming_log_buffer.clone();
+            let exec_a = execution_id.clone();
+            let target_a = target.clone();
+            let tree_a = tree_id.clone();
+            let branch_a = branch_id.clone();
+            let cell_a = cell_id.clone();
+            let pool_b = workspace.pool.clone();
+            let buf_b = workspace.streaming_log_buffer.clone();
+            let exec_b = execution_id.clone();
+            let locks_a = workspace.execution_persist_locks.clone();
+            let locks_b = workspace.execution_persist_locks.clone();
+            let (a, b) = tokio::join!(
+                async move {
+                    Workspace::persist_execution_event_snapshot_locked(
+                        &pool,
+                        &buf,
+                        Some(&locks_a),
+                        &ExecutionEvent::NodeCompleted {
+                            execution_id: exec_a,
+                            node_id: NodeId::new(cell_a.as_str()),
+                            tree_id: Some(tree_a),
+                            branch_id: Some(branch_a),
+                            target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+                            target: Some(target_a),
+                            artifacts: HashMap::new(),
+                            duration_ms: 42,
+                        },
+                    )
+                    .await
+                },
+                async move {
+                    Workspace::flush_streaming_buffer_for_execution_locked(
+                        &pool_b,
+                        &buf_b,
+                        Some(&locks_b),
+                        &exec_b,
+                    )
+                    .await
+                },
+            );
+            a.expect("persist failed");
+            b.expect("flush failed");
+
+            // Final invariant: the persisted node_logs row must contain BOTH
+            // the streamed sentinel AND the duration_ms set by NodeCompleted.
+            let row: Option<(Option<String>,)> =
+                sqlx::query_as("SELECT node_logs FROM executions WHERE id = ?")
+                    .bind(execution_id.as_str())
+                    .fetch_optional(&workspace.pool)
+                    .await
+                    .expect("failed to read execution row");
+            let logs_json = row
+                .expect("execution row missing")
+                .0
+                .expect("node_logs should be populated");
+            let parsed: HashMap<NodeId, NodeLogs> =
+                serde_json::from_str(&logs_json).expect("logs json parse");
+            let node_logs = parsed
+                .get(&NodeId::new(cell_id.as_str()))
+                .expect("node logs entry");
+            assert!(
+                node_logs.stdout.contains(&sentinel),
+                "iteration {iteration}: streamed chunk lost. node_logs.stdout = {:?}",
+                node_logs.stdout,
+            );
+            assert_eq!(
+                node_logs.duration_ms,
+                Some(42),
+                "iteration {iteration}: duration_ms from NodeCompleted lost. node_logs = {:?}",
+                node_logs,
+            );
+        }
+
+        workspace
+            .shutdown()
+            .await
+            .expect("failed to shut down workspace");
+    }
+
+    /// Regression for the broadcast-queue drain concern: events sit in the
+    /// bridge's `broadcast::Receiver` queue waiting to be processed. If
+    /// `shutdown()` aborts the bridge task before draining that queue,
+    /// any non-yet-processed events are silently lost — including
+    /// terminal events like `NodeCompleted` that mutate persisted state.
+    ///
+    /// We send a burst of events directly into the broadcast channel (so
+    /// the bridge has them queued but unprocessed), call `shutdown()`,
+    /// reopen the workspace at the same path, and assert the final row
+    /// reflects all the events.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_drains_pending_bridge_events_before_aborting() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store: Arc<dyn ArtifactStore> = Arc::new(NoopArtifactStore);
+        let workspace = Workspace::open(tmp.path().to_path_buf(), store.clone(), 1)
+            .await
+            .expect("failed to open workspace");
+
+        let tree_id = ExperimentTreeId::new("tree-shutdown-drain");
+        let branch_id = BranchId::new("main");
+        let cell_id = CellId::new("cell_drain");
+        let execution_id = ExecutionId::new("exec-shutdown-drain");
+        let target = Workspace::execution_target_for_tree_branch(&tree_id, &branch_id);
+
+        Workspace::insert_branch_execution_record(
+            &workspace.pool,
+            &execution_id,
+            &tree_id,
+            &branch_id,
+            &target,
+            &[cell_id.clone()],
+        )
+        .await
+        .expect("failed to insert execution record");
+
+        let event_tx = workspace.scheduler.event_sender();
+        // Fire a burst of stream events through the broadcast channel so
+        // the bridge has work queued. Then immediately follow with a
+        // terminal NodeCompleted that should set duration_ms = 99. If
+        // shutdown drains the queue, the terminal event lands in the DB.
+        // If it aborts the bridge instead, the NodeCompleted may be lost.
+        const SENTINEL: &str = "DRAIN_TEST_CHUNK";
+        let _ = event_tx.send(ExecutionEvent::ExecutionStarted {
+            execution_id: execution_id.clone(),
+            tree_id: Some(tree_id.clone()),
+            branch_id: Some(branch_id.clone()),
+            target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+            target: Some(target.clone()),
+        });
+        let _ = event_tx.send(ExecutionEvent::NodeStarted {
+            execution_id: execution_id.clone(),
+            node_id: NodeId::new(cell_id.as_str()),
+            tree_id: Some(tree_id.clone()),
+            branch_id: Some(branch_id.clone()),
+            target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+            target: Some(target.clone()),
+        });
+        for _ in 0..40 {
+            let _ = event_tx.send(ExecutionEvent::NodeStream {
+                execution_id: execution_id.clone(),
+                node_id: NodeId::new(cell_id.as_str()),
+                tree_id: Some(tree_id.clone()),
+                branch_id: Some(branch_id.clone()),
+                target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+                target: Some(target.clone()),
+                stream: "stdout".to_string(),
+                text: SENTINEL.to_string(),
+            });
+        }
+        let _ = event_tx.send(ExecutionEvent::NodeCompleted {
+            execution_id: execution_id.clone(),
+            node_id: NodeId::new(cell_id.as_str()),
+            tree_id: Some(tree_id.clone()),
+            branch_id: Some(branch_id.clone()),
+            target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+            target: Some(target.clone()),
+            artifacts: HashMap::new(),
+            duration_ms: 99,
+        });
+
+        // Immediate shutdown — much of the burst is still queued in the
+        // bridge's broadcast::Receiver and has not been persisted yet.
+        workspace
+            .shutdown()
+            .await
+            .expect("failed to shut down workspace");
+
+        // Reopen and assert the terminal event landed (duration_ms was
+        // captured) and all the buffered stream chunks were persisted.
+        let reopened = Workspace::open(tmp.path().to_path_buf(), store, 1)
+            .await
+            .expect("failed to reopen workspace");
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT node_logs FROM executions WHERE id = ?")
+                .bind(execution_id.as_str())
+                .fetch_optional(&reopened.pool)
+                .await
+                .expect("failed to read execution row");
+        let logs_json = row
+            .expect("execution row missing after reopen")
+            .0
+            .expect("node_logs column should be populated after shutdown drain");
+        let parsed: HashMap<NodeId, NodeLogs> =
+            serde_json::from_str(&logs_json).expect("logs json parse");
+        let node_logs = parsed
+            .get(&NodeId::new(cell_id.as_str()))
+            .expect("node logs entry");
+
+        assert!(
+            node_logs.stdout.contains(SENTINEL),
+            "shutdown dropped buffered stream chunks before they could be persisted; \
+             node_logs.stdout = {:?}",
+            node_logs.stdout,
+        );
+        assert_eq!(
+            node_logs.duration_ms,
+            Some(99),
+            "shutdown dropped a queued NodeCompleted event before the bridge \
+             could persist it; node_logs = {:?}",
+            node_logs,
+        );
+
+        reopened
+            .shutdown()
+            .await
+            .expect("failed to shut down reopened workspace");
+    }
+
+    /// Regression for the late-stream-chunk loss path: streamed stdout
+    /// can arrive AFTER a terminal `NodeCompleted` event (e.g. the kernel
+    /// emits one final stdout chunk between the executor sending
+    /// `NodeCompleted` and the iopub stream actually draining). With a
+    /// `WHERE finished_at IS NULL` guard on the flush UPDATE, those
+    /// chunks would be silently dropped — the buffer entry is removed
+    /// after the (no-op) UPDATE and there is no remaining persistence
+    /// path. This is exactly the failure tail of stdout/stderr, which is
+    /// usually the most valuable failure context.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_persists_late_stream_chunks_after_terminal_event() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store: Arc<dyn ArtifactStore> = Arc::new(NoopArtifactStore);
+        let workspace = Workspace::open(tmp.path().to_path_buf(), store, 1)
+            .await
+            .expect("failed to open workspace");
+
+        let tree_id = ExperimentTreeId::new("tree-late-tail");
+        let branch_id = BranchId::new("main");
+        let cell_id = CellId::new("cell_late");
+        let execution_id = ExecutionId::new("exec-late-tail");
+        let target = Workspace::execution_target_for_tree_branch(&tree_id, &branch_id);
+
+        Workspace::insert_branch_execution_record(
+            &workspace.pool,
+            &execution_id,
+            &tree_id,
+            &branch_id,
+            &target,
+            &[cell_id.clone()],
+        )
+        .await
+        .expect("failed to insert execution record");
+
+        let started = ExecutionEvent::ExecutionStarted {
+            execution_id: execution_id.clone(),
+            tree_id: Some(tree_id.clone()),
+            branch_id: Some(branch_id.clone()),
+            target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+            target: Some(target.clone()),
+        };
+        Workspace::persist_execution_event_snapshot_locked(
+            &workspace.pool,
+            &workspace.streaming_log_buffer,
+            Some(&workspace.execution_persist_locks),
+            &started,
+        )
+        .await
+        .unwrap();
+
+        let node_started = ExecutionEvent::NodeStarted {
+            execution_id: execution_id.clone(),
+            node_id: NodeId::new(cell_id.as_str()),
+            tree_id: Some(tree_id.clone()),
+            branch_id: Some(branch_id.clone()),
+            target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+            target: Some(target.clone()),
+        };
+        Workspace::persist_execution_event_snapshot_locked(
+            &workspace.pool,
+            &workspace.streaming_log_buffer,
+            Some(&workspace.execution_persist_locks),
+            &node_started,
+        )
+        .await
+        .unwrap();
+
+        // NodeCompleted finalizes the execution row: with one cell on the
+        // branch, `execution_nodes_finished` returns true and the same
+        // persist call sets `finished_at` and writes the row.
+        let node_completed = ExecutionEvent::NodeCompleted {
+            execution_id: execution_id.clone(),
+            node_id: NodeId::new(cell_id.as_str()),
+            tree_id: Some(tree_id.clone()),
+            branch_id: Some(branch_id.clone()),
+            target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+            target: Some(target.clone()),
+            artifacts: HashMap::new(),
+            duration_ms: 50,
+        };
+        Workspace::persist_execution_event_snapshot_locked(
+            &workspace.pool,
+            &workspace.streaming_log_buffer,
+            Some(&workspace.execution_persist_locks),
+            &node_completed,
+        )
+        .await
+        .unwrap();
+
+        // Sanity: the row is now finished.
+        let finished_row: (String, Option<String>) =
+            sqlx::query_as("SELECT status, node_logs FROM executions WHERE id = ?")
+                .bind(execution_id.as_str())
+                .fetch_one(&workspace.pool)
+                .await
+                .unwrap();
+        let finished_status: ExecutionStatus = serde_json::from_str(&finished_row.0).unwrap();
+        assert!(
+            finished_status.finished_at.is_some(),
+            "test prerequisite: row should be marked finished by NodeCompleted",
+        );
+
+        // Now buffer a late stream chunk that arrived after the terminal
+        // persistence and call the flush. Without the fix the UPDATE's
+        // `WHERE finished_at IS NULL` clause matches 0 rows and the chunk
+        // is silently lost.
+        const SENTINEL: &str = "TAIL_AFTER_TERMINAL";
+        Workspace::buffer_streaming_chunk(
+            &workspace.streaming_log_buffer,
+            &execution_id,
+            &NodeId::new(cell_id.as_str()),
+            "stdout",
+            SENTINEL,
+        );
+        Workspace::flush_streaming_buffer_for_execution_locked(
+            &workspace.pool,
+            &workspace.streaming_log_buffer,
+            Some(&workspace.execution_persist_locks),
+            &execution_id,
+        )
+        .await
+        .expect("late flush failed");
+
+        // Re-read the row and assert the late chunk landed.
+        let after_row: (Option<String>,) =
+            sqlx::query_as("SELECT node_logs FROM executions WHERE id = ?")
+                .bind(execution_id.as_str())
+                .fetch_one(&workspace.pool)
+                .await
+                .unwrap();
+        let logs_json = after_row.0.expect("node_logs missing");
+        let parsed: HashMap<NodeId, NodeLogs> = serde_json::from_str(&logs_json).unwrap();
+        let node_logs = parsed
+            .get(&NodeId::new(cell_id.as_str()))
+            .expect("node logs entry");
+        assert!(
+            node_logs.stdout.contains(SENTINEL),
+            "late stream chunk after terminal event was lost; \
+             node_logs.stdout = {:?}",
+            node_logs.stdout,
+        );
+
+        workspace
+            .shutdown()
+            .await
+            .expect("failed to shut down workspace");
+    }
+
+    /// Regression for the failure-mode log loss: if the periodic flush
+    /// drains the in-memory buffer BEFORE the SQL UPDATE commits, a
+    /// transient DB error (pool closed, lock contention, serialization
+    /// failure) silently discards a full flush window of stdout/stderr.
+    /// We force a write failure by closing the pool, run the flush, and
+    /// assert the buffered chunks remain in memory so the next flush can
+    /// retry persistence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_re_buffers_chunks_when_update_fails() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store: Arc<dyn ArtifactStore> = Arc::new(NoopArtifactStore);
+        let workspace = Workspace::open(tmp.path().to_path_buf(), store, 1)
+            .await
+            .expect("failed to open workspace");
+
+        let execution_id = ExecutionId::new("exec-rebuffer");
+        let node_id = NodeId::new("cell_rebuffer");
+        const SENTINEL: &str = "RE_BUFFER_TAIL_MUST_SURVIVE";
+        Workspace::buffer_streaming_chunk(
+            &workspace.streaming_log_buffer,
+            &execution_id,
+            &node_id,
+            "stdout",
+            SENTINEL,
+        );
+
+        // Force the flush UPDATE to fail by closing the pool first.
+        workspace.pool.close().await;
+
+        let result = Workspace::flush_streaming_buffer_for_execution_locked(
+            &workspace.pool,
+            &workspace.streaming_log_buffer,
+            Some(&workspace.execution_persist_locks),
+            &execution_id,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "expected flush to fail against closed pool, got {:?}",
+            result
+        );
+
+        // The buffered chunks must still be in memory so a subsequent
+        // flush can retry. Without re-buffering, this entry would be
+        // gone (the drain happens before the UPDATE commits).
+        let entry = workspace.streaming_log_buffer.get(&execution_id);
+        assert!(
+            entry.is_some(),
+            "buffer entry was removed after flush failure — chunks are now permanently lost"
+        );
+        let entry = entry.unwrap();
+        let logs = entry
+            .get(&node_id)
+            .expect("node entry missing after re-buffer");
+        assert!(
+            logs.stdout.contains(SENTINEL),
+            "buffered chunks were not re-inserted after flush failure; stdout = {:?}",
+            logs.stdout
+        );
+    }
+
+    /// Regression for the event-driven persistence failure mode: a
+    /// non-stream event drains buffered stdout/stderr before it writes
+    /// the updated execution row. If that final UPDATE fails, the chunks
+    /// must be restored to memory so a later event or periodic flush can
+    /// retry instead of permanently losing the current flush window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persist_re_buffers_stream_chunks_when_update_fails() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store: Arc<dyn ArtifactStore> = Arc::new(NoopArtifactStore);
+        let workspace = Workspace::open(tmp.path().to_path_buf(), store, 1)
+            .await
+            .expect("failed to open workspace");
+
+        let tree_id = ExperimentTreeId::new("tree-persist-rebuffer");
+        let branch_id = BranchId::new("main");
+        let cell_id = CellId::new("cell_persist_rebuffer");
+        let execution_id = ExecutionId::new("exec-persist-rebuffer");
+        let node_id = NodeId::new(cell_id.as_str());
+        let target = Workspace::execution_target_for_tree_branch(&tree_id, &branch_id);
+
+        Workspace::insert_branch_execution_record(
+            &workspace.pool,
+            &execution_id,
+            &tree_id,
+            &branch_id,
+            &target,
+            &[cell_id.clone()],
+        )
+        .await
+        .expect("failed to insert execution record");
+
+        Workspace::persist_execution_event_snapshot_locked(
+            &workspace.pool,
+            &workspace.streaming_log_buffer,
+            Some(&workspace.execution_persist_locks),
+            &ExecutionEvent::ExecutionStarted {
+                execution_id: execution_id.clone(),
+                tree_id: Some(tree_id.clone()),
+                branch_id: Some(branch_id.clone()),
+                target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+                target: Some(target.clone()),
+            },
+        )
+        .await
+        .expect("failed to persist start event");
+
+        const SENTINEL: &str = "PERSIST_REBUFFER_MUST_SURVIVE";
+        Workspace::buffer_streaming_chunk(
+            &workspace.streaming_log_buffer,
+            &execution_id,
+            &node_id,
+            "stdout",
+            SENTINEL,
+        );
+
+        sqlx::query(
+            "CREATE TEMP TRIGGER fail_execution_update \
+             BEFORE UPDATE ON executions \
+             BEGIN SELECT RAISE(ABORT, 'synthetic execution update failure'); END",
+        )
+        .execute(&workspace.pool)
+        .await
+        .expect("failed to install failing trigger");
+
+        let result = Workspace::persist_execution_event_snapshot_locked(
+            &workspace.pool,
+            &workspace.streaming_log_buffer,
+            Some(&workspace.execution_persist_locks),
+            &ExecutionEvent::NodeCompleted {
+                execution_id: execution_id.clone(),
+                node_id: node_id.clone(),
+                tree_id: Some(tree_id),
+                branch_id: Some(branch_id),
+                target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+                target: Some(target),
+                artifacts: HashMap::new(),
+                duration_ms: 7,
+            },
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "expected synthetic update failure, got {:?}",
+            result
+        );
+
+        let entry = workspace.streaming_log_buffer.get(&execution_id);
+        assert!(
+            entry.is_some(),
+            "persist failure removed buffered chunks; they cannot be retried"
+        );
+        let entry = entry.unwrap();
+        let logs = entry
+            .get(&node_id)
+            .expect("node entry missing after persist re-buffer");
+        assert!(
+            logs.stdout.contains(SENTINEL),
+            "persist failure did not re-buffer streamed stdout; stdout = {:?}",
+            logs.stdout
+        );
     }
 }

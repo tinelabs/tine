@@ -22,10 +22,10 @@ use tine_api::FileEntry;
 use tine_api::Workspace;
 use tine_api::{export_branch_as_ipynb, export_branch_as_python};
 use tine_core::{
-    BranchId, BranchTargetInspection, CellDef, CellId, CellRuntimeState, ExecutionId,
-    ExecutionAccepted, ExecutionStatus, ExperimentTreeDef, ExperimentTreeId, NodeCode,
-    NodeLogs, ProjectDef, ProjectId, RevisionId, RuntimeHealthSnapshot, SlotName,
-    TreeRuntimeState, WorkspaceApi,
+    BranchId, BranchTargetInspection, CellDef, CellId, CellRuntimeState, ExecutionAccepted,
+    ExecutionId, ExecutionStatus, ExperimentTreeDef, ExperimentTreeId, NodeCode, NodeLogs,
+    ProjectDef, ProjectId, RevisionId, RuntimeHealthSnapshot, SlotName, TreeRuntimeState,
+    WorkspaceApi,
 };
 use tine_env::{EnvironmentManager, DEFAULT_PYTHON_VERSION};
 
@@ -455,8 +455,7 @@ impl LightweightBranchCellRequest {
 
         if language.trim().is_empty() {
             return Err(AppError(tine_core::TineError::Config(
-                "invalid lightweight first_cell payload: language must not be empty"
-                    .to_string(),
+                "invalid lightweight first_cell payload: language must not be empty".to_string(),
             )));
         }
 
@@ -1009,7 +1008,10 @@ fn local_server_url(addr: SocketAddr) -> String {
     }
 }
 
-fn default_projects_root_for_home(workspace_dir: &std::path::Path, home: Option<&std::path::Path>) -> PathBuf {
+fn default_projects_root_for_home(
+    workspace_dir: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> PathBuf {
     let Some(home) = home else {
         return workspace_dir.join("projects");
     };
@@ -1794,9 +1796,15 @@ mod tests {
 
         assert_eq!(branch_cell.tree_id, tree_id);
         assert_eq!(branch_cell.name, "branch-lightweight");
-        assert_eq!(branch_cell.code.source, "branch_value = 2\nprint(branch_value)\n");
+        assert_eq!(
+            branch_cell.code.source,
+            "branch_value = 2\nprint(branch_value)\n"
+        );
         assert_eq!(branch_cell.code.language, "python");
-        assert_eq!(branch_cell.declared_outputs, vec![SlotName::new("branch_value")]);
+        assert_eq!(
+            branch_cell.declared_outputs,
+            vec![SlotName::new("branch_value")]
+        );
         assert!(!branch_cell.cache);
     }
 
@@ -1883,7 +1891,10 @@ mod tests {
 
         let status = wait_for_finished_status(&app, &execution_id).await;
         assert_eq!(status.tree_id.as_ref(), Some(&tree_id));
-        assert_eq!(status.status, tine_core::ExecutionLifecycleStatus::Completed);
+        assert_eq!(
+            status.status,
+            tine_core::ExecutionLifecycleStatus::Completed
+        );
         assert_eq!(status.phase, tine_core::ExecutionPhase::Completed);
 
         let logs_response = send_json(
@@ -2180,7 +2191,10 @@ mod tests {
         let status = wait_for_finished_status(&app, &execution_id).await;
         assert_eq!(status.tree_id.as_ref(), Some(&tree_id));
         assert_eq!(status.branch_id.as_ref(), Some(&branch_id));
-        assert_eq!(status.status, tine_core::ExecutionLifecycleStatus::Completed);
+        assert_eq!(
+            status.status,
+            tine_core::ExecutionLifecycleStatus::Completed
+        );
         assert_eq!(status.phase, tine_core::ExecutionPhase::Completed);
 
         let persisted_logs = send_json(
@@ -2312,7 +2326,10 @@ mod tests {
         let status = wait_for_finished_status(&app, execution_id).await;
         assert_eq!(status.tree_id.as_ref(), Some(&tree_id));
         assert_eq!(status.branch_id.as_ref(), Some(&branch_id));
-        assert_eq!(status.status, tine_core::ExecutionLifecycleStatus::Completed);
+        assert_eq!(
+            status.status,
+            tine_core::ExecutionLifecycleStatus::Completed
+        );
         assert_eq!(status.phase, tine_core::ExecutionPhase::Completed);
         assert_eq!(
             status
@@ -2496,8 +2513,14 @@ mod tests {
         .await;
         assert_eq!(requested_status.status(), StatusCode::OK);
         let requested_status: tine_core::ExecutionStatus = read_json(requested_status).await;
-        assert_eq!(requested_status.status, tine_core::ExecutionLifecycleStatus::Running);
-        assert_eq!(requested_status.phase, tine_core::ExecutionPhase::CancellationRequested);
+        assert_eq!(
+            requested_status.status,
+            tine_core::ExecutionLifecycleStatus::Running
+        );
+        assert_eq!(
+            requested_status.phase,
+            tine_core::ExecutionPhase::CancellationRequested
+        );
         assert!(requested_status.cancellation_requested_at.is_some());
 
         let cancel_again = send_json(
@@ -2527,7 +2550,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         };
         assert_eq!(status.tree_id.as_ref(), Some(&tree_id));
-        assert_eq!(status.status, tine_core::ExecutionLifecycleStatus::Cancelled);
+        assert_eq!(
+            status.status,
+            tine_core::ExecutionLifecycleStatus::Cancelled
+        );
         assert_eq!(status.phase, tine_core::ExecutionPhase::Cancelled);
         assert!(status.cancellation_requested_at.is_some());
         assert_eq!(
@@ -2635,7 +2661,10 @@ mod tests {
         let execute = send_json(
             &app,
             Method::POST,
-            &format!("/api/experiment-trees/{}/branches/main/execute", tree_id.as_str()),
+            &format!(
+                "/api/experiment-trees/{}/branches/main/execute",
+                tree_id.as_str()
+            ),
             None,
         )
         .await;
@@ -2672,10 +2701,7 @@ mod tests {
         let shutdown = send_json(
             &app,
             Method::POST,
-            &format!(
-                "/api/experiment-trees/{}/shutdown-kernel",
-                tree_id.as_str()
-            ),
+            &format!("/api/experiment-trees/{}/shutdown-kernel", tree_id.as_str()),
             None,
         )
         .await;
@@ -2699,7 +2725,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         };
         assert_eq!(status.tree_id.as_ref(), Some(&tree_id));
-        assert_eq!(status.status, tine_core::ExecutionLifecycleStatus::Cancelled);
+        assert_eq!(
+            status.status,
+            tine_core::ExecutionLifecycleStatus::Cancelled
+        );
         assert_eq!(status.phase, tine_core::ExecutionPhase::Cancelled);
         assert!(status.cancellation_requested_at.is_some());
         assert_eq!(
@@ -2717,7 +2746,10 @@ mod tests {
         assert_eq!(runtime_state.status(), StatusCode::OK);
         let runtime_state: Option<tine_core::TreeRuntimeState> = read_json(runtime_state).await;
         let runtime_state = runtime_state.expect("expected runtime state after shutdown");
-        assert_eq!(runtime_state.kernel_state, tine_core::TreeKernelState::NeedsReplay);
+        assert_eq!(
+            runtime_state.kernel_state,
+            tine_core::TreeKernelState::NeedsReplay
+        );
         assert!(runtime_state.materialized_path_cell_ids.is_empty());
 
         let logs_response = send_json(

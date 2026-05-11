@@ -394,7 +394,11 @@ impl Scheduler {
                         artifact = %artifact_key,
                         "injecting cached artifact"
                     );
-                    match self.kernel_mgr.execute_tree_code(&tree_id, &inject_code).await {
+                    match self
+                        .kernel_mgr
+                        .execute_tree_code(&tree_id, &inject_code)
+                        .await
+                    {
                         Ok(result) if result.error.is_none() => {}
                         Ok(result) => {
                             cache_ready = false;
@@ -412,7 +416,7 @@ impl Scheduler {
                             break;
                         }
                         Err(err) => {
-                        cache_ready = false;
+                            cache_ready = false;
                             warn!(
                                 node = %node_id,
                                 slot = %slot,
@@ -908,13 +912,20 @@ async fn execute_cell(
                 "kernel communication failed, attempting restart and retry"
             );
             let _ = event_tx.send(ExecutionEvent::FallbackRestartTriggered {
+                execution_id: execution_id.clone(),
                 tree_id: branch.tree_id.clone(),
-                branch_id: branch_id.clone().unwrap_or_else(|| branch.branch_id.clone()),
+                branch_id: branch_id
+                    .clone()
+                    .unwrap_or_else(|| branch.branch_id.clone()),
                 reason: "Kernel communication lost; restarting runtime".to_string(),
             });
             kernel_mgr.restart_tree_kernel(&branch.tree_id).await?;
             kernel_mgr
-                .execute_tree_code_with_stream(&branch.tree_id, &cell.code.source, &mut emit_live_stream)
+                .execute_tree_code_with_stream(
+                    &branch.tree_id,
+                    &cell.code.source,
+                    &mut emit_live_stream,
+                )
                 .await?
         }
         Err(e) => return Err(e),
@@ -1107,8 +1118,8 @@ async fn introspect_error_context(
 mod tests {
     use super::Scheduler;
     use tine_core::{
-        BranchId, ExecutableTreeBranch, ExecutionTargetKind, ExecutionTargetRef,
-        ExperimentTreeId, SlotName,
+        BranchId, ExecutableTreeBranch, ExecutionTargetKind, ExecutionTargetRef, ExperimentTreeId,
+        SlotName,
     };
 
     #[test]

@@ -1068,5 +1068,640 @@ class McpPythonTests(unittest.TestCase):
         self.assertIn("scikit-learn==1.8.0", defaults)
 
 
+class _StallingHandler(BaseHTTPRequestHandler):
+    """HTTP handler that accepts requests but never responds, simulating a wedged
+    or deadlocked Tine REST server. The matching test event is set in test
+    setUp so each test can release the in-flight request before tearDown."""
+
+    release_event: threading.Event | None = None
+
+    def _wait_then_drop(self) -> None:
+        evt = type(self).release_event
+        if evt is not None:
+            evt.wait(timeout=15)
+        # Intentionally do not write a response — we want the client to
+        # observe a stall, not a 503.
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._wait_then_drop()
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._wait_then_drop()
+
+    def log_message(self, *args, **kwargs) -> None:  # noqa: D401
+        return
+
+
+class StalledServerFailureTests(unittest.TestCase):
+    """Replicates the urlopen-no-timeout wedge: the api_client's HTTP calls
+    have no timeout, so a stalled server blocks them forever, which in turn
+    blocks the synchronous MCP dispatcher and causes 'failed to tool call'
+    cascades on the host side."""
+
+    def setUp(self) -> None:
+        from tine.api_client import TineApiClient
+
+        self.release_event = threading.Event()
+        _StallingHandler.release_event = self.release_event
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _StallingHandler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.httpd.server_address
+        # Tight timeout for the test so we can prove the wedge is bounded
+        # without making the suite take 30s. Production uses 30s default.
+        self.api = TineApiClient(
+            f"http://{host}:{port}", default_timeout_secs=1.0, long_timeout_secs=1.0
+        )
+
+    def tearDown(self) -> None:
+        # Release any in-flight blocked handlers so threads exit cleanly.
+        self.release_event.set()
+        self.httpd.shutdown()
+        self.thread.join(timeout=5)
+
+    def test_api_status_does_not_block_indefinitely_when_server_stalls(self) -> None:
+        """A stalled API server must not wedge api.status() forever."""
+        result: dict[str, Any] = {}
+
+        def call() -> None:
+            try:
+                result["ok"] = self.api.status("exec-1")
+            except Exception as exc:  # noqa: BLE001
+                result["err"] = exc
+
+        worker = threading.Thread(target=call, daemon=True)
+        worker.start()
+        worker.join(timeout=2.0)
+        self.assertFalse(
+            worker.is_alive(),
+            "api.status() must time out against a stalled server, not block forever; "
+            "this is the urlopen-no-timeout wedge that causes MCP 'failed to tool call' cascades",
+        )
+        self.assertIn("err", result)
+
+    def test_execute_branch_timeout_warns_about_duplicate_submission_risk(self) -> None:
+        """execute_* submissions are non-idempotent: an HTTP timeout on a
+        POST does not prove the server abandoned the request. A pure
+        `timeout=None` would prevent the duplicate, but it also makes an
+        orphaned submission un-cancellable from the wrapper. The
+        compromise: bound the timeout long-but-finite, and require the
+        timeout error to *explicitly* warn about duplicate-risk so the
+        agent / user does not blindly retry.
+
+        The test client uses `long_timeout_secs=1.0` so we observe the
+        timeout fire quickly; production uses 600s.
+        """
+        with self.assertRaises(RuntimeError) as ctx:
+            self.api.execute_branch_in_experiment_tree("tree_1", "main")
+        message = str(ctx.exception)
+        self.assertIn(
+            "WARNING",
+            message,
+            f"timeout error must escalate visibility for non-idempotent submissions: {message}",
+        )
+        self.assertIn(
+            "DO NOT retry",
+            message,
+            f"timeout error must instruct against blind retry to prevent "
+            f"duplicate executions: {message}",
+        )
+        self.assertIn(
+            "duplicate",
+            message.lower(),
+            f"timeout error must mention duplicate-risk: {message}",
+        )
+
+    def test_create_experiment_tree_timeout_warns_about_duplicate_mutation_risk(self) -> None:
+        """Tree creation is also a non-idempotent write: if the server
+        accepts the POST and the response stalls, a blind retry can create
+        duplicate trees. The wrapper must surface the same explicit
+        duplicate-risk warning path used for execute submissions."""
+        with self.assertRaises(RuntimeError) as ctx:
+            self.api.create_experiment_tree("demo")
+        message = str(ctx.exception)
+        self.assertIn(
+            "WARNING",
+            message,
+            f"timeout error must escalate visibility for mutating writes: {message}",
+        )
+        self.assertIn(
+            "DO NOT retry",
+            message,
+            f"timeout error must instruct against blind retry for mutating writes: {message}",
+        )
+        self.assertTrue(
+            "duplicate" in message.lower() or "conflicting state" in message.lower(),
+            f"timeout error must mention duplicate/conflicting-state risk: {message}",
+        )
+
+
+class _PauseHandler(BaseHTTPRequestHandler):
+    """HTTP handler that sleeps inside slow endpoints and returns immediately
+    for fast ones. Used to simulate the 'long tool call followed by short
+    tool call' pattern that exposes the single-threaded dispatcher."""
+
+    pause_event: threading.Event | None = None
+    fast_calls = 0
+    slow_calls = 0
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path.endswith("/inspect-kernel"):
+            type(self).slow_calls += 1
+            evt = type(self).pause_event
+            if evt is not None:
+                evt.wait(timeout=10)
+            self._json(200, {
+                "tree_id": "tree_1",
+                "has_live_kernel": False,
+                "tree_kernel_state": None,
+                "replay_required": False,
+                "active_branch_id": None,
+                "runtime_epoch": 0,
+            })
+            return
+        if self.path.startswith("/api/executions/"):
+            # Fast recovery path used by `status` — must always respond
+            # promptly, even while slow paths are wedged.
+            type(self).fast_calls += 1
+            self._json(200, {
+                "execution_id": "exec_1",
+                "status": "running",
+                "phase": "running",
+                "cancellation_requested_at": None,
+                "node_statuses": {},
+                "finished_at": None,
+            })
+            return
+        if self.path == "/api/experiment-trees":
+            type(self).fast_calls += 1
+            self._json(200, [{"id": "tree_1", "name": "demo"}])
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path.endswith("/execute"):
+            # Slow path simulating a wedged execute submission. Holds the
+            # dispatcher worker until the test releases pause_event.
+            type(self).slow_calls += 1
+            evt = type(self).pause_event
+            if evt is not None:
+                evt.wait(timeout=15)
+            self._json(202, {
+                "execution_id": "exec_pending",
+                "status": "queued",
+                "phase": "queued",
+                "target": {"kind": "branch", "tree_id": "tree_1", "branch_id": "main"},
+                "queue_position": None,
+                "created_at": "2026-05-10T00:00:00Z",
+            })
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def _json(self, status: int, payload: object) -> None:
+        encoded = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, *args, **kwargs) -> None:  # noqa: D401
+        return
+
+
+class DispatcherSerialBlockingTests(unittest.TestCase):
+    """Replicates the observed 'first call works, every subsequent call fails'
+    pattern: the JSON-RPC dispatcher is single-threaded, so a single slow tool
+    call (e.g. wait_for_execution with extended wait_timeout_secs, or any
+    api_client call hitting a stalled server) blocks every other tool call
+    arriving on stdin until it completes."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _PauseHandler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        host, port = cls.httpd.server_address
+        cls.server = McpServer(f"http://{host}:{port}")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.httpd.shutdown()
+        cls.thread.join(timeout=5)
+
+    def setUp(self) -> None:
+        _PauseHandler.pause_event = threading.Event()
+        _PauseHandler.fast_calls = 0
+        _PauseHandler.slow_calls = 0
+
+    def tearDown(self) -> None:
+        # Release any blocked slow endpoint so the worker thread exits.
+        evt = _PauseHandler.pause_event
+        if evt is not None:
+            evt.set()
+
+    def test_run_stdio_must_dispatch_concurrent_requests(self) -> None:
+        """A slow tool call must not block other tool calls from being
+        serviced. With the current synchronous `run_stdio`, the second
+        request waits behind the first; we need concurrent dispatch so
+        unrelated tools (status, logs, cancel) stay responsive while a
+        long wait_for_execution is in flight."""
+        from tine.mcp import run_stdio
+
+        slow_request = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "inspect_kernel",
+                "arguments": {"experiment_id": "tree_1"},
+            },
+        })
+        fast_request = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "list_experiment_trees",
+                "arguments": {},
+            },
+        })
+
+        # Pre-load both requests into stdin; the loop will consume them sequentially.
+        import io
+
+        stdin = io.StringIO(slow_request + "\n" + fast_request + "\n")
+        stdout = _ThreadSafeStringIO()
+
+        # Run the loop in a thread so we can observe response timing.
+        loop_thread = threading.Thread(
+            target=run_stdio, args=(self.server, stdin, stdout), daemon=True
+        )
+        loop_thread.start()
+
+        # Wait until at least one response has been written, capturing its
+        # arrival time. We expect this to be the FAST one if dispatch is
+        # concurrent. With today's serial dispatcher it will be neither
+        # until we release the slow endpoint.
+        first_response_at = stdout.wait_for_lines(1, timeout=2.0)
+        self.assertIsNotNone(
+            first_response_at,
+            "no response within 2s — dispatcher is blocked on the slow tool call; "
+            "a concurrent dispatcher should service the fast tool while the slow one is in flight",
+        )
+        first_response = json.loads(stdout.lines()[0])
+        self.assertEqual(
+            first_response.get("id"),
+            2,
+            "expected the fast (id=2) response to arrive first under concurrent dispatch, "
+            f"but got id={first_response.get('id')} — dispatcher is serial",
+        )
+
+        # Now release the slow endpoint so the second response (id=1) lands.
+        _PauseHandler.pause_event.set()
+        stdout.wait_for_lines(2, timeout=5.0)
+        loop_thread.join(timeout=5.0)
+
+
+class StdioLoopResilienceTests(unittest.TestCase):
+    """The JSON-RPC loop must survive an unhandled exception in one tool call
+    and continue serving subsequent requests. Today's bare `_handle_request`
+    catches tool errors at the dispatcher boundary, but anything escaping that
+    catch (e.g. a malformed protocol message that hits an unexpected code
+    path) used to take the whole loop down. Concurrent dispatch closes that
+    gap by wrapping every per-request worker in a top-level try/except."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        host, port = cls.httpd.server_address
+        cls.server = McpServer(f"http://{host}:{port}")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.httpd.shutdown()
+        cls.thread.join(timeout=5)
+
+    def test_run_stdio_survives_handler_raising_outside_call_tool_catch(self) -> None:
+        """Patch `_handle_request` to raise on the first call; assert that
+        a subsequent valid `tools/list` call still receives a structured
+        response."""
+        from tine import mcp as mcp_module
+        from tine.mcp import run_stdio
+
+        import io
+
+        original_handle_request = mcp_module._handle_request
+        call_count = {"n": 0}
+
+        def flaky_handle_request(server, request_obj):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("synthetic dispatcher crash")
+            return original_handle_request(server, request_obj)
+
+        bad_request = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {},
+        })
+        good_request = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {},
+        })
+
+        stdin = io.StringIO(bad_request + "\n" + good_request + "\n")
+        stdout = _ThreadSafeStringIO()
+
+        with mock.patch.object(mcp_module, "_handle_request", side_effect=flaky_handle_request):
+            run_stdio(self.server, stdin, stdout)
+
+        responses = [json.loads(line) for line in stdout.lines()]
+        self.assertEqual(
+            len(responses),
+            2,
+            f"loop must produce a response for both requests, got {responses}",
+        )
+        ids = sorted(r.get("id") for r in responses)
+        self.assertEqual(ids, [1, 2], f"both ids must round-trip, got {responses}")
+        # The crashed request must come back as a JSON-RPC error response,
+        # not a silent drop.
+        bad_response = next(r for r in responses if r.get("id") == 1)
+        self.assertIn("error", bad_response, f"crashed request must surface an error: {bad_response}")
+        self.assertIn(
+            "synthetic dispatcher crash",
+            bad_response["error"]["message"],
+            f"error must include the underlying exception: {bad_response}",
+        )
+        # The healthy request must succeed.
+        good_response = next(r for r in responses if r.get("id") == 2)
+        self.assertIn("result", good_response, f"healthy request must succeed: {good_response}")
+
+
+class DispatcherSaturationTests(unittest.TestCase):
+    """The dispatcher must keep reading stdin even when its concurrency cap
+    is exhausted; otherwise a burst of slow tool calls deadlocks the bridge
+    against any subsequent fast call (host-visible 'failed to tool call'
+    cascade once the host's per-call timeout fires)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _PauseHandler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        host, port = cls.httpd.server_address
+        cls.server = McpServer(f"http://{host}:{port}")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.httpd.shutdown()
+        cls.thread.join(timeout=5)
+
+    def setUp(self) -> None:
+        _PauseHandler.pause_event = threading.Event()
+        _PauseHandler.fast_calls = 0
+        _PauseHandler.slow_calls = 0
+
+    def tearDown(self) -> None:
+        evt = _PauseHandler.pause_event
+        if evt is not None:
+            evt.set()
+
+    def test_run_stdio_reader_does_not_block_when_concurrency_cap_is_saturated(self) -> None:
+        """Submit (concurrency + 2) slow requests followed by 1 fast request.
+        The fast request must receive a response promptly even while the
+        slow ones are still in flight. With the previous reader-blocks-on-
+        semaphore design, the reader stops consuming stdin once N slow
+        requests are in flight, and the fast request sits unread until one
+        slow request completes."""
+        import io
+        import time as _time
+
+        from tine.mcp import run_stdio
+
+        # Saturate at the dispatcher's concurrency cap + 2. The reader
+        # must keep accepting input regardless.
+        concurrency = 4
+        slow_count = concurrency + 2
+        slow_requests = "\n".join(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 100 + i,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "inspect_kernel",
+                        "arguments": {"experiment_id": "tree_1"},
+                    },
+                }
+            )
+            for i in range(slow_count)
+        )
+        fast_request = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 999,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_experiment_trees",
+                    "arguments": {},
+                },
+            }
+        )
+
+        stdin = io.StringIO(slow_requests + "\n" + fast_request + "\n")
+        stdout = _ThreadSafeStringIO()
+
+        loop_thread = threading.Thread(
+            target=run_stdio,
+            args=(self.server, stdin, stdout),
+            kwargs={"concurrency": concurrency},
+            daemon=True,
+        )
+        loop_thread.start()
+
+        # Wait up to 3s for the fast (id=999) response to arrive while slow
+        # endpoints are still parked. Either a `result` (would mean a slot
+        # opened and the dispatcher serviced it) OR an `error` with the
+        # overload code (means the dispatcher chose to fast-fail rather
+        # than block) is acceptable — both prove the reader is responsive.
+        # What we want to rule out is "no response at all", which is what
+        # happens when the reader blocks on the semaphore.
+        deadline = _time.monotonic() + 3.0
+        fast_response = None
+        while _time.monotonic() < deadline:
+            for line in stdout.lines():
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("id") == 999:
+                    fast_response = payload
+                    break
+            if fast_response is not None:
+                break
+            _time.sleep(0.05)
+
+        self.assertIsNotNone(
+            fast_response,
+            f"fast (id=999) request did not receive any response within 3s while "
+            f"{slow_count} slow requests were in flight (concurrency cap={concurrency}); "
+            "the reader is blocking on the semaphore and not accepting new stdin",
+        )
+        self.assertTrue(
+            "result" in fast_response or "error" in fast_response,
+            f"fast (id=999) response missing both result and error: {fast_response}",
+        )
+
+        # Release the slow endpoint and drain the loop.
+        _PauseHandler.pause_event.set()
+        stdout.wait_for_lines(slow_count + 1, timeout=10.0)
+        loop_thread.join(timeout=10.0)
+
+    def test_slow_tools_must_not_starve_fast_recovery_tools(self) -> None:
+        """Saturate the dispatcher with non-idempotent slow tool calls
+        (e.g. `execute_branch`) and assert that a recovery-class tool
+        (`status`) still receives a real success response — not an
+        overload error. Without a reserved fast lane, enough hung slow
+        submissions will consume every dispatcher slot and the user is
+        locked out of `status`/`cancel` until the process is restarted —
+        exactly the deadlock-of-recovery scenario the adversarial review
+        flagged."""
+        import io
+        import time as _time
+
+        from tine.mcp import run_stdio
+
+        # Saturate the dispatcher with slow execute_branch calls.
+        # `concurrency=4` is the dispatcher cap; we send 4 slow ones.
+        concurrency = 4
+        slow_count = concurrency
+        slow_requests = "\n".join(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 200 + i,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "execute_branch",
+                        "arguments": {
+                            "experiment_id": "tree_1",
+                            "branch_id": "main",
+                        },
+                    },
+                }
+            )
+            for i in range(slow_count)
+        )
+        # Recovery tool — `status` is fast and stateless, must reach the
+        # API even when execute submissions are wedged.
+        fast_request = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 777,
+                "method": "tools/call",
+                "params": {
+                    "name": "status",
+                    "arguments": {"execution_id": "exec_1"},
+                },
+            }
+        )
+
+        stdin = io.StringIO(slow_requests + "\n" + fast_request + "\n")
+        stdout = _ThreadSafeStringIO()
+
+        loop_thread = threading.Thread(
+            target=run_stdio,
+            args=(self.server, stdin, stdout),
+            kwargs={"concurrency": concurrency},
+            daemon=True,
+        )
+        loop_thread.start()
+
+        # Wait up to 3s for the fast recovery tool to land. It MUST come
+        # back with a real `result` — not an overload `error` — even
+        # though all `concurrency` slow slots are wedged.
+        deadline = _time.monotonic() + 3.0
+        fast_response = None
+        while _time.monotonic() < deadline:
+            for line in stdout.lines():
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("id") == 777:
+                    fast_response = payload
+                    break
+            if fast_response is not None:
+                break
+            _time.sleep(0.05)
+
+        self.assertIsNotNone(
+            fast_response,
+            f"recovery tool (id=777, status) did not receive any response within 3s "
+            f"while {slow_count} execute_branch submissions were wedged "
+            f"(concurrency cap={concurrency}); the dispatcher is locking out recovery",
+        )
+        self.assertIn(
+            "result",
+            fast_response,
+            f"recovery tool (id=777, status) was rejected with overload error "
+            f"instead of executing — slow execute submissions are starving "
+            f"fast recovery tools out of dispatcher slots: {fast_response}",
+        )
+
+        # Release the slow endpoint and drain the loop.
+        _PauseHandler.pause_event.set()
+        loop_thread.join(timeout=10.0)
+
+
+class _ThreadSafeStringIO:
+    """Minimal thread-safe sink for run_stdio. Writes are line-buffered and
+    we expose an explicit `wait_for_lines(n, timeout)` so tests can observe
+    response arrival timing without polling."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._buf: list[str] = []
+
+    def write(self, s: str) -> int:
+        with self._cond:
+            self._buf.append(s)
+            self._cond.notify_all()
+        return len(s)
+
+    def flush(self) -> None:
+        return None
+
+    def _lines_locked(self) -> list[str]:
+        joined = "".join(self._buf)
+        return [line for line in joined.splitlines() if line.strip()]
+
+    def lines(self) -> list[str]:
+        with self._cond:
+            return self._lines_locked()
+
+    def wait_for_lines(self, n: int, timeout: float) -> bool | None:
+        import time as _time
+
+        deadline = _time.monotonic() + timeout if timeout is not None else None
+        with self._cond:
+            while len(self._lines_locked()) < n:
+                remaining = None
+                if deadline is not None:
+                    remaining = deadline - _time.monotonic()
+                    if remaining <= 0:
+                        return None
+                self._cond.wait(timeout=remaining)
+        return True
+
+
 if __name__ == "__main__":
     unittest.main()

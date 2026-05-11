@@ -561,17 +561,20 @@ pub enum ExecutionEvent {
     },
     /// A branch isolation attempt started for a tree/branch runtime.
     IsolationAttempted {
+        execution_id: ExecutionId,
         tree_id: ExperimentTreeId,
         branch_id: BranchId,
     },
     /// A branch isolation attempt completed successfully.
     IsolationSucceeded {
+        execution_id: ExecutionId,
         tree_id: ExperimentTreeId,
         branch_id: BranchId,
         delta: NamespaceDelta,
     },
     /// A branch isolation attempt detected contamination.
     ContaminationDetected {
+        execution_id: ExecutionId,
         tree_id: ExperimentTreeId,
         branch_id: BranchId,
         #[serde(default)]
@@ -579,6 +582,7 @@ pub enum ExecutionEvent {
     },
     /// Runtime fell back to restart/replay after an isolation decision.
     FallbackRestartTriggered {
+        execution_id: ExecutionId,
         tree_id: ExperimentTreeId,
         branch_id: BranchId,
         reason: String,
@@ -625,7 +629,13 @@ pub enum TreeKernelState {
     KernelLost,
 }
 
-/// Runtime branch-isolation mode for a tree-owned kernel.
+/// Runtime branch-isolation strategy for a tree-owned kernel during batch execution.
+///
+/// **Execution Contract**:
+/// 1. Sibling isolation is mandatory for batch execution (`run all`). No branch may inherit unintended side effects from a previous sibling execution.
+/// 2. `BranchIsolationMode` defines the isolation *strategy*. Currently, `NamespaceGuarded` is the supported correct strategy for batch execution.
+/// 3. Targeted execution (single branch/cell) relies on path-correctness and runtime reusability (`TreeKernelState`), independently of sibling-isolation mode.
+/// 4. Loss of trust in the runtime (e.g. guard failure or contamination) immediately invalidates direct sibling reuse, transitioning `kernel_state` to `NeedsReplay`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BranchIsolationMode {
@@ -915,7 +925,7 @@ pub struct ExecutionOutcome {
 }
 
 /// Logs from a single node execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeLogs {
     pub stdout: String,
     pub stderr: String,
@@ -1082,6 +1092,7 @@ mod tests {
     #[test]
     fn isolation_event_payloads_round_trip() {
         let event = ExecutionEvent::IsolationSucceeded {
+            execution_id: ExecutionId::new("exec-1"),
             tree_id: ExperimentTreeId::new("tree-1"),
             branch_id: BranchId::new("branch-a"),
             delta: NamespaceDelta {
@@ -1093,6 +1104,7 @@ mod tests {
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "isolation_succeeded");
+        assert_eq!(json["execution_id"], "exec-1");
 
         let runtime_state = TreeRuntimeState {
             tree_id: ExperimentTreeId::new("tree-1"),

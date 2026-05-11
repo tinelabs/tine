@@ -99,10 +99,7 @@ pub trait WorkspaceApi: Send + Sync {
     ) -> TineResult<()>;
 
     /// Get current runtime state for a tree, if any exists.
-    async fn get_tree_runtime_state(
-        &self,
-        tree_id: &ExperimentTreeId,
-    ) -> Option<TreeRuntimeState>;
+    async fn get_tree_runtime_state(&self, tree_id: &ExperimentTreeId) -> Option<TreeRuntimeState>;
 
     /// Inspect current tree-kernel health and runtime metadata.
     async fn inspect_tree_kernel(

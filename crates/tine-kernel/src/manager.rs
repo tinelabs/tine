@@ -827,7 +827,8 @@ impl KernelManager {
         owner_id: &KernelOwnerId,
         code: &str,
     ) -> TineResult<KernelExecutionResult> {
-        self.execute_owned_code_with_stream(owner_id, code, |_, _| {}).await
+        self.execute_owned_code_with_stream(owner_id, code, |_, _| {})
+            .await
     }
 
     pub async fn execute_worker_code_with_stream<F>(
@@ -840,7 +841,7 @@ impl KernelManager {
         F: FnMut(&str, &str),
     {
         self.execute_owned_code_with_stream(&Self::owner_id_for_worker(worker_id), code, on_stream)
-        .await
+            .await
     }
 
     async fn execute_owned_code_with_stream<F>(
@@ -883,7 +884,8 @@ impl KernelManager {
 
         let mut iopub_wait_timer = OutcomeTimer::start(METRIC_KERNEL_EXECUTE_IOPUB_WAIT);
         loop {
-            let msg = match tokio::time::timeout(Duration::from_secs(30), kernel.iopub.read()).await {
+            let msg = match tokio::time::timeout(Duration::from_secs(30), kernel.iopub.read()).await
+            {
                 Ok(Ok(msg)) => {
                     kernel.touch();
                     msg
@@ -895,7 +897,11 @@ impl KernelManager {
                 }
                 Err(_) => {
                     let heartbeat_alive = matches!(
-                        tokio::time::timeout(Duration::from_secs(2), kernel.heartbeat.single_heartbeat()).await,
+                        tokio::time::timeout(
+                            Duration::from_secs(2),
+                            kernel.heartbeat.single_heartbeat()
+                        )
+                        .await,
                         Ok(Ok(()))
                     );
                     if !heartbeat_alive {
@@ -964,25 +970,30 @@ impl KernelManager {
 
         // Read shell reply to stay in sync
         let mut shell_reply_timer = OutcomeTimer::start(METRIC_KERNEL_EXECUTE_SHELL_REPLY);
-        let shell_reply_outcome = match tokio::time::timeout(Duration::from_secs(5), kernel.shell.read()).await {
-            Ok(Ok(reply)) => {
-                debug!(owner = %owner_id, msg_type = reply.message_type(), "shell reply");
-                "success"
-            }
-            Ok(Err(e)) => {
-                warn!(owner = %owner_id, error = %e, "shell reply error");
-                "comm_error"
-            }
-            Err(_) => {
-                warn!(owner = %owner_id, "shell reply timed out");
-                "timeout"
-            }
-        };
+        let shell_reply_outcome =
+            match tokio::time::timeout(Duration::from_secs(5), kernel.shell.read()).await {
+                Ok(Ok(reply)) => {
+                    debug!(owner = %owner_id, msg_type = reply.message_type(), "shell reply");
+                    "success"
+                }
+                Ok(Err(e)) => {
+                    warn!(owner = %owner_id, error = %e, "shell reply error");
+                    "comm_error"
+                }
+                Err(_) => {
+                    warn!(owner = %owner_id, "shell reply timed out");
+                    "timeout"
+                }
+            };
         shell_reply_timer.set_outcome(shell_reply_outcome);
         drop(shell_reply_timer);
 
         kernel.set_executing(false);
-        let total_outcome = if exec_error.is_some() { "kernel_error" } else { "success" };
+        let total_outcome = if exec_error.is_some() {
+            "kernel_error"
+        } else {
+            "success"
+        };
         total_timer.set_outcome(total_outcome);
         Ok(KernelExecutionResult {
             stdout,
@@ -1004,7 +1015,7 @@ impl KernelManager {
         F: FnMut(&str, &str),
     {
         self.execute_owned_code_with_stream(&Self::owner_id_for_tree(tree_id), code, on_stream)
-        .await
+            .await
     }
 
     pub async fn begin_tree_branch_session(
@@ -1909,7 +1920,10 @@ mod tests {
         assert_eq!(kernel_mgr.kernels.len(), 1);
 
         let result = kernel_mgr
-            .execute_tree_code(&second_tree_id, "print('capacity-evict-second-ok', flush=True)")
+            .execute_tree_code(
+                &second_tree_id,
+                "print('capacity-evict-second-ok', flush=True)",
+            )
             .await
             .expect("failed to execute code in second tree kernel");
         assert!(result.stdout.contains("capacity-evict-second-ok"));

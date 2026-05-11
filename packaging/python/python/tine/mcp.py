@@ -5,6 +5,7 @@ import json
 import os
 import platform
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -734,27 +735,190 @@ class McpServer:
         return ToolResult(content=[{"type": "text", "text": text}], is_error=False)
 
 
-def run_stdio(server: McpServer) -> int:
-    for raw_line in sys.stdin:
+# Cap on concurrent in-flight tool calls. Excess requests block on the
+# semaphore briefly rather than spawn unbounded threads. Tuned to allow a
+# single long `wait_for_execution` plus several quick status/log/cancel
+# calls without falling behind. See `_DEFAULT_DISPATCH_CONCURRENCY` rationale
+# in docs/long-running-task-flow-and-failure-modes.md (locally, gitignored).
+_DEFAULT_DISPATCH_CONCURRENCY: int = 16
+
+
+# Tools whose handler can legitimately stall for a long time (cold venv
+# setup on first execute, long-poll `wait_for_execution`, etc.). These
+# get a bounded slot subset of the dispatcher cap so they cannot starve
+# recovery-class tools (`status`, `cancel`, `logs`, `inspect_kernel`,
+# etc.) out of their dispatcher slots when several stall at once. Without
+# this cap, N stalled `execute_branch` calls can consume the entire
+# dispatcher pool and lock the user out of the tools they would need to
+# recover. See the regression test
+# `test_slow_tools_must_not_starve_fast_recovery_tools`.
+_SLOW_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "execute_branch",
+        "execute_cell",
+        "execute_all_branches",
+        "wait_for_execution",
+        "create_experiment",
+        "save_experiment",
+    }
+)
+
+
+def _is_slow_request(request_obj: dict[str, Any]) -> bool:
+    if request_obj.get("method") != "tools/call":
+        return False
+    params = request_obj.get("params") or {}
+    return params.get("name") in _SLOW_TOOL_NAMES
+
+
+def run_stdio(
+    server: McpServer,
+    stdin: Any = None,
+    stdout: Any = None,
+    *,
+    concurrency: int = _DEFAULT_DISPATCH_CONCURRENCY,
+) -> int:
+    """Read JSON-RPC requests from `stdin` line-by-line and dispatch each in
+    its own daemon thread, so a slow tool call (e.g. a long
+    `wait_for_execution` poll, or any HTTP call to a stalled server) does
+    not block other tool calls from being serviced.
+
+    Responses are written to `stdout` under a lock so JSON-RPC frames stay
+    atomic even when multiple workers finish near-simultaneously. JSON-RPC
+    request IDs let the host correlate out-of-order responses.
+
+    Any exception raised inside `_handle_request` is caught and converted
+    to a JSON-RPC error response; the loop never dies on a single bad
+    request. A semaphore caps concurrent in-flight calls; excess requests
+    block briefly on `acquire` rather than spawning unbounded threads.
+    """
+    in_stream = stdin if stdin is not None else sys.stdin
+    out_stream = stdout if stdout is not None else sys.stdout
+    write_lock = threading.Lock()
+    in_flight = threading.Semaphore(concurrency)
+    # Cap how many slow-tool calls can be in flight at once. The slot
+    # reservation guarantees that at least `concurrency - slow_cap` slots
+    # are available to fast recovery tools even under heavy load.
+    slow_cap = max(1, concurrency // 2)
+    slow_count_lock = threading.Lock()
+    slow_count = [0]
+    workers: list[threading.Thread] = []
+
+    def _safe_handle(request_obj: dict[str, Any], was_slow: bool) -> None:
+        try:
+            try:
+                response = _handle_request(server, request_obj)
+            except Exception as exc:  # noqa: BLE001
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_obj.get("id"),
+                    "error": {
+                        "code": -32603,
+                        "message": f"Internal error in tool dispatch: {exc}",
+                    },
+                }
+            if request_obj.get("id") is None:
+                return
+            try:
+                with write_lock:
+                    _write_response(response, stdout=out_stream)
+            except (BrokenPipeError, ValueError):
+                # Stdout closed (host went away) — nothing useful left to do
+                # in this worker. The main loop will exit on its own when
+                # stdin closes.
+                return
+        finally:
+            if was_slow:
+                with slow_count_lock:
+                    slow_count[0] -= 1
+            in_flight.release()
+
+    for raw_line in in_stream:
         line = raw_line.strip()
         if not line:
             continue
         try:
             request_obj = json.loads(line)
         except json.JSONDecodeError as exc:
-            _write_response(
-                {
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32700, "message": f"Parse error: {exc}"},
-                }
-            )
+            with write_lock:
+                _write_response(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32700, "message": f"Parse error: {exc}"},
+                    },
+                    stdout=out_stream,
+                )
             continue
 
-        response = _handle_request(server, request_obj)
-        if request_obj.get("id") is None:
+        # Non-blocking slot acquisition. Blocking on the semaphore here
+        # would stop the reader from consuming subsequent stdin lines once
+        # `concurrency` slow requests are in flight, recreating the
+        # original "fast tool calls wedge behind slow ones" symptom. When
+        # we are saturated we send an immediate JSON-RPC error so the host
+        # can surface the overload to the agent and retry; the reader
+        # stays responsive to the next request line.
+        is_slow = _is_slow_request(request_obj)
+        slow_overload = False
+        if is_slow:
+            with slow_count_lock:
+                if slow_count[0] >= slow_cap:
+                    slow_overload = True
+                else:
+                    slow_count[0] += 1
+
+        if slow_overload or not in_flight.acquire(blocking=False):
+            # If we incremented the slow counter optimistically, undo it
+            # on failure to acquire the dispatcher slot.
+            if is_slow and not slow_overload:
+                with slow_count_lock:
+                    slow_count[0] -= 1
+            req_id = request_obj.get("id")
+            if req_id is None:
+                # Notification under load — drop silently per JSON-RPC.
+                continue
+            message = (
+                f"Tine MCP overloaded: {slow_cap} slow tool calls already in flight; "
+                "retry this submission after one completes, or use status/cancel "
+                "to make progress."
+                if slow_overload
+                else (
+                    f"Tine MCP overloaded: {concurrency} tool calls "
+                    "already in flight. Retry after one completes."
+                )
+            )
+            try:
+                with write_lock:
+                    _write_response(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "error": {
+                                # -32000 is the reserved server-error range;
+                                # the message is the agent-visible signal.
+                                "code": -32000,
+                                "message": message,
+                            },
+                        },
+                        stdout=out_stream,
+                    )
+            except (BrokenPipeError, ValueError):
+                return 0
             continue
-        _write_response(response)
+
+        worker = threading.Thread(
+            target=_safe_handle,
+            args=(request_obj, is_slow),
+            daemon=True,
+        )
+        worker.start()
+        workers.append(worker)
+
+    # Wait for in-flight workers to finish so any final responses are written
+    # before the function returns. Bounded so a hung worker can't keep the
+    # process alive forever — daemon threads are reaped at process exit.
+    for worker in workers:
+        worker.join(timeout=30.0)
     return 0
 
 
@@ -1293,9 +1457,10 @@ def _value_kind(value: Any) -> str:
     return type(value).__name__
 
 
-def _write_response(response_obj: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(response_obj) + "\n")
-    sys.stdout.flush()
+def _write_response(response_obj: dict[str, Any], stdout: Any = None) -> None:
+    out_stream = stdout if stdout is not None else sys.stdout
+    out_stream.write(json.dumps(response_obj) + "\n")
+    out_stream.flush()
 
 
 def _experiment_payload(

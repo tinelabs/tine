@@ -14,6 +14,7 @@ tine-scheduler.workspace = true
 tine-observe.workspace = true
 tokio.workspace = true
 metrics.workspace = true
+dashmap.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -28,7 +29,6 @@ blake3.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile = "3"
-dashmap.workspace = true
 async-trait.workspace = true
 serial_test = "3"
 metrics-exporter-prometheus.workspace = true

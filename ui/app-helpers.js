@@ -77,6 +77,11 @@ export function resolveWebSocketUrl(locationLike, baseUrl) {
   return `${locationLike?.protocol === "https:" ? "wss" : "ws"}://${locationLike?.host || ""}/ws`;
 }
 
+export function desktopMcpCommand(serverInfo) {
+  if (!serverInfo?.port) return null;
+  return `tine-mcp --api-url http://127.0.0.1:${serverInfo.port}`;
+}
+
 function stripAnsiText(text) {
   return String(text || "").replace(/\x1b\[[0-9;]*m/g, "");
 }

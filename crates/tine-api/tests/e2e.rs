@@ -17,8 +17,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use dashmap::DashMap;
 use serial_test::serial;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
 use tempfile::TempDir;
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, Instant};
 
 use tine_api::Workspace;
 use tine_core::{
@@ -27,6 +28,8 @@ use tine_core::{
     ExperimentTreeDef, ExperimentTreeId, NodeCode, NodeId, NodeStatus, ProjectDef, ProjectId,
     SlotName, TineError, TineResult, TreeKernelState, WorkspaceApi,
 };
+
+use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
 // In-memory ArtifactStore for tests
@@ -451,6 +454,44 @@ async fn wait_for_node_running(
         "node {} in execution {} did not reach running state in time",
         node_id.as_str(),
         exec_id.as_str()
+    );
+}
+
+async fn wait_for_cell_stdout_contains(
+    ws: &Workspace,
+    tree_id: &ExperimentTreeId,
+    branch_id: &BranchId,
+    cell_id: &CellId,
+    needle: &str,
+) {
+    for attempt in 0..240 {
+        let logs = ws
+            .logs_for_tree_cell(tree_id, branch_id, cell_id)
+            .await
+            .unwrap();
+        if logs.stdout.contains(needle) {
+            return;
+        }
+        if attempt == 0 || attempt % 10 == 0 {
+            eprintln!(
+                "[e2e] waiting for cell {} logs to contain {:?} poll={} stdout={:?}",
+                cell_id.as_str(),
+                needle,
+                attempt,
+                logs.stdout
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let logs = ws
+        .logs_for_tree_cell(tree_id, branch_id, cell_id)
+        .await
+        .unwrap();
+    panic!(
+        "cell {} logs never contained {:?}; final stdout={:?}",
+        cell_id.as_str(),
+        needle,
+        logs.stdout
     );
 }
 
@@ -1071,20 +1112,29 @@ async fn test_execute_all_branches_stops_after_first_branch_failure() {
         .into_iter()
         .collect();
 
-    let root_status = wait_for_execution_finished(&ws, execution_ids.get(&root_branch_id).unwrap()).await;
-    let failing_status = wait_for_execution_finished(&ws, execution_ids.get(&failing_branch_id).unwrap()).await;
-    let skipped_status = wait_for_execution_finished(&ws, execution_ids.get(&skipped_branch_id).unwrap()).await;
+    let root_status =
+        wait_for_execution_finished(&ws, execution_ids.get(&root_branch_id).unwrap()).await;
+    let failing_status =
+        wait_for_execution_finished(&ws, execution_ids.get(&failing_branch_id).unwrap()).await;
+    let skipped_status =
+        wait_for_execution_finished(&ws, execution_ids.get(&skipped_branch_id).unwrap()).await;
 
     assert_eq!(root_status.status, ExecutionLifecycleStatus::Completed);
     assert_eq!(failing_status.status, ExecutionLifecycleStatus::Failed);
     assert_eq!(skipped_status.status, ExecutionLifecycleStatus::Failed);
 
     let skipped_logs = ws
-        .logs_for_tree_cell(&tree_id, &skipped_branch_id, &CellId::new("branch_skipped_step"))
+        .logs_for_tree_cell(
+            &tree_id,
+            &skipped_branch_id,
+            &CellId::new("branch_skipped_step"),
+        )
         .await
         .unwrap();
     assert!(
-        !skipped_logs.stdout.contains("branch skipped should not execute"),
+        !skipped_logs
+            .stdout
+            .contains("branch skipped should not execute"),
         "later branch unexpectedly executed: {:?}",
         skipped_logs.stdout
     );
@@ -1158,7 +1208,14 @@ async fn test_namespace_guarded_run_all_emits_success_events() {
     let expected_branches: HashSet<_> = [root_branch_id.clone(), branch_id.clone()]
         .into_iter()
         .collect();
+    let execution_ids: HashMap<_, _> = ws
+        .execute_all_branches_in_experiment_tree(&tree_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
     let expected_branches_for_task = expected_branches.clone();
+    let execution_ids_for_task = execution_ids.clone();
     let event_task = tokio::spawn(async move {
         let mut attempted = HashSet::new();
         let mut resolved = HashSet::new();
@@ -1166,24 +1223,42 @@ async fn test_namespace_guarded_run_all_emits_success_events() {
             let event = rx.recv().await.expect("event channel closed");
             match event {
                 ExecutionEvent::IsolationAttempted {
+                    execution_id,
                     tree_id: evt_tree,
                     branch_id,
                     ..
                 } if evt_tree == event_tree_id => {
+                    assert_eq!(
+                        execution_ids_for_task.get(&branch_id),
+                        Some(&execution_id),
+                        "attempted event carried wrong execution id"
+                    );
                     attempted.insert(branch_id);
                 }
                 ExecutionEvent::IsolationSucceeded {
+                    execution_id,
                     tree_id: evt_tree,
                     branch_id,
                     ..
                 } if evt_tree == event_tree_id => {
+                    assert_eq!(
+                        execution_ids_for_task.get(&branch_id),
+                        Some(&execution_id),
+                        "success event carried wrong execution id"
+                    );
                     resolved.insert(branch_id);
                 }
                 ExecutionEvent::FallbackRestartTriggered {
+                    execution_id,
                     tree_id: evt_tree,
                     branch_id,
                     ..
                 } if evt_tree == event_tree_id => {
+                    assert_eq!(
+                        execution_ids_for_task.get(&branch_id),
+                        Some(&execution_id),
+                        "fallback event carried wrong execution id"
+                    );
                     resolved.insert(branch_id);
                 }
                 _ => {}
@@ -1194,11 +1269,14 @@ async fn test_namespace_guarded_run_all_emits_success_events() {
         }
         (attempted, resolved)
     });
-    ws.execute_all_branches_in_experiment_tree(&tree_id)
-        .await
-        .unwrap();
-
-    let (attempted, resolved) = timeout(Duration::from_secs(30), event_task)
+    let _ = execution_ids;
+    // 5-minute budget mirrors the patch on
+    // `test_large_output_execution_preserves_stream_and_final_logs`. The
+    // previous 30 s deadline was too tight on cold-venv-startup machines —
+    // first kernel boot for a fresh tree can exceed 30 s before any
+    // namespace-isolation events are emitted, so the listener task races
+    // a deadline that has nothing to do with the invariant under test.
+    let (attempted, resolved) = timeout(Duration::from_secs(300), event_task)
         .await
         .expect("timed out waiting for event listener task")
         .expect("event listener task panicked");
@@ -1220,6 +1298,128 @@ async fn test_namespace_guarded_run_all_emits_success_events() {
         "expected queued guarded run-all to avoid contamination, got {:?}",
         isolation_result.contamination_signals
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_run_all_emits_isolation_success_events_by_default() {
+    let (_tmp, ws) = open_temp_workspace().await;
+    let tree_id = ws.save_experiment_tree(&two_cell_tree()).await.unwrap().id;
+    let root_branch_id = tine_core::BranchId::new("main");
+
+    let branch_id = ws
+        .create_branch_in_experiment_tree(
+            &tree_id,
+            &root_branch_id,
+            "branch-events-default".to_string(),
+            &CellId::new("step2"),
+            CellDef {
+                id: CellId::new("branch_events_default_cell"),
+                tree_id: tree_id.clone(),
+                branch_id: tine_core::BranchId::new("ignored"),
+                name: "Branch events default cell".to_string(),
+                code: NodeCode {
+                    source: "branch_events_default = step2 + 1".to_string(),
+                    language: "python".to_string(),
+                },
+                upstream_cell_ids: vec![CellId::new("step2")],
+                declared_outputs: vec![SlotName::new("branch_events_default")],
+                cache: false,
+                map_over: None,
+                map_concurrency: None,
+                tags: HashMap::new(),
+                revision_id: None,
+                state: CellRuntimeState::Clean,
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut rx = ws.subscribe_events();
+    let event_tree_id = tree_id.clone();
+    let expected_branches: HashSet<_> = [root_branch_id.clone(), branch_id.clone()]
+        .into_iter()
+        .collect();
+    let execution_ids: HashMap<_, _> = ws
+        .execute_all_branches_in_experiment_tree(&tree_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    let expected_branches_for_task = expected_branches.clone();
+    let execution_ids_for_task = execution_ids.clone();
+    let event_task = tokio::spawn(async move {
+        let mut attempted = HashSet::new();
+        let mut resolved = HashSet::new();
+        loop {
+            let event = rx.recv().await.expect("event channel closed");
+            match event {
+                ExecutionEvent::IsolationAttempted {
+                    execution_id,
+                    tree_id: evt_tree,
+                    branch_id,
+                    ..
+                } if evt_tree == event_tree_id => {
+                    assert_eq!(
+                        execution_ids_for_task.get(&branch_id),
+                        Some(&execution_id),
+                        "attempted event carried wrong execution id"
+                    );
+                    attempted.insert(branch_id);
+                }
+                ExecutionEvent::IsolationSucceeded {
+                    execution_id,
+                    tree_id: evt_tree,
+                    branch_id,
+                    ..
+                } if evt_tree == event_tree_id => {
+                    assert_eq!(
+                        execution_ids_for_task.get(&branch_id),
+                        Some(&execution_id),
+                        "success event carried wrong execution id"
+                    );
+                    resolved.insert(branch_id);
+                }
+                ExecutionEvent::FallbackRestartTriggered {
+                    execution_id,
+                    tree_id: evt_tree,
+                    branch_id,
+                    ..
+                } if evt_tree == event_tree_id => {
+                    assert_eq!(
+                        execution_ids_for_task.get(&branch_id),
+                        Some(&execution_id),
+                        "fallback event carried wrong execution id"
+                    );
+                    resolved.insert(branch_id);
+                }
+                _ => {}
+            }
+            if attempted == expected_branches_for_task && resolved == expected_branches_for_task {
+                break;
+            }
+        }
+        (attempted, resolved)
+    });
+
+    let (attempted, resolved) = timeout(Duration::from_secs(300), event_task)
+        .await
+        .expect("timed out waiting for event listener task")
+        .expect("event listener task panicked");
+
+    assert_eq!(attempted, expected_branches);
+    assert_eq!(resolved, expected_branches);
+
+    let runtime_state = ws.get_tree_runtime_state(&tree_id).await.unwrap();
+    let isolation_result = runtime_state
+        .last_isolation_result
+        .as_ref()
+        .expect("expected isolation result to be recorded");
+    assert_eq!(runtime_state.kernel_state, TreeKernelState::Ready);
+    assert!(runtime_state.materialized_path_cell_ids.is_empty());
+    assert_eq!(runtime_state.last_prepared_cell_id, None);
+    assert!(isolation_result.succeeded);
+    assert!(isolation_result.contamination_signals.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1480,6 +1680,190 @@ async fn test_namespace_guarded_end_session_failure_marks_replay_and_records_sig
                 tree_id: evt_tree,
                 branch_id: evt_branch_id,
                 reason,
+                ..
+            }) if evt_tree == tree_id && evt_branch_id == root_branch_id => {
+                fallback_reason = Some(reason);
+                break;
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                panic!("lagged while draining events, skipped {skipped}");
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+    let fallback_reason =
+        fallback_reason.expect("expected fallback restart event for end-session failure");
+
+    assert!(
+        fallback_reason.contains("failed_to_end_branch_session"),
+        "unexpected fallback reason: {fallback_reason}"
+    );
+
+    let runtime_state = ws.get_tree_runtime_state(&tree_id).await.unwrap();
+    let isolation_result = runtime_state
+        .last_isolation_result
+        .as_ref()
+        .expect("expected end-session failure result to be recorded");
+    assert_eq!(isolation_result.branch_id, root_branch_id);
+    assert!(!isolation_result.succeeded);
+    assert_eq!(
+        isolation_result.contamination_signals,
+        vec!["session_end_failed".to_string()]
+    );
+    assert_eq!(runtime_state.kernel_state, TreeKernelState::NeedsReplay);
+    assert!(runtime_state.materialized_path_cell_ids.is_empty());
+    assert_eq!(runtime_state.last_prepared_cell_id, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_namespace_guarded_begin_session_failure_marks_replay_and_records_signal() {
+    let (_tmp, ws) = open_temp_workspace().await;
+    let root_branch_id = tine_core::BranchId::new("main");
+    let mut tree = two_cell_tree();
+    let tree_id = tree.id.clone();
+    tree.cells
+        .iter_mut()
+        .find(|cell| cell.id == CellId::new("step1"))
+        .expect("expected step1 cell in test tree")
+        .code
+        .source = "_pf_begin_branch_session = None\nstep1 = 1".to_string();
+    ws.save_experiment_tree(&tree).await.unwrap();
+
+    let warmup_execution_id = ws
+        .execute_branch_in_experiment_tree(&tree_id, &root_branch_id)
+        .await
+        .unwrap();
+    let warmup_status = wait_for_execution_finished(&ws, &warmup_execution_id).await;
+    assert_eq!(warmup_status.status, ExecutionLifecycleStatus::Completed);
+
+    let mut state = ws
+        .get_tree_runtime_state(&tree_id)
+        .await
+        .unwrap_or_else(|| tine_core::TreeRuntimeState {
+            tree_id: tree_id.clone(),
+            active_branch_id: root_branch_id.clone(),
+            materialized_path_cell_ids: Vec::new(),
+            runtime_epoch: 0,
+            kernel_state: TreeKernelState::NeedsReplay,
+            last_prepared_cell_id: None,
+            isolation_mode: BranchIsolationMode::Disabled,
+            last_isolation_result: None,
+        });
+    state.isolation_mode = BranchIsolationMode::NamespaceGuarded;
+    ws.set_tree_runtime_state(state).await.unwrap();
+
+    let mut rx = ws.subscribe_events();
+
+    let executions = ws
+        .execute_all_branches_in_experiment_tree(&tree_id)
+        .await
+        .unwrap();
+    for (_, exec_id) in &executions {
+        wait_for_execution_finished(&ws, exec_id).await;
+    }
+    for _ in 0..120 {
+        if ws
+            .get_tree_runtime_state(&tree_id)
+            .await
+            .and_then(|state| state.last_isolation_result)
+            .is_some_and(|result| result.branch_id == root_branch_id)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    let mut fallback_reason = None;
+    loop {
+        match rx.try_recv() {
+            Ok(ExecutionEvent::FallbackRestartTriggered {
+                tree_id: evt_tree,
+                branch_id: evt_branch_id,
+                reason,
+                ..
+            }) if evt_tree == tree_id && evt_branch_id == root_branch_id => {
+                fallback_reason = Some(reason);
+                break;
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                panic!("lagged while draining events, skipped {skipped}");
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+    let fallback_reason =
+        fallback_reason.expect("expected fallback restart event for begin-session failure");
+
+    assert!(
+        fallback_reason.contains("failed_to_begin_branch_session"),
+        "unexpected fallback reason: {fallback_reason}"
+    );
+
+    let runtime_state = ws.get_tree_runtime_state(&tree_id).await.unwrap();
+    let isolation_result = runtime_state
+        .last_isolation_result
+        .as_ref()
+        .expect("expected begin-session failure result to be recorded");
+    assert_eq!(isolation_result.branch_id, root_branch_id);
+    assert!(!isolation_result.succeeded);
+    assert_eq!(
+        isolation_result.contamination_signals,
+        vec!["session_begin_failed".to_string()]
+    );
+    assert_eq!(runtime_state.kernel_state, TreeKernelState::NeedsReplay);
+    assert!(runtime_state.materialized_path_cell_ids.is_empty());
+    assert_eq!(runtime_state.last_prepared_cell_id, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_run_all_end_session_failure_marks_replay_by_default() {
+    let (_tmp, ws) = open_temp_workspace().await;
+    let root_branch_id = tine_core::BranchId::new("main");
+    let mut tree = two_cell_tree();
+    let tree_id = tree.id.clone();
+    tree.cells
+        .iter_mut()
+        .find(|cell| cell.id == CellId::new("step2"))
+        .expect("expected step2 cell in test tree")
+        .code
+        .source = "_pf_end_branch_session = None\nstep2 = step1 * 2".to_string();
+    ws.save_experiment_tree(&tree).await.unwrap();
+
+    let mut rx = ws.subscribe_events();
+
+    let executions = ws
+        .execute_all_branches_in_experiment_tree(&tree_id)
+        .await
+        .unwrap();
+    for (_, exec_id) in &executions {
+        wait_for_execution_finished(&ws, exec_id).await;
+    }
+    for _ in 0..120 {
+        if ws
+            .get_tree_runtime_state(&tree_id)
+            .await
+            .and_then(|state| state.last_isolation_result)
+            .is_some_and(|result| result.branch_id == root_branch_id)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    let mut fallback_reason = None;
+    loop {
+        match rx.try_recv() {
+            Ok(ExecutionEvent::FallbackRestartTriggered {
+                tree_id: evt_tree,
+                branch_id: evt_branch_id,
+                reason,
+                ..
             }) if evt_tree == tree_id && evt_branch_id == root_branch_id => {
                 fallback_reason = Some(reason);
                 break;
@@ -2224,7 +2608,10 @@ async fn test_inspect_tree_kernel_with_no_kernel_returns_empty_snapshot() {
 
     let snap = ws.inspect_tree_kernel(&tree_id).await.unwrap();
     assert_eq!(snap.tree_id, tree_id);
-    assert!(!snap.has_live_kernel, "fresh tree must report no live kernel");
+    assert!(
+        !snap.has_live_kernel,
+        "fresh tree must report no live kernel"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3287,6 +3674,203 @@ async fn test_mark_tree_kernel_lost_fails_running_branch_execution() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 #[ignore]
+async fn test_shutdown_persists_terminal_state_for_running_branch_execution() {
+    let (tmp, ws) = open_temp_workspace().await;
+    let tree_id = ExperimentTreeId::new("shutdown-persist-tree");
+    let branch_id = BranchId::new("main");
+    let cell_id = CellId::new("step1");
+    let tree = ExperimentTreeDef {
+        id: tree_id.clone(),
+        name: "shutdown-persist-tree".to_string(),
+        project_id: None,
+        root_branch_id: branch_id.clone(),
+        branches: vec![BranchDef {
+            id: branch_id.clone(),
+            name: "main".to_string(),
+            parent_branch_id: None,
+            branch_point_cell_id: None,
+            cell_order: vec![cell_id.clone()],
+            display: HashMap::new(),
+        }],
+        cells: vec![CellDef {
+            id: cell_id.clone(),
+            tree_id: tree_id.clone(),
+            branch_id: branch_id.clone(),
+            name: "step1".to_string(),
+            code: NodeCode {
+                source: "import time\nprint('shutdown test started', flush=True)\ntime.sleep(20)\nprint('should not reach shutdown test end', flush=True)\nstep1 = 42\n".to_string(),
+                language: "python".to_string(),
+            },
+            upstream_cell_ids: vec![],
+            declared_outputs: vec![SlotName::new("step1")],
+            cache: false,
+            map_over: None,
+            map_concurrency: None,
+            tags: HashMap::new(),
+            revision_id: None,
+            state: CellRuntimeState::Clean,
+        }],
+        environment: Default::default(),
+        execution_mode: ExecutionMode::Parallel,
+        budget: None,
+        created_at: chrono::Utc::now(),
+    };
+    ws.save_experiment_tree(&tree).await.unwrap();
+
+    let execution_id = ws
+        .execute_branch_in_experiment_tree(&tree_id, &branch_id)
+        .await
+        .unwrap();
+
+    let running_status = wait_for_node_running(&ws, &execution_id, &NodeId::new("step1")).await;
+    assert_eq!(running_status.tree_id.as_ref(), Some(&tree_id));
+    wait_for_cell_stdout_contains(&ws, &tree_id, &branch_id, &cell_id, "shutdown test started")
+        .await;
+
+    timeout(Duration::from_secs(60), ws.shutdown())
+        .await
+        .expect("workspace shutdown timed out")
+        .expect("workspace shutdown failed");
+
+    let db_path = tmp.path().join(".tine").join("tine.db");
+    let db_url = format!("sqlite://{}?mode=ro", db_path.display());
+    let connect_options = SqliteConnectOptions::from_str(&db_url)
+        .expect("failed to build sqlite connect options")
+        .journal_mode(SqliteJournalMode::Wal);
+    let pool = SqlitePool::connect_with(connect_options)
+        .await
+        .expect("failed to reopen sqlite db after shutdown");
+
+    let row: (String, Option<String>) =
+        sqlx::query_as("SELECT status, node_logs FROM executions WHERE id = ?")
+            .bind(execution_id.as_str())
+            .fetch_one(&pool)
+            .await
+            .expect("failed to read execution row after shutdown");
+
+    let persisted_status: tine_core::ExecutionStatus =
+        serde_json::from_str(&row.0).expect("failed to parse persisted execution status");
+    assert!(
+        is_terminal_execution_status(&persisted_status),
+        "shutdown must persist a terminal execution status before reopen; got {:?}",
+        persisted_status
+    );
+    assert_eq!(persisted_status.status, ExecutionLifecycleStatus::Cancelled);
+    assert_eq!(persisted_status.phase, tine_core::ExecutionPhase::Cancelled);
+    assert!(persisted_status.finished_at.is_some());
+    assert!(persisted_status.cancellation_requested_at.is_some());
+    assert_eq!(
+        persisted_status
+            .node_statuses
+            .get(&NodeId::new(cell_id.as_str())),
+        Some(&NodeStatus::Interrupted),
+        "shutdown must mark the running node interrupted in persisted state: {:?}",
+        persisted_status.node_statuses
+    );
+
+    let logs_json = row
+        .1
+        .expect("node_logs should be persisted during shutdown");
+    let parsed_logs: HashMap<NodeId, tine_core::NodeLogs> =
+        serde_json::from_str(&logs_json).expect("failed to parse persisted node logs");
+    let node_logs = parsed_logs
+        .get(&NodeId::new(cell_id.as_str()))
+        .expect("missing persisted node logs for step1");
+    assert!(
+        node_logs.stdout.contains("shutdown test started"),
+        "shutdown lost the pre-teardown stream tail: {:?}",
+        node_logs.stdout
+    );
+    assert!(
+        !node_logs
+            .stdout
+            .contains("should not reach shutdown test end"),
+        "workspace shutdown allowed the node to keep running instead of quiescing it: {:?}",
+        node_logs.stdout
+    );
+
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore]
+async fn test_workspace_shutdown_cancels_queued_branch_execution() {
+    let (tmp, ws) = open_temp_workspace_with_max_kernels(1).await;
+    let tree = slow_single_cell_tree();
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+    let branch_id = tree.root_branch_id.clone();
+
+    let running_execution_id = ws
+        .execute_branch_in_experiment_tree(&tree_id, &branch_id)
+        .await
+        .unwrap();
+    let queued_execution_id = ws
+        .execute_branch_in_experiment_tree(&tree_id, &branch_id)
+        .await
+        .unwrap();
+
+    let running_status =
+        wait_for_node_running(&ws, &running_execution_id, &NodeId::new("step1")).await;
+    assert_eq!(running_status.tree_id.as_ref(), Some(&tree_id));
+
+    let queued_status = {
+        let mut observed = None;
+        for _ in 0..120 {
+            let status = ws.status(&queued_execution_id).await.unwrap();
+            if status.phase == tine_core::ExecutionPhase::Queued {
+                observed = Some(status);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        observed.expect("expected second execution to remain queued before shutdown")
+    };
+    assert_eq!(queued_status.status, ExecutionLifecycleStatus::Queued);
+    assert!(queued_status.queue_position.is_some());
+
+    timeout(Duration::from_secs(60), ws.shutdown())
+        .await
+        .expect("workspace shutdown timed out")
+        .expect("workspace shutdown failed");
+
+    let db_path = tmp.path().join(".tine").join("tine.db");
+    let db_url = format!("sqlite://{}?mode=ro", db_path.display());
+    let connect_options = SqliteConnectOptions::from_str(&db_url)
+        .expect("failed to build sqlite connect options")
+        .journal_mode(SqliteJournalMode::Wal);
+    let pool = SqlitePool::connect_with(connect_options)
+        .await
+        .expect("failed to reopen sqlite db after shutdown");
+
+    for execution_id in [&running_execution_id, &queued_execution_id] {
+        let (status_json,): (String,) =
+            sqlx::query_as("SELECT status FROM executions WHERE id = ?")
+                .bind(execution_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("failed to read execution row after shutdown");
+
+        let persisted_status: tine_core::ExecutionStatus =
+            serde_json::from_str(&status_json).expect("failed to parse persisted execution status");
+        assert!(
+            is_terminal_execution_status(&persisted_status),
+            "workspace shutdown must persist a terminal status for all queued and running executions; got {:?}",
+            persisted_status
+        );
+        assert_eq!(persisted_status.status, ExecutionLifecycleStatus::Cancelled);
+        assert_eq!(persisted_status.phase, tine_core::ExecutionPhase::Cancelled);
+        assert!(persisted_status.finished_at.is_some());
+        assert!(persisted_status.cancellation_requested_at.is_some());
+        assert!(persisted_status.queue_position.is_none());
+    }
+
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+#[ignore]
 async fn test_restart_tree_kernel_waits_for_running_branch_execution_to_finish() {
     let (_tmp, ws) = open_temp_workspace().await;
     let tree_id = ExperimentTreeId::new("mid-branch-restart-tree");
@@ -3453,9 +4037,24 @@ async fn test_large_output_execution_preserves_stream_and_final_logs() {
     let mut saw_last = false;
     let mut stream_chunks = 0usize;
     let event_exec_id = execution_id.clone();
+    // Single overall deadline. The previous version used a tight 30s
+    // per-`recv()` timeout which is too short to cover cold venv setup —
+    // on a cold-start machine no events arrive between `ExecutionStarted`
+    // and `NodeStarted` for >30s while the kernel is being prepared, and
+    // the test panics before observing the actual streaming. Use a 5-minute
+    // total budget that covers cold start + streaming + completion.
+    const EVENT_OBSERVATION_BUDGET_SECS: u64 = 300;
     let event_task = tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(EVENT_OBSERVATION_BUDGET_SECS);
         loop {
-            match timeout(Duration::from_secs(30), rx.recv()).await {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                panic!(
+                    "exhausted {EVENT_OBSERVATION_BUDGET_SECS}s observation budget without seeing \
+                     ExecutionCompleted for the large-output execution"
+                );
+            }
+            match timeout(remaining, rx.recv()).await {
                 Ok(Ok(ExecutionEvent::NodeStream {
                     execution_id,
                     node_id,
@@ -3475,9 +4074,7 @@ async fn test_large_output_execution_preserves_stream_and_final_logs() {
                     execution_id,
                     failed_nodes,
                     ..
-                }))
-                    if execution_id == event_exec_id =>
-                {
+                })) if execution_id == event_exec_id => {
                     panic!(
                         "large output execution failed unexpectedly; failed_nodes={failed_nodes:?}"
                     );
@@ -3489,7 +4086,10 @@ async fn test_large_output_execution_preserves_stream_and_final_logs() {
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                     panic!("event channel closed while waiting for large output stream");
                 }
-                Err(_) => panic!("timed out waiting for large output stream events"),
+                Err(_) => panic!(
+                    "exhausted {EVENT_OBSERVATION_BUDGET_SECS}s observation budget without seeing \
+                     ExecutionCompleted for the large-output execution"
+                ),
             }
         }
     });
@@ -3502,8 +4102,14 @@ async fn test_large_output_execution_preserves_stream_and_final_logs() {
     );
 
     let (saw_first, saw_last, stream_chunks) = event_task.await.unwrap();
-    assert!(saw_first, "expected stream events to include the first output line");
-    assert!(saw_last, "expected stream events to include the last output line");
+    assert!(
+        saw_first,
+        "expected stream events to include the first output line"
+    );
+    assert!(
+        saw_last,
+        "expected stream events to include the last output line"
+    );
     assert!(stream_chunks > 0, "expected at least one NodeStream event");
 
     let logs = ws
@@ -3623,7 +4229,6 @@ async fn test_wi1_perf_histograms_fire_on_cold_and_warm_execute() {
             rendered
         );
     }
-
 }
 
 #[tokio::test]

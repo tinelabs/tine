@@ -2,8 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -89,7 +89,6 @@ fn configure_bundled_runtime(app: &tauri::App) {
             "runtime dir exists but bundled python binary is missing"
         );
     }
-
 }
 
 /// IPC: list experiment trees
@@ -259,7 +258,11 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 match start_embedded_server(&ws_dir, state.preferred_port).await {
                     Ok((workspace, port, fell_back)) => {
-                        info!(port = port, fell_back = fell_back, "embedded tine server started");
+                        info!(
+                            port = port,
+                            fell_back = fell_back,
+                            "embedded tine server started"
+                        );
 
                         if let Ok(mut state_workspace) = state.workspace.lock() {
                             *state_workspace = Some(workspace);
