@@ -81,6 +81,22 @@ jobs:
     runs-on: ubuntu-latest
     if: inputs.publish_release
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release notes
+        id: release_notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES_PATH=".github/release-notes/${{ needs.resolve-release-tag.outputs.canonical_tag }}.md"
+          if [[ -f "$NOTES_PATH" ]]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "path=$NOTES_PATH" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download wrapper runtime artifacts
         uses: actions/download-artifact@v4
         with:
@@ -101,7 +117,22 @@ jobs:
           pattern: desktop-app-*
           merge-multiple: true
 
-      - name: Create release and upload validated assets
+      - name: Create release with curated notes and upload validated assets
+        if: steps.release_notes.outputs.found == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve-release-tag.outputs.canonical_tag }}
+          name: ${{ needs.resolve-release-tag.outputs.release_name }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ inputs.prerelease }}
+          body_path: ${{ steps.release_notes.outputs.path }}
+          files: |
+            release-artifacts/*
+            python-dist/*
+            desktop-artifacts/*
+
+      - name: Create release with generated notes and upload validated assets
+        if: steps.release_notes.outputs.found != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.resolve-release-tag.outputs.canonical_tag }}
