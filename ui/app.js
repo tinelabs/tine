@@ -86,12 +86,12 @@ import {
   hasHttpOrigin,
   markReplayRequiredCellStatuses,
   nextAsyncRequestId,
+  nextPollDelay,
   nodeStatusToCellStatus,
   normalizeFileTreePath,
   pickActiveBranchId,
   registerPendingFileTreeRefresh,
   reconnectResyncTargets,
-  resolvePollWindowExpiry,
   resolveApiBaseUrl,
   resolveServerInfo,
   resolveApiUrl,
@@ -1316,9 +1316,27 @@ function requestExecutionStatusResync(executionId) {
     });
 }
 
+let lagResyncInFlight = false;
+
 function handleEvent(evt) {
   const { type, data: d } = parseExecutionEvent(evt);
   if (!type || !d) return;
+  if (type === "ExecutionEventsLagged") {
+    // The server's event stream dropped events for this client (slow
+    // consumer); completions may have been missed, so re-pull authoritative
+    // status for every tracked execution.
+    termLog(
+      `Event stream lagged (${d.skipped ?? "?"} events dropped); resyncing tracked executions`,
+      "warn",
+    );
+    if (!lagResyncInFlight) {
+      lagResyncInFlight = true;
+      resyncTrackedExecutionsAfterReconnect().finally(() => {
+        lagResyncInFlight = false;
+      });
+    }
+    return;
+  }
   store.set(s => {
     const ns = {
       ...s,
@@ -1766,14 +1784,20 @@ async function loadExperiments() {
 
 async function pollExecution(execId, runtimeId, nodeIds) {
   const targetNodes = nodeIds || [];
-  for (let i = 0; i < 120; i++) {
+  // Poll until the execution is untracked, terminal, or deleted — never give
+  // up on a live execution. WebSocket events untrack executions promptly when
+  // the socket is healthy; when it is not, this loop is the only progress
+  // signal, so the interval backs off instead of capping iterations.
+  let delayMs = 1000;
+  for (;;) {
     if (
       !(execId in store.get().activePollIds) ||
       store.get().activePollIds[execId] === false
     ) {
       return;
     }
-    await new Promise((r) => setTimeout(r, 1000));
+    await new Promise((r) => setTimeout(r, delayMs));
+    delayMs = nextPollDelay(delayMs);
     try {
       const st = await api.status(execId);
       const executionTarget = store.get().executionTargets?.[execId] || null;
@@ -1846,40 +1870,6 @@ async function pollExecution(execId, runtimeId, nodeIds) {
       termLog(`Execution ${execId} poll error: ${err}`, "error");
     }
   }
-  const wsConnected = store.get().wsConnected;
-  const expiry = resolvePollWindowExpiry({
-    currentStatus: null,
-    wsConnected,
-  });
-  if (targetNodes.length && !wsConnected) {
-    const executionTarget = store.get().executionTargets?.[execId] || null;
-    store.set((s) => {
-      let cellStatuses = s.cellStatuses;
-      for (const nid of targetNodes) {
-        const k = runtimeCellKey({
-          runtimeId,
-          treeId: executionTarget?.treeId || null,
-          branchId: executionTarget?.branchId || null,
-          nodeId: nid,
-        });
-        if (!k) continue;
-        const next = resolvePollWindowExpiry({
-          currentStatus: s.cellStatuses[k] || null,
-          wsConnected: false,
-        });
-        if (next.shouldUpdateStatus && next.nextStatus !== s.cellStatuses[k]) {
-          if (cellStatuses === s.cellStatuses) cellStatuses = { ...s.cellStatuses };
-          cellStatuses[k] = next.nextStatus;
-        }
-      }
-      return cellStatuses === s.cellStatuses ? s : { ...s, cellStatuses };
-    });
-  }
-  finishTrackedExecution(execId);
-  termLog(
-    `Execution ${execId} ${expiry.logMessage}`,
-    expiry.logLevel,
-  );
 }
 
 async function cancelExecutionById(execId) {

@@ -951,6 +951,14 @@ pub struct NodeCacheKey {
     pub input_hashes: HashMap<SlotName, [u8; 32]>,
     /// blake3 hash of the lockfile (environment).
     pub lockfile_hash: [u8; 32],
+    /// blake3 hash of the owning cell's identity (tree id + cell id).
+    ///
+    /// Scopes reuse strictly "top to bottom": a cell only hits entries it
+    /// produced itself (the same lineage position, e.g. a shared-prefix cell
+    /// re-running on a sibling branch path). Branches are intentionally
+    /// divergent experiments, so a sibling cell that happens to share code
+    /// and inputs must still execute — sideways reuse is never allowed.
+    pub scope_hash: [u8; 32],
 }
 
 impl std::hash::Hash for NodeCacheKey {
@@ -964,6 +972,7 @@ impl std::hash::Hash for NodeCacheKey {
             v.hash(state);
         }
         self.lockfile_hash.hash(state);
+        self.scope_hash.hash(state);
     }
 }
 
@@ -976,6 +985,15 @@ impl NodeCacheKey {
     /// Compute the hash for raw bytes (artifact content).
     pub fn hash_bytes(data: &[u8]) -> [u8; 32] {
         *blake3::hash(data).as_bytes()
+    }
+
+    /// Compute the scope hash binding a cache entry to one cell of one tree.
+    pub fn scope_for(tree_id: &str, cell_id: &str) -> [u8; 32] {
+        let mut data = Vec::with_capacity(tree_id.len() + cell_id.len() + 1);
+        data.extend_from_slice(tree_id.as_bytes());
+        data.push(0);
+        data.extend_from_slice(cell_id.as_bytes());
+        *blake3::hash(&data).as_bytes()
     }
 }
 

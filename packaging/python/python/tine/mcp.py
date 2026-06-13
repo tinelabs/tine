@@ -106,6 +106,12 @@ def _server_version() -> str:
         return "0.0.0-dev"
 
 
+class McpValidationError(RuntimeError):
+    """Tool argument validation failure (stable error code: `validation`)."""
+
+    code = "validation"
+
+
 @dataclass
 class ToolDef:
     name: str
@@ -127,8 +133,11 @@ class McpServer:
         return [
             _tool(
                 "list_experiment_trees",
-                "List all experiment trees in the workspace.",
-                {"type": "object", "properties": {}},
+                "List experiment trees — all of them, or only those in one project when `project_id` is provided.",
+                {
+                    "type": "object",
+                    "properties": {"project_id": {"type": "string"}},
+                },
             ),
             _tool(
                 "create_experiment",
@@ -170,10 +179,13 @@ class McpServer:
             ),
             _tool(
                 "get_experiment",
-                "Get an experiment tree definition by ID. The response includes agent context with the experiment's current package list plus explicit guidance about defaults, when to install extra packages, and using `!pip install ...` in a setup cell for anything not already available.",
+                "Get an experiment tree definition by ID. The response includes agent context with the experiment's current package list plus explicit guidance about defaults, when to install extra packages, and using `!pip install ...` in a setup cell for anything not already available. Pass `include_cell_sources=false` to omit cell source code (structure and ids only) when you just need to navigate the tree.",
                 {
                     "type": "object",
-                    "properties": {"experiment_id": {"type": "string"}},
+                    "properties": {
+                        "experiment_id": {"type": "string"},
+                        "include_cell_sources": {"type": "boolean", "default": True},
+                    },
                     "required": ["experiment_id"],
                 },
             ),
@@ -348,35 +360,63 @@ class McpServer:
             ),
             _tool(
                 "execute_branch",
-                "Execute one branch in an experiment tree and return the accepted execution envelope, including execution id, submission status, phase, and queue position when available. `branch_id` defaults to `main` when omitted.",
+                "Execute one branch in an experiment tree. By default returns the accepted execution envelope (execution id, submission status, phase, queue position). Pass `wait_timeout_secs` to instead block until the execution finishes (or the wait budget runs out) and return the final status — add `include_logs` to also get every cell's logs in the same response. Submissions are idempotent: a key is auto-generated when omitted and echoed back as `idempotency_key` in the response and in timeout errors — resubmit with that key to reattach to the original run instead of starting a duplicate. Reusing a key after the code or environment changed fails with `idempotency_conflict` — use a new key. `branch_id` defaults to `main`.",
                 {
                     "type": "object",
                     "properties": {
                         "experiment_id": {"type": "string"},
                         "branch_id": {"type": "string", "default": "main"},
+                        "wait_timeout_secs": {"type": "integer", "minimum": 0},
+                        "poll_interval_ms": {"type": "integer", "default": 500},
+                        "include_logs": {"type": "boolean", "default": False},
+                        "tail_lines": {"type": "integer", "minimum": 0},
+                        "idempotency_key": {"type": "string"},
                     },
                     "required": ["experiment_id"],
                 },
             ),
             _tool(
                 "execute_cell",
-                "Execute one cell in a branch and return the accepted execution envelope, including execution id, submission status, phase, and queue position when available. `branch_id` defaults to `main` when omitted.",
+                "Execute one cell in a branch. By default returns the accepted execution envelope. Pass `wait_timeout_secs` to instead block until the execution finishes (or the wait budget runs out) and return the final status — add `include_logs` to also get logs in the same response. Submissions are idempotent: a key is auto-generated when omitted and echoed back as `idempotency_key` — resubmit with that key to reattach to the original run instead of starting a duplicate. Reusing a key after the code or environment changed fails with `idempotency_conflict` — use a new key. `branch_id` defaults to `main`.",
                 {
                     "type": "object",
                     "properties": {
                         "experiment_id": {"type": "string"},
                         "branch_id": {"type": "string", "default": "main"},
                         "cell_id": {"type": "string"},
+                        "wait_timeout_secs": {"type": "integer", "minimum": 0},
+                        "poll_interval_ms": {"type": "integer", "default": 500},
+                        "include_logs": {"type": "boolean", "default": False},
+                        "tail_lines": {"type": "integer", "minimum": 0},
+                        "idempotency_key": {"type": "string"},
                     },
                     "required": ["experiment_id", "cell_id"],
                 },
             ),
             _tool(
                 "execute_all_branches",
-                "Execute all branches in one experiment tree and return accepted execution envelopes for each submitted branch.",
+                "Execute all branches in one experiment tree. By default returns accepted execution envelopes for each submitted branch; pass `wait_timeout_secs` to instead wait for each execution (in order) and return final statuses, optionally with `include_logs`. NOTE: unlike execute_branch/execute_cell, this tool is NOT idempotent — it submits one coordinated isolated batch and takes no idempotency_key. If a call times out, the batch may already be running; check status (list the tree's executions) before resubmitting rather than blindly retrying, which would start a second batch.",
                 {
                     "type": "object",
-                    "properties": {"experiment_id": {"type": "string"}},
+                    "properties": {
+                        "experiment_id": {"type": "string"},
+                        "wait_timeout_secs": {"type": "integer", "minimum": 0},
+                        "poll_interval_ms": {"type": "integer", "default": 500},
+                        "include_logs": {"type": "boolean", "default": False},
+                        "tail_lines": {"type": "integer", "minimum": 0},
+                    },
+                    "required": ["experiment_id"],
+                },
+            ),
+            _tool(
+                "plan_branch",
+                "Dry-run a branch execution against the current cache: returns per-cell `action` (run | cache_hit) and `reason` (cached, cache_disabled, upstream_will_run, no_prior_run, code_changed, inputs_or_environment_changed) plus a summary, without executing anything. Use it to estimate cost before a long run or to debug why a cell is not cache-hitting. `branch_id` defaults to `main`.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "experiment_id": {"type": "string"},
+                        "branch_id": {"type": "string", "default": "main"},
+                    },
                     "required": ["experiment_id"],
                 },
             ),
@@ -400,7 +440,7 @@ class McpServer:
             ),
             _tool(
                 "wait_for_execution",
-                "Wait for an execution to reach a terminal lifecycle state by polling the status API. `wait_timeout_secs` bounds how long the tool waits before returning the latest status with `terminal=false` and `wait_exhausted=true`. `timeout_secs` is accepted as a legacy alias.",
+                "Wait for an execution to reach a terminal lifecycle state by polling the status API. `wait_timeout_secs` bounds how long the tool waits before returning the latest status with `terminal=false` and `wait_exhausted=true` (call again to keep waiting). Pass `include_logs` to attach every cell's logs to the response — on exhausted waits this doubles as a progress snapshot of live output so far. `timeout_secs` is accepted as a legacy alias.",
                 {
                     "type": "object",
                     "properties": {
@@ -408,13 +448,28 @@ class McpServer:
                         "wait_timeout_secs": {"type": "integer", "default": 30, "minimum": 0},
                         "timeout_secs": {"type": "integer", "minimum": 0},
                         "poll_interval_ms": {"type": "integer", "default": 500},
+                        "include_logs": {"type": "boolean", "default": False},
+                        "tail_lines": {"type": "integer", "minimum": 0},
+                    },
+                    "required": ["execution_id"],
+                },
+            ),
+            _tool(
+                "results",
+                "Get an execution's status plus every cell's logs in one call (instead of one `logs` call per cell). Works mid-run too: live output streamed so far is included. Large inline display payloads (e.g. base64 plots) are replaced with placeholders unless `include_outputs` is true.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "execution_id": {"type": "string"},
+                        "tail_lines": {"type": "integer", "minimum": 0},
+                        "include_outputs": {"type": "boolean", "default": False},
                     },
                     "required": ["execution_id"],
                 },
             ),
             _tool(
                 "logs",
-                "Get logs for one cell in one experiment tree branch. `branch_id` defaults to `main` when omitted. When `tail_lines` is provided, the MCP adapter returns only the last N lines of `stdout` and `stderr` plus truncation metadata so agents can make an extra call for the full log when needed.",
+                "Get logs for one cell in one experiment tree branch. `branch_id` defaults to `main` when omitted. When `tail_lines` is provided, the MCP adapter returns only the last N lines of `stdout` and `stderr` plus truncation metadata so agents can make an extra call for the full log when needed. Large inline display payloads are replaced with placeholders unless `include_outputs` is true.",
                 {
                     "type": "object",
                     "properties": {
@@ -422,6 +477,7 @@ class McpServer:
                         "branch_id": {"type": "string", "default": "main"},
                         "cell_id": {"type": "string"},
                         "tail_lines": {"type": "integer", "minimum": 0},
+                        "include_outputs": {"type": "boolean", "default": False},
                     },
                     "required": ["experiment_id", "cell_id"],
                 },
@@ -467,6 +523,9 @@ class McpServer:
     def call_tool(self, name: str, args: dict[str, Any]) -> ToolResult:
         try:
             if name == "list_experiment_trees":
+                project_id = _optional_string(args, "project_id")
+                if project_id:
+                    return self._ok(self.api.list_experiments(project_id))
                 return self._ok(self.api.list_experiment_trees())
             if name == "create_experiment":
                 has_root_authoring = _has_root_cell_authoring_args(args)
@@ -487,13 +546,18 @@ class McpServer:
                 definition = _required_object(args, "definition")
                 return self._ok(_experiment_payload(self.api.save_experiment_tree(definition)))
             if name == "get_experiment":
-                return self._ok(
-                    _experiment_payload(
-                        self.api.get_experiment_tree(
-                            _required_string(args, "experiment_id")
-                        )
-                    )
+                payload = _experiment_payload(
+                    self.api.get_experiment_tree(_required_string(args, "experiment_id"))
                 )
+                if args.get("include_cell_sources") is False:
+                    experiment = payload.get("experiment")
+                    if isinstance(experiment, dict):
+                        for cell in experiment.get("cells") or []:
+                            code = cell.get("code")
+                            if isinstance(code, dict):
+                                code["source"] = ""
+                        payload["cell_sources_omitted"] = True
+                return self._ok(payload)
             if name == "get_experiment_summary":
                 return self._ok(
                     _experiment_summary(
@@ -504,44 +568,69 @@ class McpServer:
                 )
             if name == "rename_experiment":
                 experiment_id = _required_string(args, "experiment_id")
-                self.api.rename_experiment_tree(
-                    experiment_id,
-                    _required_string(args, "name"),
+                new_name = _required_string(args, "name")
+                self.api.rename_experiment_tree(experiment_id, new_name)
+                return self._ok(
+                    {
+                        "experiment_id": experiment_id,
+                        "name": new_name,
+                        "message": f"Experiment {experiment_id} renamed",
+                    }
                 )
-                return self._text_ok(f"Experiment {experiment_id} renamed")
             if name == "delete_experiment":
                 experiment_id = _required_string(args, "experiment_id")
                 self.api.delete_experiment_tree(experiment_id)
-                return self._text_ok(f"Experiment {experiment_id} deleted")
+                return self._ok(
+                    {
+                        "experiment_id": experiment_id,
+                        "message": f"Experiment {experiment_id} deleted",
+                    }
+                )
             if name == "create_branch":
                 experiment_id = _required_string(args, "experiment_id")
+                first_cell = _cell_payload(
+                    args,
+                    object_key="first_cell",
+                    experiment_id=experiment_id,
+                )
                 branch_id = self.api.create_branch_in_experiment_tree(
                     experiment_id,
                     _required_string(args, "parent_branch_id"),
                     _required_string(args, "name"),
                     _required_string(args, "branch_point_cell_id"),
-                    _cell_payload(
-                        args,
-                        object_key="first_cell",
-                        experiment_id=experiment_id,
-                    ),
+                    first_cell,
                 )
-                return self._text_ok(f"Branch created: {branch_id}")
+                return self._ok(
+                    {
+                        "branch_id": branch_id,
+                        "first_cell_id": first_cell.get("id"),
+                        "experiment_id": experiment_id,
+                        "message": f"Branch created: {branch_id}",
+                    }
+                )
             if name == "add_cell":
                 experiment_id = _required_string(args, "experiment_id")
                 branch_id = _optional_string(args, "branch_id") or "main"
+                cell = _cell_payload(
+                    args,
+                    object_key="cell",
+                    experiment_id=experiment_id,
+                    branch_id=branch_id,
+                )
                 self.api.add_cell_to_experiment_tree_branch(
                     experiment_id,
                     branch_id,
-                    _cell_payload(
-                        args,
-                        object_key="cell",
-                        experiment_id=experiment_id,
-                        branch_id=branch_id,
-                    ),
+                    cell,
                     _optional_string(args, "after_cell_id"),
                 )
-                return self._text_ok(f"Cell added to branch {branch_id}")
+                return self._ok(
+                    {
+                        "cell_id": cell.get("id"),
+                        "branch_id": branch_id,
+                        "experiment_id": experiment_id,
+                        "message": f"Cell {cell.get('id')} added to branch {branch_id}",
+                    }
+                )
             if name == "update_cell":
                 experiment_id = _required_string(args, "experiment_id")
                 branch_id = _optional_string(args, "branch_id") or "main"
@@ -552,21 +641,33 @@ class McpServer:
                     cell_id,
                     _required_string(args, "source"),
                 )
-                return self._text_ok(f"Cell {cell_id} updated in branch {branch_id}")
+                return self._ok(
+                    {
+                        "cell_id": cell_id,
+                        "branch_id": branch_id,
+                        "message": f"Cell {cell_id} updated in branch {branch_id}",
+                    }
+                )
             if name == "move_cell":
                 experiment_id = _required_string(args, "experiment_id")
                 branch_id = _optional_string(args, "branch_id") or "main"
                 cell_id = _required_string(args, "cell_id")
                 direction = _required_string(args, "direction")
                 if direction not in {"up", "down"}:
-                    raise RuntimeError("invalid field 'direction': expected 'up' or 'down'")
+                    raise McpValidationError("invalid field 'direction': expected 'up' or 'down'")
                 self.api.move_cell_in_experiment_tree_branch(
                     experiment_id,
                     branch_id,
                     cell_id,
                     direction,
                 )
-                return self._text_ok(f"Cell {cell_id} moved {direction} in branch {branch_id}")
+                return self._ok(
+                    {
+                        "cell_id": cell_id,
+                        "branch_id": branch_id,
+                        "message": f"Cell {cell_id} moved {direction} in branch {branch_id}",
+                    }
+                )
             if name == "delete_cell":
                 experiment_id = _required_string(args, "experiment_id")
                 branch_id = _optional_string(args, "branch_id") or "main"
@@ -576,12 +677,24 @@ class McpServer:
                     branch_id,
                     cell_id,
                 )
-                return self._text_ok(f"Cell {cell_id} deleted from branch {branch_id}")
+                return self._ok(
+                    {
+                        "cell_id": cell_id,
+                        "branch_id": branch_id,
+                        "message": f"Cell {cell_id} deleted from branch {branch_id}",
+                    }
+                )
             if name == "delete_branch":
                 experiment_id = _required_string(args, "experiment_id")
                 branch_id = _required_string(args, "branch_id")
                 self.api.delete_experiment_tree_branch(experiment_id, branch_id)
-                return self._text_ok(f"Branch {branch_id} deleted")
+                return self._ok(
+                    {
+                        "branch_id": branch_id,
+                        "experiment_id": experiment_id,
+                        "message": f"Branch {branch_id} deleted",
+                    }
+                )
             if name == "inspect_cell":
                 experiment_id = _required_string(args, "experiment_id")
                 branch_id = _optional_string(args, "branch_id") or "main"
@@ -601,31 +714,76 @@ class McpServer:
             if name == "restart_kernel":
                 experiment_id = _required_string(args, "experiment_id")
                 self.api.restart_experiment_tree_kernel(experiment_id)
-                return self._text_ok(f"Kernel restart requested for experiment {experiment_id}")
+                return self._ok(
+                    {
+                        "experiment_id": experiment_id,
+                        "message": f"Kernel restart requested for experiment {experiment_id}",
+                    }
+                )
             if name == "execute_branch":
                 experiment_id = _required_string(args, "experiment_id")
                 branch_id = _optional_string(args, "branch_id") or "main"
-                execution = self.api.execute_branch_in_experiment_tree(
-                    experiment_id, branch_id
+                idempotency_key = (
+                    _optional_string(args, "idempotency_key")
+                    or _generate_idempotency_key()
                 )
-                return self._ok(execution)
+                execution = self._submit_with_idempotency(
+                    lambda: self.api.execute_branch_in_experiment_tree(
+                        experiment_id,
+                        branch_id,
+                        idempotency_key=idempotency_key,
+                    ),
+                    idempotency_key,
+                )
+                return self._maybe_await_submission(execution, args)
             if name == "execute_cell":
                 experiment_id = _required_string(args, "experiment_id")
                 branch_id = _optional_string(args, "branch_id") or "main"
                 cell_id = _required_string(args, "cell_id")
-                execution = self.api.execute_cell_in_experiment_tree_branch(
-                    experiment_id, branch_id, cell_id
+                idempotency_key = (
+                    _optional_string(args, "idempotency_key")
+                    or _generate_idempotency_key()
                 )
-                return self._ok(execution)
+                execution = self._submit_with_idempotency(
+                    lambda: self.api.execute_cell_in_experiment_tree_branch(
+                        experiment_id,
+                        branch_id,
+                        cell_id,
+                        idempotency_key=idempotency_key,
+                    ),
+                    idempotency_key,
+                )
+                return self._maybe_await_submission(execution, args)
             if name == "execute_all_branches":
                 experiment_id = _required_string(args, "experiment_id")
                 executions = self.api.execute_all_branches_in_experiment_tree(experiment_id)
-                return self._ok(executions)
+                wait_timeout_secs = _optional_int(args, "wait_timeout_secs")
+                if wait_timeout_secs is None:
+                    return self._ok(executions)
+                results = []
+                for execution in executions:
+                    execution_id = str(execution.get("execution_id") or "")
+                    if not execution_id:
+                        results.append(execution)
+                        continue
+                    payload = self._await_execution(
+                        execution_id,
+                        wait_timeout_secs=wait_timeout_secs,
+                        poll_interval_ms=_optional_int(args, "poll_interval_ms") or 500,
+                        include_logs=bool(args.get("include_logs")),
+                        tail_lines=_optional_non_negative_int(args, "tail_lines"),
+                    )
+                    payload["target"] = execution.get("target")
+                    results.append(payload)
+                return self._ok(results)
             if name == "cancel":
                 execution_id = _required_string(args, "execution_id")
                 self.api.cancel(execution_id)
-                return self._text_ok(
-                    f"Cancellation requested for execution {execution_id}"
+                return self._ok(
+                    {
+                        "execution_id": execution_id,
+                        "message": f"Cancellation requested for execution {execution_id}",
+                    }
                 )
             if name == "status":
                 return self._ok(self.api.status(_required_string(args, "execution_id")))
@@ -633,73 +791,44 @@ class McpServer:
                 execution_id = _required_string(args, "execution_id")
                 wait_timeout_secs = _optional_int(args, "wait_timeout_secs")
                 legacy_timeout_secs = _optional_int(args, "timeout_secs")
-                poll_interval_ms = _optional_int(args, "poll_interval_ms")
                 if wait_timeout_secs is None:
                     wait_timeout_secs = 30 if legacy_timeout_secs is None else legacy_timeout_secs
-                if wait_timeout_secs < 0:
-                    raise RuntimeError("invalid field 'wait_timeout_secs': expected a non-negative integer")
-                poll_interval_ms = 500 if poll_interval_ms is None else poll_interval_ms
-                deadline = time.monotonic() + wait_timeout_secs
-
-                def _is_terminal_execution_status(status: dict[str, Any]) -> bool:
-                    lifecycle = str(status.get("status") or "").strip().lower()
-                    if lifecycle in {"completed", "failed", "cancelled", "timed_out", "rejected"}:
-                        return True
-                    return status.get("finished_at") is not None
-
-                def _wait_result(status: dict[str, Any], *, terminal: bool, wait_exhausted: bool) -> dict[str, Any]:
-                    payload = dict(status)
-                    payload["terminal"] = terminal
-                    payload["wait_exhausted"] = wait_exhausted
-                    summary, suggested_next_action = _execution_summary(payload)
-                    payload["summary"] = summary
-                    payload["suggested_next_action"] = suggested_next_action
-                    return payload
-
-                def _transition_snapshot(status: dict[str, Any]) -> dict[str, Any]:
-                    queue = status.get("queue") if isinstance(status.get("queue"), dict) else {}
-                    return {
-                        "observed_at": time.time(),
-                        "status": status.get("status"),
-                        "phase": status.get("phase"),
-                        "queue_position": status.get("queue_position"),
-                        "queued_reason": queue.get("queued_reason"),
-                    }
-
-                observed_transitions: list[dict[str, Any]] = []
-                last_signature: tuple[Any, Any, Any, Any] | None = None
-
-                while True:
-                    status = self.api.status(execution_id)
-                    queue = status.get("queue") if isinstance(status.get("queue"), dict) else {}
-                    signature = (
-                        status.get("status"),
-                        status.get("phase"),
-                        status.get("queue_position"),
-                        queue.get("queued_reason"),
-                    )
-                    if signature != last_signature:
-                        observed_transitions.append(_transition_snapshot(status))
-                        last_signature = signature
-                    if _is_terminal_execution_status(status):
-                        payload = _wait_result(status, terminal=True, wait_exhausted=False)
-                        payload["observed_transitions"] = observed_transitions
-                        return self._ok(payload)
-                    if time.monotonic() >= deadline:
-                        payload = _wait_result(status, terminal=False, wait_exhausted=True)
-                        payload["observed_transitions"] = observed_transitions
-                        return self._ok(payload)
-                    time.sleep(max(poll_interval_ms, 50) / 1000)
-            if name == "logs":
                 return self._ok(
-                    _slice_logs(
-                        self.api.logs_for_tree_cell(
-                            _required_string(args, "experiment_id"),
-                            _optional_string(args, "branch_id") or "main",
-                            _required_string(args, "cell_id"),
-                        ),
+                    self._await_execution(
+                        execution_id,
+                        wait_timeout_secs=wait_timeout_secs,
+                        poll_interval_ms=_optional_int(args, "poll_interval_ms") or 500,
+                        include_logs=bool(args.get("include_logs")),
                         tail_lines=_optional_non_negative_int(args, "tail_lines"),
                     )
+                )
+            if name == "results":
+                execution_id = _required_string(args, "execution_id")
+                results = self.api.execution_results(execution_id)
+                results["node_logs"] = _shape_node_logs(
+                    results.get("node_logs"),
+                    tail_lines=_optional_non_negative_int(args, "tail_lines"),
+                    include_outputs=bool(args.get("include_outputs")),
+                )
+                return self._ok(results)
+            if name == "plan_branch":
+                return self._ok(
+                    self.api.plan_branch_in_experiment_tree(
+                        _required_string(args, "experiment_id"),
+                        _optional_string(args, "branch_id") or "main",
+                    )
+                )
+            if name == "logs":
+                logs = _slice_logs(
+                    self.api.logs_for_tree_cell(
+                        _required_string(args, "experiment_id"),
+                        _optional_string(args, "branch_id") or "main",
+                        _required_string(args, "cell_id"),
+                    ),
+                    tail_lines=_optional_non_negative_int(args, "tail_lines"),
+                )
+                return self._ok(
+                    _cap_outputs(logs, include_outputs=bool(args.get("include_outputs")))
                 )
             if name == "create_project":
                 project_id = self.api.create_project(
@@ -707,7 +836,12 @@ class McpServer:
                     _required_string(args, "workspace_dir"),
                     _optional_string(args, "description"),
                 )
-                return self._text_ok(f"Project created: {project_id}")
+                return self._ok(
+                    {
+                        "project_id": project_id,
+                        "message": f"Project created: {project_id}",
+                    }
+                )
             if name == "list_projects":
                 return self._ok(self.api.list_projects())
             if name == "get_project":
@@ -718,10 +852,169 @@ class McpServer:
                 )
             raise RuntimeError(f"unknown tool: {name}")
         except Exception as exc:
+            # Structured error envelope: a stable `code` to branch on plus a
+            # suggested recovery action, instead of bare prose.
+            code = str(getattr(exc, "code", "") or "internal")
+            error_payload: dict[str, Any] = {"code": code, "message": str(exc)}
+            # Execute submissions stamp their idempotency key onto the
+            # exception: echo it so the agent can retry with the same key
+            # and reattach instead of double-running.
+            retry_key = getattr(exc, "idempotency_key", None)
+            if retry_key:
+                error_payload["idempotency_key"] = str(retry_key)
+            next_action = _error_next_action(code)
+            if next_action:
+                error_payload["suggested_next_action"] = next_action
             return ToolResult(
-                content=[{"type": "text", "text": str(exc)}],
+                content=[
+                    {"type": "text", "text": json.dumps({"error": error_payload}, indent=2)}
+                ],
                 is_error=True,
             )
+
+    def _submit_with_idempotency(
+        self,
+        submit: Any,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Run an execute submission, stamping its idempotency key onto both
+        the success envelope and any raised error: a caller that times out
+        mid-submission needs the key to retry and reattach to the original
+        run instead of starting a duplicate."""
+        try:
+            execution = submit()
+        except Exception as exc:
+            exc.idempotency_key = idempotency_key
+            raise
+        if isinstance(execution, dict):
+            execution.setdefault("idempotency_key", idempotency_key)
+        return execution
+
+    def _maybe_await_submission(
+        self,
+        execution: dict[str, Any],
+        args: dict[str, Any],
+    ) -> ToolResult:
+        """Return the submission envelope, or — when `wait_timeout_secs` was
+        provided — block until the execution is terminal (or the wait budget
+        runs out) and return the final status instead."""
+        wait_timeout_secs = _optional_int(args, "wait_timeout_secs")
+        if wait_timeout_secs is None:
+            return self._ok(execution)
+        execution_id = str(execution.get("execution_id") or "")
+        if not execution_id:
+            return self._ok(execution)
+        payload = self._await_execution(
+            execution_id,
+            wait_timeout_secs=wait_timeout_secs,
+            poll_interval_ms=_optional_int(args, "poll_interval_ms") or 500,
+            include_logs=bool(args.get("include_logs")),
+            tail_lines=_optional_non_negative_int(args, "tail_lines"),
+        )
+        idempotency_key = execution.get("idempotency_key")
+        if idempotency_key:
+            payload.setdefault("idempotency_key", idempotency_key)
+        return self._ok(payload)
+
+    def _await_execution(
+        self,
+        execution_id: str,
+        *,
+        wait_timeout_secs: int,
+        poll_interval_ms: int,
+        include_logs: bool = False,
+        tail_lines: int | None = None,
+    ) -> dict[str, Any]:
+        if wait_timeout_secs < 0:
+            raise McpValidationError(
+                "invalid field 'wait_timeout_secs': expected a non-negative integer"
+            )
+        deadline = time.monotonic() + wait_timeout_secs
+
+        def _is_terminal_execution_status(status: dict[str, Any]) -> bool:
+            lifecycle = str(status.get("status") or "").strip().lower()
+            if lifecycle in {"completed", "failed", "cancelled", "timed_out", "rejected"}:
+                return True
+            return status.get("finished_at") is not None
+
+        def _wait_result(
+            status: dict[str, Any], *, terminal: bool, wait_exhausted: bool
+        ) -> dict[str, Any]:
+            payload = dict(status)
+            payload["terminal"] = terminal
+            payload["wait_exhausted"] = wait_exhausted
+            summary, suggested_next_action = _execution_summary(payload)
+            payload["summary"] = summary
+            payload["suggested_next_action"] = suggested_next_action
+            return payload
+
+        def _transition_snapshot(status: dict[str, Any]) -> dict[str, Any]:
+            queue = status.get("queue") if isinstance(status.get("queue"), dict) else {}
+            return {
+                "observed_at": time.time(),
+                "status": status.get("status"),
+                "phase": status.get("phase"),
+                "queue_position": status.get("queue_position"),
+                "queued_reason": queue.get("queued_reason"),
+            }
+
+        observed_transitions: list[dict[str, Any]] = []
+        last_signature: tuple[Any, Any, Any, Any] | None = None
+
+        while True:
+            status = self.api.status(execution_id)
+            queue = status.get("queue") if isinstance(status.get("queue"), dict) else {}
+            signature = (
+                status.get("status"),
+                status.get("phase"),
+                status.get("queue_position"),
+                queue.get("queued_reason"),
+            )
+            if signature != last_signature:
+                observed_transitions.append(_transition_snapshot(status))
+                last_signature = signature
+            terminal = _is_terminal_execution_status(status)
+            exhausted = time.monotonic() >= deadline
+            if terminal or exhausted:
+                payload = _wait_result(
+                    status, terminal=terminal, wait_exhausted=not terminal
+                )
+                payload["observed_transitions"] = observed_transitions
+                if include_logs:
+                    # On terminal returns these are the final logs; on
+                    # exhausted returns they double as a progress snapshot
+                    # (live streaming chunks are folded in server-side).
+                    # A retrieval failure must not fail the whole wait
+                    # result, but it also must be distinguishable from
+                    # "the execution produced no logs".
+                    try:
+                        payload["node_logs"] = self._node_logs_snapshot(
+                            execution_id, tail_lines=tail_lines
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        payload["node_logs"] = {}
+                        payload["logs_error"] = {
+                            "code": str(getattr(exc, "code", "") or "internal"),
+                            "message": str(exc),
+                            "suggested_next_action": (
+                                "Log retrieval failed; the wait result itself "
+                                "is valid. Call the results tool with this "
+                                "execution_id to fetch the logs."
+                            ),
+                        }
+                return payload
+            time.sleep(max(poll_interval_ms, 50) / 1000)
+
+    def _node_logs_snapshot(
+        self,
+        execution_id: str,
+        *,
+        tail_lines: int | None,
+    ) -> dict[str, Any]:
+        results = self.api.execution_results(execution_id)
+        return _shape_node_logs(
+            results.get("node_logs"), tail_lines=tail_lines, include_outputs=False
+        )
 
     @staticmethod
     def _ok(payload: Any) -> ToolResult:
@@ -1102,11 +1395,11 @@ def _required_string(payload: dict[str, Any], key: str) -> str:
         raise RuntimeError(f"missing required field '{key}': expected a non-empty string")
     value = payload.get(key)
     if not isinstance(value, str):
-        raise RuntimeError(
+        raise McpValidationError(
             f"invalid field '{key}': expected a string, got {_value_kind(value)}"
         )
     if not value:
-        raise RuntimeError(f"invalid field '{key}': expected a non-empty string")
+        raise McpValidationError(f"invalid field '{key}': expected a non-empty string")
     return value
 
 
@@ -1115,11 +1408,11 @@ def _optional_string(payload: dict[str, Any], key: str) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise RuntimeError(
+        raise McpValidationError(
             f"invalid field '{key}': expected a string when provided, got {_value_kind(value)}"
         )
     if not value:
-        raise RuntimeError(
+        raise McpValidationError(
             f"invalid field '{key}': expected a non-empty string when provided"
         )
     return value
@@ -1130,11 +1423,11 @@ def _optional_non_negative_int(payload: dict[str, Any], key: str) -> int | None:
     if value is None:
         return None
     if not isinstance(value, int) or isinstance(value, bool):
-        raise RuntimeError(
+        raise McpValidationError(
             f"invalid field '{key}': expected a non-negative integer when provided, got {_value_kind(value)}"
         )
     if value < 0:
-        raise RuntimeError(
+        raise McpValidationError(
             f"invalid field '{key}': expected a non-negative integer when provided"
         )
     return value
@@ -1145,7 +1438,7 @@ def _required_object(payload: dict[str, Any], key: str) -> dict[str, Any]:
         raise RuntimeError(f"missing required field '{key}': expected an object")
     value = payload.get(key)
     if not isinstance(value, dict):
-        raise RuntimeError(
+        raise McpValidationError(
             f"invalid field '{key}': expected an object, got {_value_kind(value)}"
         )
     return value
@@ -1156,13 +1449,13 @@ def _optional_string_list(payload: dict[str, Any], key: str) -> list[str]:
     if value is None:
         return []
     if not isinstance(value, list):
-        raise RuntimeError(
+        raise McpValidationError(
             f"invalid field '{key}': expected an array of strings, got {_value_kind(value)}"
         )
     result: list[str] = []
     for index, item in enumerate(value):
         if not isinstance(item, str):
-            raise RuntimeError(
+            raise McpValidationError(
                 f"invalid field '{key}[{index}]': expected a string, got {_value_kind(item)}"
             )
         result.append(item)
@@ -1214,6 +1507,96 @@ def _slice_logs(logs: dict[str, Any], *, tail_lines: int | None) -> dict[str, An
     return payload
 
 
+# Inline display payloads (e.g. base64 PNGs) larger than this are replaced
+# with a placeholder unless the caller passes `include_outputs=true` — a
+# single plot can otherwise dwarf an agent's whole context window.
+_OUTPUT_INLINE_CAP_BYTES = 8192
+
+
+def _cap_outputs(logs: dict[str, Any], *, include_outputs: bool) -> dict[str, Any]:
+    if include_outputs:
+        return logs
+    outputs = logs.get("outputs")
+    if not isinstance(outputs, list):
+        return logs
+    capped_outputs: list[Any] = []
+    truncated = False
+    for output in outputs:
+        if not isinstance(output, dict) or not isinstance(output.get("data"), dict):
+            capped_outputs.append(output)
+            continue
+        data: dict[str, Any] = {}
+        for mime, value in output["data"].items():
+            if isinstance(value, str) and len(value) > _OUTPUT_INLINE_CAP_BYTES:
+                data[mime] = (
+                    f"<{len(value)} bytes omitted ({mime}); "
+                    "pass include_outputs=true to fetch inline>"
+                )
+                truncated = True
+            else:
+                data[mime] = value
+        capped_outputs.append({**output, "data": data})
+    payload = dict(logs)
+    payload["outputs"] = capped_outputs
+    if truncated:
+        payload["outputs_truncated"] = True
+    return payload
+
+
+def _shape_node_logs(
+    node_logs: Any,
+    *,
+    tail_lines: int | None,
+    include_outputs: bool,
+) -> dict[str, Any]:
+    if not isinstance(node_logs, dict):
+        return {}
+    return {
+        str(node_id): _cap_outputs(
+            _slice_logs(logs, tail_lines=tail_lines),
+            include_outputs=include_outputs,
+        )
+        for node_id, logs in node_logs.items()
+        if isinstance(logs, dict)
+    }
+
+
+def _generate_idempotency_key() -> str:
+    """Execute submissions are idempotent by default: when the caller omits
+    a key, the adapter generates one and echoes it in the response (and in
+    error envelopes) so a timed-out submission can always be retried safely."""
+    return f"mcp-{uuid.uuid4()}"
+
+
+def _error_next_action(code: str) -> str | None:
+    return {
+        "not_found": (
+            "Check the ids you passed: list_experiment_trees for experiment ids, "
+            "get_experiment for branch and cell ids, and the execute response for "
+            "execution ids."
+        ),
+        "queue_full": "The execution queue is at capacity; wait briefly and resubmit.",
+        "kernel_unavailable": (
+            "The kernel is unavailable; call restart_kernel for this experiment, "
+            "then re-run."
+        ),
+        "validation": "Fix the offending request field and retry.",
+        "unreachable": (
+            "The Tine API server is not reachable; ask the user to start it "
+            "(`tine serve`) or check the --api-url this adapter was launched with."
+        ),
+        "timeout": (
+            "The server did not respond in time. For execute submissions, retry "
+            "with the same idempotency_key (echoed in this error) to reattach to "
+            "the original run instead of starting a duplicate."
+        ),
+        "environment_failed": (
+            "Environment preparation failed; inspect declared_dependencies via "
+            "get_experiment and fix or remove the offending package."
+        ),
+    }.get(code)
+
+
 def _execution_summary(status: dict[str, Any]) -> tuple[str, str]:
     lifecycle = str(status.get("status") or "").strip().lower()
     phase = str(status.get("phase") or "").strip().lower()
@@ -1261,7 +1644,7 @@ def _cell_payload(
     explicit = payload.get(object_key)
     if explicit is not None:
         if not isinstance(explicit, dict):
-            raise RuntimeError(
+            raise McpValidationError(
                 f"invalid field '{object_key}': expected an object, got {_value_kind(explicit)}"
             )
         return _normalized_cell_payload(
@@ -1276,7 +1659,7 @@ def _cell_payload(
     if source is None:
         source = ""
     if not isinstance(source, str):
-        raise RuntimeError(
+        raise McpValidationError(
             f"invalid field 'source': expected a string when provided, got {_value_kind(source)}"
         )
     return _normalized_cell_payload(
@@ -1352,7 +1735,7 @@ def _normalized_cell_payload(
     if code is None:
         code = {}
     if not isinstance(code, dict):
-        raise RuntimeError(
+        raise McpValidationError(
             f"invalid field 'code': expected an object when provided, got {_value_kind(code)}"
         )
 
@@ -1360,7 +1743,7 @@ def _normalized_cell_payload(
     if source is None:
         source = ""
     if not isinstance(source, str):
-        raise RuntimeError(
+        raise McpValidationError(
             f"invalid field 'source': expected a string when provided, got {_value_kind(source)}"
         )
 
@@ -1368,7 +1751,7 @@ def _normalized_cell_payload(
     if language is None:
         language = "python"
     if not isinstance(language, str) or not language:
-        raise RuntimeError(
+        raise McpValidationError(
             f"invalid field 'language': expected a non-empty string when provided, got {_value_kind(language)}"
         )
 
@@ -1382,7 +1765,7 @@ def _normalized_cell_payload(
 
     cache = cell.get("cache", True)
     if not isinstance(cache, bool):
-        raise RuntimeError(
+        raise McpValidationError(
             f"invalid field 'cache': expected a boolean when provided, got {_value_kind(cache)}"
         )
 
@@ -1393,13 +1776,13 @@ def _normalized_cell_payload(
             or isinstance(map_concurrency, bool)
             or map_concurrency < 0
         ):
-            raise RuntimeError(
+            raise McpValidationError(
                 "invalid field 'map_concurrency': expected a non-negative integer when provided"
             )
 
     map_over = cell.get("map_over")
     if map_over is not None and not isinstance(map_over, str):
-        raise RuntimeError(
+        raise McpValidationError(
             f"invalid field 'map_over': expected a string when provided, got {_value_kind(map_over)}"
         )
 
@@ -1409,7 +1792,7 @@ def _normalized_cell_payload(
     if not isinstance(tags, dict) or not all(
         isinstance(key, str) and isinstance(value, str) for key, value in tags.items()
     ):
-        raise RuntimeError(
+        raise McpValidationError(
             "invalid field 'tags': expected an object with string keys and string values"
         )
 
@@ -1435,7 +1818,7 @@ def _optional_int(payload: dict[str, Any], key: str) -> int | None:
     if value is None:
         return None
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise RuntimeError(
+        raise McpValidationError(
             f"invalid field '{key}': expected a non-negative integer, got {_value_kind(value)}"
         )
     return value

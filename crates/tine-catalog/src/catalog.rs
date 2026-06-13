@@ -214,16 +214,18 @@ impl DataCatalog {
     }
 
     /// Get the local file path for a loaded artifact (for injection into kernels).
-    /// Falls back to checking the artifact directory on disk if not in memory.
+    ///
+    /// Prefers the content-addressed copy in the artifact directory: registered
+    /// paths usually point at per-slot files that later executions overwrite in
+    /// place, so they are only trustworthy as a fallback when no immutable copy
+    /// exists.
     pub fn get_path(&self, key: &ArtifactKey) -> Option<PathBuf> {
-        // Check in-memory cache first
-        if let Some(a) = self.mmaps.get(key) {
-            return Some(a.path.clone());
-        }
-        // Fallback: check if the artifact file exists on disk
         let path = self.artifact_dir.join(key.as_str());
         if path.exists() {
             return Some(path);
+        }
+        if let Some(a) = self.mmaps.get(key) {
+            return Some(a.path.clone());
         }
         None
     }
@@ -231,6 +233,110 @@ impl DataCatalog {
     /// Get the local artifact directory.
     pub fn artifact_dir(&self) -> &std::path::Path {
         &self.artifact_dir
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use dashmap::DashMap;
+    use tine_core::{ArtifactKey, ArtifactMetadata, ArtifactStore, TineError, TineResult};
+
+    use super::DataCatalog;
+
+    struct MemoryStore {
+        data: DashMap<String, Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl ArtifactStore for MemoryStore {
+        async fn put(&self, key: &ArtifactKey, data: &[u8]) -> TineResult<[u8; 32]> {
+            self.data.insert(key.as_str().to_string(), data.to_vec());
+            Ok([0; 32])
+        }
+
+        async fn get(&self, key: &ArtifactKey) -> TineResult<Vec<u8>> {
+            self.data
+                .get(key.as_str())
+                .map(|entry| entry.clone())
+                .ok_or_else(|| TineError::ArtifactNotFound(key.clone()))
+        }
+
+        async fn delete(&self, key: &ArtifactKey) -> TineResult<()> {
+            self.data.remove(key.as_str());
+            Ok(())
+        }
+
+        async fn exists(&self, key: &ArtifactKey) -> TineResult<bool> {
+            Ok(self.data.contains_key(key.as_str()))
+        }
+
+        async fn metadata(&self, _key: &ArtifactKey) -> TineResult<ArtifactMetadata> {
+            Err(TineError::Internal("not implemented".to_string()))
+        }
+
+        async fn list(&self) -> TineResult<Vec<ArtifactKey>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn temp_catalog() -> (tempfile::TempDir, DataCatalog) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let catalog = DataCatalog::new(
+            Arc::new(MemoryStore {
+                data: DashMap::new(),
+            }),
+            tmp.path().join("artifacts"),
+        );
+        (tmp, catalog)
+    }
+
+    #[tokio::test]
+    async fn get_path_prefers_content_addressed_copy_over_registered_path() {
+        let (tmp, catalog) = temp_catalog();
+        let key = ArtifactKey::new("artifact-key");
+
+        // A per-slot file is registered for the key, then overwritten by a
+        // later execution — the registered path no longer holds this key's
+        // content.
+        let slot_path = tmp.path().join("tree-cell-out.pkl");
+        std::fs::write(&slot_path, b"original").unwrap();
+        catalog.store(&key, b"original").await.unwrap();
+        catalog
+            .register(key.clone(), slot_path.clone())
+            .await
+            .unwrap();
+        std::fs::write(&slot_path, b"overwritten-by-later-run").unwrap();
+
+        let path = catalog.get_path(&key).expect("path should resolve");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"original",
+            "get_path must resolve to the immutable content-addressed copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_path_falls_back_to_registered_path_without_stored_copy() {
+        let (tmp, catalog) = temp_catalog();
+        let key = ArtifactKey::new("registered-only");
+
+        let slot_path = tmp.path().join("registered-only.pkl");
+        std::fs::write(&slot_path, b"data").unwrap();
+        catalog
+            .register(key.clone(), slot_path.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(catalog.get_path(&key), Some(slot_path));
+    }
+
+    #[tokio::test]
+    async fn get_path_returns_none_for_unknown_key() {
+        let (_tmp, catalog) = temp_catalog();
+        assert_eq!(catalog.get_path(&ArtifactKey::new("missing")), None);
     }
 }
 

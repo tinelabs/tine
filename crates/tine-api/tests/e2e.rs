@@ -695,6 +695,184 @@ fn cached_two_cell_tree(
     tree
 }
 
+/// Two cached cells where the upstream declares two output slots; the
+/// downstream consumes one of them.
+fn multi_output_cached_tree(
+    tree_id: &str,
+    root_counter_path: &Path,
+    leaf_counter_path: &Path,
+) -> ExperimentTreeDef {
+    let mut tree = two_cell_tree();
+    let root_literal = serde_json::to_string(&root_counter_path.to_string_lossy().to_string())
+        .expect("failed to serialize root counter path");
+    let leaf_literal = serde_json::to_string(&leaf_counter_path.to_string_lossy().to_string())
+        .expect("failed to serialize leaf counter path");
+    tree.id = ExperimentTreeId::new(tree_id);
+    tree.name = tree_id.to_string();
+    for cell in &mut tree.cells {
+        cell.tree_id = tree.id.clone();
+        cell.cache = true;
+    }
+    tree.cells[0].declared_outputs = vec![SlotName::new("left"), SlotName::new("right")];
+    tree.cells[0].code.source = format!(
+        "from pathlib import Path\n_root_counter_path = Path({root_literal})\nroot_count = int(_root_counter_path.read_text()) if _root_counter_path.exists() else 0\nroot_count += 1\n_root_counter_path.write_text(str(root_count))\nleft = 1\nright = 2\nprint(left, right, flush=True)\n"
+    );
+    tree.cells[1].declared_outputs = vec![SlotName::new("out")];
+    tree.cells[1].code.source = format!(
+        "from pathlib import Path\n_leaf_counter_path = Path({leaf_literal})\nleaf_count = int(_leaf_counter_path.read_text()) if _leaf_counter_path.exists() else 0\nleaf_count += 1\n_leaf_counter_path.write_text(str(leaf_count))\nout = right + 1\nprint(out, flush=True)\n"
+    );
+    tree
+}
+
+/// step1 pins `val`, cached step2 derives `out`, uncached step3 writes the
+/// observed `out` to `result_path` so tests can see what was injected.
+fn pinned_value_tree(tree_id: &str, val: u64, result_path: &Path) -> ExperimentTreeDef {
+    let result_literal = serde_json::to_string(&result_path.to_string_lossy().to_string())
+        .expect("failed to serialize result path");
+    let tree_id = ExperimentTreeId::new(tree_id);
+    let branch_id = BranchId::new("main");
+    let make_cell =
+        |id: &str, code: String, upstream: Vec<CellId>, outputs: Vec<SlotName>| CellDef {
+            id: CellId::new(id),
+            tree_id: tree_id.clone(),
+            branch_id: branch_id.clone(),
+            name: id.to_string(),
+            code: NodeCode {
+                source: code,
+                language: "python".to_string(),
+            },
+            upstream_cell_ids: upstream,
+            declared_outputs: outputs,
+            cache: true,
+            map_over: None,
+            map_concurrency: None,
+            tags: HashMap::new(),
+            revision_id: None,
+            state: CellRuntimeState::Clean,
+        };
+    let mut step3 = make_cell(
+        "step3",
+        format!("from pathlib import Path\nPath({result_literal}).write_text(str(out))\n"),
+        vec![CellId::new("step2")],
+        vec![],
+    );
+    step3.cache = false;
+    ExperimentTreeDef {
+        id: tree_id.clone(),
+        name: tree_id.as_str().to_string(),
+        project_id: None,
+        root_branch_id: branch_id.clone(),
+        branches: vec![BranchDef {
+            id: branch_id.clone(),
+            name: "main".to_string(),
+            parent_branch_id: None,
+            branch_point_cell_id: None,
+            cell_order: vec![
+                CellId::new("step1"),
+                CellId::new("step2"),
+                CellId::new("step3"),
+            ],
+            display: HashMap::new(),
+        }],
+        cells: vec![
+            make_cell(
+                "step1",
+                format!("val = {val}\n"),
+                vec![],
+                vec![SlotName::new("val")],
+            ),
+            make_cell(
+                "step2",
+                "out = val * 2\n".to_string(),
+                vec![CellId::new("step1")],
+                vec![SlotName::new("out")],
+            ),
+            step3,
+        ],
+        environment: Default::default(),
+        execution_mode: ExecutionMode::Parallel,
+        budget: None,
+        created_at: chrono::Utc::now(),
+    }
+}
+
+/// A tree with two branches diverging after a shared prefix cell:
+/// main: [step1], branch_a: [a1], branch_b: [b1] (both branch from step1).
+fn two_branch_tree_with(
+    tree_id: &str,
+    step1_code: &str,
+    branch_a_code: &str,
+    branch_b_code: &str,
+) -> ExperimentTreeDef {
+    let tree_id = ExperimentTreeId::new(tree_id);
+    let main = BranchId::new("main");
+    let branch_a = BranchId::new("branch_a");
+    let branch_b = BranchId::new("branch_b");
+    let make_cell = |id: &str, branch: &BranchId, code: &str, outputs: Vec<SlotName>| CellDef {
+        id: CellId::new(id),
+        tree_id: tree_id.clone(),
+        branch_id: branch.clone(),
+        name: id.to_string(),
+        code: NodeCode {
+            source: code.to_string(),
+            language: "python".to_string(),
+        },
+        upstream_cell_ids: if id == "step1" {
+            vec![]
+        } else {
+            vec![CellId::new("step1")]
+        },
+        declared_outputs: outputs,
+        cache: false,
+        map_over: None,
+        map_concurrency: None,
+        tags: HashMap::new(),
+        revision_id: None,
+        state: CellRuntimeState::Clean,
+    };
+    ExperimentTreeDef {
+        id: tree_id.clone(),
+        name: tree_id.as_str().to_string(),
+        project_id: None,
+        root_branch_id: main.clone(),
+        branches: vec![
+            BranchDef {
+                id: main.clone(),
+                name: "main".to_string(),
+                parent_branch_id: None,
+                branch_point_cell_id: None,
+                cell_order: vec![CellId::new("step1")],
+                display: HashMap::new(),
+            },
+            BranchDef {
+                id: branch_a.clone(),
+                name: "branch_a".to_string(),
+                parent_branch_id: Some(main.clone()),
+                branch_point_cell_id: Some(CellId::new("step1")),
+                cell_order: vec![CellId::new("a1")],
+                display: HashMap::new(),
+            },
+            BranchDef {
+                id: branch_b.clone(),
+                name: "branch_b".to_string(),
+                parent_branch_id: Some(main.clone()),
+                branch_point_cell_id: Some(CellId::new("step1")),
+                cell_order: vec![CellId::new("b1")],
+                display: HashMap::new(),
+            },
+        ],
+        cells: vec![
+            make_cell("step1", &main, step1_code, vec![SlotName::new("step1")]),
+            make_cell("a1", &branch_a, branch_a_code, vec![SlotName::new("a1")]),
+            make_cell("b1", &branch_b, branch_b_code, vec![SlotName::new("b1")]),
+        ],
+        environment: Default::default(),
+        execution_mode: ExecutionMode::Parallel,
+        budget: None,
+        created_at: chrono::Utc::now(),
+    }
+}
+
 async fn execute_branch_and_wait(
     ws: &Workspace,
     tree_id: &ExperimentTreeId,
@@ -2173,7 +2351,7 @@ async fn test_branch_scoped_cell_routes_reject_membership_mismatch() {
         .await
         .unwrap_err();
     match err {
-        TineError::Internal(msg) => assert!(msg.contains("not found in branch")),
+        TineError::NotFound(msg) => assert!(msg.contains("not found in branch")),
         other => panic!("unexpected error: {other:?}"),
     }
 
@@ -2182,7 +2360,7 @@ async fn test_branch_scoped_cell_routes_reject_membership_mismatch() {
         .await
         .unwrap_err();
     match err {
-        TineError::Internal(msg) => assert!(msg.contains("not found in branch")),
+        TineError::NotFound(msg) => assert!(msg.contains("not found in branch")),
         other => panic!("unexpected error: {other:?}"),
     }
 }
@@ -3308,6 +3486,576 @@ async fn test_cache_corrupted_artifact_after_restart_does_not_report_cache_hit()
 
 #[tokio::test]
 #[serial]
+#[ignore]
+async fn test_cache_hit_with_multi_output_upstream() {
+    let (tmp, ws) = open_temp_workspace().await;
+    let root_counter_path = tmp.path().join("multi-output-root-counter.txt");
+    let leaf_counter_path = tmp.path().join("multi-output-leaf-counter.txt");
+    let tree = multi_output_cached_tree(
+        "multi-output-cache-tree",
+        &root_counter_path,
+        &leaf_counter_path,
+    );
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+    let branch_id = tree.root_branch_id.clone();
+
+    let status1 = execute_branch_and_wait(&ws, &tree_id, &branch_id).await;
+    assert_eq!(status1.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(read_counter(&root_counter_path), 1);
+    assert_eq!(read_counter(&leaf_counter_path), 1);
+
+    let status2 = execute_branch_and_wait(&ws, &tree_id, &branch_id).await;
+    assert_eq!(status2.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(read_counter(&root_counter_path), 1);
+    assert_eq!(
+        read_counter(&leaf_counter_path),
+        1,
+        "downstream of a multi-output upstream must cache-hit deterministically"
+    );
+    assert_eq!(
+        status2.node_statuses.get(&NodeId::new("step1")),
+        Some(&NodeStatus::CacheHit)
+    );
+    assert_eq!(
+        status2.node_statuses.get(&NodeId::new("step2")),
+        Some(&NodeStatus::CacheHit)
+    );
+}
+
+#[tokio::test]
+#[serial]
+#[ignore]
+async fn test_cache_injection_uses_entry_matching_inputs() {
+    let (tmp, ws) = open_temp_workspace().await;
+    let result_path = tmp.path().join("injection-result.txt");
+    let tree = pinned_value_tree("cache-injection-tree", 10, &result_path);
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+    let branch_id = tree.root_branch_id.clone();
+    let read_result = |path: &Path| fs::read_to_string(path).unwrap().trim().to_string();
+
+    let status1 = execute_branch_and_wait(&ws, &tree_id, &branch_id).await;
+    assert_eq!(status1.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(read_result(&result_path), "20");
+
+    // Re-key step2 under a different upstream value: same step2 source code,
+    // different inputs — the cache now holds two entries with the same code
+    // hash for step2.
+    ws.update_cell_code_in_experiment_tree(
+        &tree_id,
+        &CellId::new("step1"),
+        &pinned_value_tree("cache-injection-tree", 30, &result_path).cells[0]
+            .code
+            .source,
+    )
+    .await
+    .unwrap();
+    let status2 = execute_branch_and_wait(&ws, &tree_id, &branch_id).await;
+    assert_eq!(status2.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(read_result(&result_path), "60");
+
+    // Back to the original upstream: step2's cache hit must inject the
+    // artifact of the entry whose inputs match (out = 20), not whichever
+    // same-code entry happens to be found first (out = 60).
+    ws.update_cell_code_in_experiment_tree(
+        &tree_id,
+        &CellId::new("step1"),
+        &pinned_value_tree("cache-injection-tree", 10, &result_path).cells[0]
+            .code
+            .source,
+    )
+    .await
+    .unwrap();
+    let status3 = execute_branch_and_wait(&ws, &tree_id, &branch_id).await;
+    assert_eq!(status3.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(
+        status3.node_statuses.get(&NodeId::new("step2")),
+        Some(&NodeStatus::CacheHit)
+    );
+    assert_eq!(
+        read_result(&result_path),
+        "20",
+        "cache hit must inject the artifacts of the entry whose inputs match"
+    );
+}
+
+#[tokio::test]
+#[serial]
+#[ignore]
+async fn test_submitted_cell_execution_always_executes() {
+    let (tmp, ws) = open_temp_workspace().await;
+    let ws = Arc::new(ws);
+    let counter_path = tmp.path().join("submit-cell-counter.txt");
+    let tree = cached_single_cell_tree("submit-cell-tree", &counter_path, "v1");
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+    let branch_id = tree.root_branch_id.clone();
+
+    // A branch run caches step1.
+    let status1 = execute_branch_and_wait(ws.as_ref(), &tree_id, &branch_id).await;
+    assert_eq!(status1.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(read_counter(&counter_path), 1);
+
+    // Explicitly submitting the cell must run it — not replay the cache
+    // entry the branch run wrote (the single-cell plan has no input edges,
+    // so any cache key it computed would ignore upstream data).
+    let accepted = Workspace::submit_cell_execution_in_experiment_tree_branch(
+        ws.clone(),
+        &tree_id,
+        &branch_id,
+        &CellId::new("step1"),
+    )
+    .await
+    .expect("failed to submit cell execution");
+    let status2 = wait_for_execution_finished(ws.as_ref(), &accepted.execution_id).await;
+    assert_eq!(status2.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(
+        read_counter(&counter_path),
+        2,
+        "submitted cell execution must re-execute instead of cache-hitting"
+    );
+    assert_ne!(
+        status2.node_statuses.get(&NodeId::new("step1")),
+        Some(&NodeStatus::CacheHit)
+    );
+}
+
+/// Collect execution events relevant to the given execution ids until all of
+/// them have completed (or failed), preserving arrival order.
+async fn collect_events_until_finished(
+    mut rx: tokio::sync::broadcast::Receiver<ExecutionEvent>,
+    execution_ids: HashSet<String>,
+) -> Vec<ExecutionEvent> {
+    let collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        let mut finished = HashSet::new();
+        loop {
+            let event = match rx.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            };
+            let (exec_id, terminal) = match &event {
+                ExecutionEvent::ExecutionStarted { execution_id, .. }
+                | ExecutionEvent::NodeStarted { execution_id, .. }
+                | ExecutionEvent::NodeCompleted { execution_id, .. }
+                | ExecutionEvent::NodeCacheHit { execution_id, .. }
+                | ExecutionEvent::NodeFailed { execution_id, .. } => {
+                    (execution_id.as_str().to_string(), false)
+                }
+                ExecutionEvent::ExecutionCompleted { execution_id, .. }
+                | ExecutionEvent::ExecutionFailed { execution_id, .. } => {
+                    (execution_id.as_str().to_string(), true)
+                }
+                _ => continue,
+            };
+            if !execution_ids.contains(&exec_id) {
+                continue;
+            }
+            events.push(event);
+            if terminal {
+                finished.insert(exec_id);
+            }
+            if finished == execution_ids {
+                break;
+            }
+        }
+        events
+    });
+    timeout(Duration::from_secs(300), collector)
+        .await
+        .expect("timed out collecting execution events")
+        .expect("event collector panicked")
+}
+
+fn event_execution_id(event: &ExecutionEvent) -> Option<&str> {
+    match event {
+        ExecutionEvent::ExecutionStarted { execution_id, .. }
+        | ExecutionEvent::NodeStarted { execution_id, .. }
+        | ExecutionEvent::NodeCompleted { execution_id, .. }
+        | ExecutionEvent::NodeCacheHit { execution_id, .. }
+        | ExecutionEvent::NodeFailed { execution_id, .. }
+        | ExecutionEvent::ExecutionCompleted { execution_id, .. }
+        | ExecutionEvent::ExecutionFailed { execution_id, .. } => Some(execution_id.as_str()),
+        _ => None,
+    }
+}
+
+/// Rich outputs (execute_result, display_data, inline plots) must survive the
+/// whole pipeline: kernel iopub capture (parent-header-correlated), the
+/// scheduler outcome, finalization, and the logs read path. Regression for
+/// two bugs: uncorrelated iopub reads desyncing result attribution, and the
+/// event bridge terminalizing rows before the finalizer landed the outputs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_rich_outputs_reach_cell_logs() {
+    let (_tmp, ws) = open_temp_workspace().await;
+    let mut tree = trivial_tree();
+    tree.id = ExperimentTreeId::new("rich-outputs-tree");
+    tree.name = "rich-outputs-tree".to_string();
+    tree.cells[0].tree_id = tree.id.clone();
+    tree.cells[0].code.source = "1 + 1".to_string();
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+    let branch_id = tree.root_branch_id.clone();
+    let cell_id = CellId::new("step1");
+
+    async fn run_and_fetch_logs(
+        ws: &Workspace,
+        tree_id: &ExperimentTreeId,
+        branch_id: &BranchId,
+        cell_id: &CellId,
+        source: &str,
+    ) -> tine_core::NodeLogs {
+        ws.update_cell_code_in_experiment_tree_branch(tree_id, branch_id, cell_id, source)
+            .await
+            .unwrap();
+        let status = execute_branch_and_wait(ws, tree_id, branch_id).await;
+        assert_eq!(status.status, ExecutionLifecycleStatus::Completed);
+        ws.logs_for_tree_cell(tree_id, branch_id, cell_id)
+            .await
+            .unwrap()
+    }
+
+    let logs = run_and_fetch_logs(&ws, &tree_id, &branch_id, &cell_id, "1 + 1").await;
+    assert!(
+        logs.outputs
+            .iter()
+            .any(|output| output.data.get("text/plain") == Some(&"2".to_string())),
+        "bare-expression execute_result missing from logs: {:?}",
+        logs.outputs
+    );
+
+    let logs = run_and_fetch_logs(
+        &ws,
+        &tree_id,
+        &branch_id,
+        &cell_id,
+        "from IPython.display import display, HTML\ndisplay(HTML('<b>rich</b>'))\nprint('d', flush=True)",
+    )
+    .await;
+    assert!(
+        logs.outputs
+            .iter()
+            .any(|output| output.data.contains_key("text/html")),
+        "display_data missing from logs: {:?}",
+        logs.outputs
+    );
+
+    // `%matplotlib inline` parity: a single cell that imports and plots
+    // WITHOUT plt.show() must still display (interactive mode comes from the
+    // kernel's MATPLOTLIBRC, not a boot-time matplotlib import).
+    let logs = run_and_fetch_logs(
+        &ws,
+        &tree_id,
+        &branch_id,
+        &cell_id,
+        "import matplotlib.pyplot as plt\nplt.plot([1, 2], [3, 4])",
+    )
+    .await;
+    assert!(
+        logs.outputs
+            .iter()
+            .any(|output| output.data.contains_key("image/png")),
+        "inline plot missing from logs; mime types seen: {:?}",
+        logs.outputs
+            .iter()
+            .map(|output| output.data.keys().collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_same_tree_branch_executions_serialize() {
+    let (_tmp, ws) = open_temp_workspace().await;
+    let mut tree = trivial_tree();
+    tree.id = ExperimentTreeId::new("serialize-tree");
+    tree.name = "serialize-tree".to_string();
+    tree.cells[0].tree_id = tree.id.clone();
+    tree.cells[0].code.source =
+        "import time\ntime.sleep(2)\nstep1 = 1\nprint('done', flush=True)\n".to_string();
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+    let branch_id = tree.root_branch_id.clone();
+
+    let rx = ws.subscribe_events();
+    let exec_1 = ws
+        .execute_branch_in_experiment_tree(&tree_id, &branch_id)
+        .await
+        .unwrap();
+    let exec_2 = ws
+        .execute_branch_in_experiment_tree(&tree_id, &branch_id)
+        .await
+        .unwrap();
+
+    let ids: HashSet<String> = [exec_1.as_str().to_string(), exec_2.as_str().to_string()]
+        .into_iter()
+        .collect();
+    let events = collect_events_until_finished(rx, ids).await;
+
+    let status_1 = wait_for_execution_finished(&ws, &exec_1).await;
+    let status_2 = wait_for_execution_finished(&ws, &exec_2).await;
+    assert_eq!(status_1.status, ExecutionLifecycleStatus::Completed);
+    assert_eq!(status_2.status, ExecutionLifecycleStatus::Completed);
+
+    // Same-tree executions hold the tree's exclusive lock: every event of
+    // whichever execution completes first must precede every event of the
+    // other — no interleaving.
+    let first_complete_idx = events
+        .iter()
+        .position(|event| matches!(event, ExecutionEvent::ExecutionCompleted { .. }))
+        .expect("no ExecutionCompleted event observed");
+    let first_exec_id = event_execution_id(&events[first_complete_idx])
+        .expect("completion event without execution id")
+        .to_string();
+    for event in &events[..first_complete_idx] {
+        assert_eq!(
+            event_execution_id(event),
+            Some(first_exec_id.as_str()),
+            "same-tree executions interleaved: {:?} appeared before {} completed",
+            event,
+            first_exec_id
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_executions_on_different_trees_run_concurrently() {
+    let (_tmp, ws) = open_temp_workspace().await;
+    let mut tree_1 = trivial_tree();
+    tree_1.id = ExperimentTreeId::new("concurrent-tree-1");
+    tree_1.name = "concurrent-tree-1".to_string();
+    tree_1.cells[0].tree_id = tree_1.id.clone();
+    tree_1.cells[0].code.source =
+        "import time\ntime.sleep(6)\nstep1 = 1\nprint('one', flush=True)\n".to_string();
+    let mut tree_2 = trivial_tree();
+    tree_2.id = ExperimentTreeId::new("concurrent-tree-2");
+    tree_2.name = "concurrent-tree-2".to_string();
+    tree_2.cells[0].tree_id = tree_2.id.clone();
+    tree_2.cells[0].code.source =
+        "import time\ntime.sleep(6)\nstep1 = 2\nprint('two', flush=True)\n".to_string();
+    let tree_1_id = ws.save_experiment_tree(&tree_1).await.unwrap().id;
+    let tree_2_id = ws.save_experiment_tree(&tree_2).await.unwrap().id;
+
+    let rx = ws.subscribe_events();
+    let exec_1 = ws
+        .execute_branch_in_experiment_tree(&tree_1_id, &tree_1.root_branch_id)
+        .await
+        .unwrap();
+    let exec_2 = ws
+        .execute_branch_in_experiment_tree(&tree_2_id, &tree_2.root_branch_id)
+        .await
+        .unwrap();
+
+    let ids: HashSet<String> = [exec_1.as_str().to_string(), exec_2.as_str().to_string()]
+        .into_iter()
+        .collect();
+    let events = collect_events_until_finished(rx, ids).await;
+
+    assert_eq!(
+        wait_for_execution_finished(&ws, &exec_1).await.status,
+        ExecutionLifecycleStatus::Completed
+    );
+    assert_eq!(
+        wait_for_execution_finished(&ws, &exec_2).await.status,
+        ExecutionLifecycleStatus::Completed
+    );
+
+    // Different trees must not serialize: the later execution's cell starts
+    // (NodeStarted) before the earlier execution completes.
+    let first_complete_idx = events
+        .iter()
+        .position(|event| matches!(event, ExecutionEvent::ExecutionCompleted { .. }))
+        .expect("no ExecutionCompleted event observed");
+    let first_exec_id = event_execution_id(&events[first_complete_idx]).unwrap();
+    let other_started_before = events[..first_complete_idx].iter().any(|event| {
+        matches!(event, ExecutionEvent::NodeStarted { .. })
+            && event_execution_id(event) != Some(first_exec_id)
+    });
+    assert!(
+        other_started_before,
+        "executions on different trees serialized; events: {:?}",
+        events
+            .iter()
+            .map(|event| format!("{:?}", std::mem::discriminant(event)))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_run_all_contamination_restarts_kernel_and_next_branch_succeeds() {
+    let (_tmp, ws) = open_temp_workspace().await;
+    // step1 rebinds an unpicklable object (generator). After seeding the
+    // kernel once, the run-all session baseline contains the old generator;
+    // re-running step1 replaces it with a new one the guard cannot restore —
+    // a deterministic contamination signal.
+    let tree = two_branch_tree_with(
+        "contamination-tree",
+        "unp = (i for i in range(3))\nstep1 = 1\n",
+        "a1 = step1 + 1\n",
+        "b1 = step1 + 2\n",
+    );
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+
+    // Seed kernel state outside any isolation session.
+    ws.execute_cell_in_experiment_tree_branch(
+        &tree_id,
+        &BranchId::new("main"),
+        &CellId::new("step1"),
+    )
+    .await
+    .expect("failed to seed kernel state");
+
+    let mut rx = ws.subscribe_events();
+    let executions = ws
+        .execute_all_branches_in_experiment_tree(&tree_id)
+        .await
+        .unwrap();
+
+    let contamination_listener = tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(ExecutionEvent::ContaminationDetected {
+                    branch_id, signals, ..
+                }) => return (branch_id, signals),
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => panic!("event channel closed before contamination event"),
+            }
+        }
+    });
+
+    for (branch_id, execution_id) in &executions {
+        let status = wait_for_execution_finished(&ws, execution_id).await;
+        assert_eq!(
+            status.status,
+            ExecutionLifecycleStatus::Completed,
+            "branch {} should complete even when a sibling contaminated the kernel",
+            branch_id
+        );
+    }
+
+    let (contaminated_branch, signals) = timeout(Duration::from_secs(60), contamination_listener)
+        .await
+        .expect("timed out waiting for contamination event")
+        .expect("contamination listener panicked");
+    assert_eq!(contaminated_branch, BranchId::new("main"));
+    assert!(
+        signals.iter().any(|signal| signal.contains("unrestorable")),
+        "expected an unrestorable signal, got {:?}",
+        signals
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_run_all_branches_do_not_observe_sibling_definitions() {
+    let (tmp, ws) = open_temp_workspace().await;
+    let probe_path = tmp.path().join("sibling-leak-probe.txt");
+    let probe_literal = serde_json::to_string(&probe_path.to_string_lossy().to_string()).unwrap();
+    // branch_a leaks both a plain value and a function definition; branch_b
+    // probes for them. Function definitions are the historic blind spot: the
+    // namespace guard used to skip callables entirely.
+    let tree = two_branch_tree_with(
+        "sibling-leak-tree",
+        "step1 = 1\n",
+        "def helper_fn():\n    return 41\nleak_marker = 42\na1 = step1\n",
+        &format!(
+            "from pathlib import Path\nPath({probe_literal}).write_text(f\"{{int('helper_fn' in globals())}}{{int('leak_marker' in globals())}}\")\nb1 = step1\n"
+        ),
+    );
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+
+    let executions = ws
+        .execute_all_branches_in_experiment_tree(&tree_id)
+        .await
+        .unwrap();
+    for (_, execution_id) in &executions {
+        let status = wait_for_execution_finished(&ws, execution_id).await;
+        assert_eq!(status.status, ExecutionLifecycleStatus::Completed);
+    }
+
+    assert_eq!(
+        fs::read_to_string(&probe_path).unwrap().trim(),
+        "00",
+        "sibling branch definitions leaked into branch_b's namespace"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_run_all_cache_parity_second_run_hits() {
+    let (tmp, ws) = open_temp_workspace().await;
+    let step1_counter = tmp.path().join("run-all-step1-counter.txt");
+    let a1_counter = tmp.path().join("run-all-a1-counter.txt");
+    let b1_counter = tmp.path().join("run-all-b1-counter.txt");
+    let counter_code = |path: &Path, body: &str| {
+        let literal = serde_json::to_string(&path.to_string_lossy().to_string()).unwrap();
+        format!(
+            "from pathlib import Path\n_c = Path({literal})\n_n = int(_c.read_text()) if _c.exists() else 0\n_c.write_text(str(_n + 1))\n{body}"
+        )
+    };
+    let mut tree = two_branch_tree_with(
+        "run-all-cache-tree",
+        &counter_code(&step1_counter, "step1 = 10\n"),
+        &counter_code(&a1_counter, "a1 = step1 + 1\n"),
+        &counter_code(&b1_counter, "b1 = step1 + 2\n"),
+    );
+    for cell in &mut tree.cells {
+        cell.cache = true;
+    }
+    let tree_id = ws.save_experiment_tree(&tree).await.unwrap().id;
+
+    // First run-all: step1 executes once (main); branch_a and branch_b reuse
+    // its entry top-to-bottom (same cell on their own paths).
+    let first = ws
+        .execute_all_branches_in_experiment_tree(&tree_id)
+        .await
+        .unwrap();
+    for (_, execution_id) in &first {
+        let status = wait_for_execution_finished(&ws, execution_id).await;
+        assert_eq!(status.status, ExecutionLifecycleStatus::Completed);
+    }
+    assert_eq!(read_counter(&step1_counter), 1, "prefix must execute once");
+    assert_eq!(read_counter(&a1_counter), 1);
+    assert_eq!(read_counter(&b1_counter), 1);
+
+    // Second run-all: everything cache-hits; cache injection inside the
+    // isolation session must not raise contamination.
+    let second = ws
+        .execute_all_branches_in_experiment_tree(&tree_id)
+        .await
+        .unwrap();
+    let mut statuses = HashMap::new();
+    for (branch_id, execution_id) in &second {
+        let status = wait_for_execution_finished(&ws, execution_id).await;
+        assert_eq!(status.status, ExecutionLifecycleStatus::Completed);
+        statuses.insert(branch_id.clone(), status);
+    }
+    assert_eq!(read_counter(&step1_counter), 1);
+    assert_eq!(read_counter(&a1_counter), 1);
+    assert_eq!(read_counter(&b1_counter), 1);
+    let branch_a_status = &statuses[&BranchId::new("branch_a")];
+    assert_eq!(
+        branch_a_status.node_statuses.get(&NodeId::new("step1")),
+        Some(&NodeStatus::CacheHit)
+    );
+    assert_eq!(
+        branch_a_status.node_statuses.get(&NodeId::new("a1")),
+        Some(&NodeStatus::CacheHit)
+    );
+
+    let runtime_state = ws.get_tree_runtime_state(&tree_id).await.unwrap();
+    if let Some(isolation_result) = runtime_state.last_isolation_result.as_ref() {
+        assert!(
+            isolation_result.succeeded,
+            "cache injection should not contaminate the isolation session: {:?}",
+            isolation_result.contamination_signals
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn test_move_cell_in_experiment_tree_branch() {
     let (_tmp, ws) = open_temp_workspace().await;
     let tree = two_cell_tree();
@@ -4171,10 +4919,16 @@ async fn test_wi1_perf_histograms_fire_on_cold_and_warm_execute() {
     // Every histogram added in WI-1 should appear in the Prometheus output
     // with a non-zero sample count. We match on `<metric>_count` since the
     // Prometheus text format emits that for every histogram observation.
+    // Note: `tine_ensure_tree_environment_pip_check_seconds` is intentionally
+    // absent. The pip-check stage only runs when ensure falls back to plain
+    // pip (`!use_uv`); under uv (the default in test/CI) pip is delivered as an
+    // ordinary package and the pip-check subprocess is skipped, so this
+    // histogram legitimately never fires here. The remaining cold-stage
+    // histograms still fire on the first (cold) ensure before in-process
+    // memoization short-circuits the second (warm) ensure.
     let required_histograms = [
         "tine_ensure_tree_environment_total_seconds",
         "tine_ensure_tree_environment_lock_wait_seconds",
-        "tine_ensure_tree_environment_pip_check_seconds",
         "tine_ensure_tree_environment_sync_seconds",
         "tine_ensure_tree_environment_preflight_seconds",
         "tine_kernel_start_total_seconds",
@@ -4206,7 +4960,6 @@ async fn test_wi1_perf_histograms_fire_on_cold_and_warm_execute() {
     let outcome_labeled = [
         "tine_ensure_tree_environment_total_seconds",
         "tine_ensure_tree_environment_lock_wait_seconds",
-        "tine_ensure_tree_environment_pip_check_seconds",
         "tine_ensure_tree_environment_sync_seconds",
         "tine_ensure_tree_environment_preflight_seconds",
         "tine_kernel_start_total_seconds",

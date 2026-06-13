@@ -7,10 +7,15 @@ CREATE TABLE IF NOT EXISTS cache (
     lockfile_hash   BLOB NOT NULL,
     artifacts       TEXT NOT NULL,     -- JSON: {slot_name: artifact_key}
     source_runtime_id TEXT,
-    node_id         TEXT,
+    node_id         TEXT NOT NULL DEFAULT '',
+    -- hex blake3 of (tree id, cell id): cache reuse is scoped to the owning
+    -- cell of the owning tree (top-to-bottom along its lineage), never
+    -- sideways across branch cells or across trees that happen to share a
+    -- cell id, code, and inputs.
+    scope_hash      TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     last_accessed   TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (code_hash, input_hashes, lockfile_hash)
+    PRIMARY KEY (code_hash, input_hashes, lockfile_hash, scope_hash, node_id)
 );
 
 -- Artifact reference counting for safe GC

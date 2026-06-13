@@ -181,6 +181,12 @@ pub struct KernelManager {
     work_dir: PathBuf,
     /// Per-owner mutex to prevent concurrent duplicate kernel starts.
     start_locks: DashMap<KernelOwnerId, Arc<Mutex<()>>>,
+    /// The execution that currently occupies each owner's kernel. Set by the
+    /// scheduler while it holds the owner's execution lock and runs code, and
+    /// cleared when that run ends. A targeted interrupt consults this so a
+    /// cancellation cannot land on a different execution that started on the
+    /// shared kernel after the intended target finished.
+    current_executions: DashMap<KernelOwnerId, String>,
     lifecycle_tx: broadcast::Sender<KernelLifecycleEvent>,
 }
 
@@ -310,6 +316,7 @@ impl KernelManager {
             max_kernels,
             work_dir,
             start_locks: DashMap::new(),
+            current_executions: DashMap::new(),
             lifecycle_tx,
         }
     }
@@ -497,6 +504,22 @@ impl KernelManager {
             "starting kernel"
         );
 
+        // Reproduce `%matplotlib inline` semantics without importing
+        // matplotlib at boot (the magic costs ~0.3s warm and seconds on a
+        // fresh venv, on every kernel start): the env vars below make
+        // matplotlib pick the inline backend and interactive mode (so figures
+        // auto-display without plt.show()) lazily, when user code actually
+        // imports it. The inline backend registers its post-cell flush hook
+        // on import.
+        let matplotlibrc_path = self.work_dir.join("matplotlibrc");
+        if let Err(error) = tokio::fs::write(&matplotlibrc_path, "interactive: True\n").await {
+            warn!(
+                path = %matplotlibrc_path.display(),
+                %error,
+                "failed to write matplotlibrc; figures will need explicit plt.show()"
+            );
+        }
+
         let mut process = Command::new(&python)
             .args([
                 "-m",
@@ -506,6 +529,8 @@ impl KernelManager {
             ])
             .env("VIRTUAL_ENV", venv_dir)
             .env("PATH", Self::path_with_venv_bin(venv_dir))
+            .env("MPLBACKEND", "module://matplotlib_inline.backend_inline")
+            .env("MATPLOTLIBRC", &matplotlibrc_path)
             .current_dir(working_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -870,6 +895,10 @@ impl KernelManager {
         // Build and send ExecuteRequest on shell channel
         let execute_request = ExecuteRequest::new(code.to_string());
         let message: JupyterMessage = execute_request.into();
+        // Everything this execution produces on iopub carries this id as its
+        // parent — it's the only reliable way to attribute messages to this
+        // request on the shared iopub stream.
+        let request_msg_id = message.header.msg_id.clone();
         kernel
             .shell
             .send(message)
@@ -915,6 +944,26 @@ impl KernelManager {
                 }
             };
 
+            // Attribute messages to this request via the parent header. The
+            // iopub stream is shared: without this check, any stray message
+            // (a boot-time welcome, a leftover from a timed-out read) shifts
+            // attribution by one request *permanently* — every execution then
+            // breaks on the previous request's idle before its own
+            // execute_result arrives, so rich outputs silently vanish.
+            // Skipping foreign messages instead of consuming them as ours
+            // also makes the loop self-healing after any desync.
+            let belongs_to_request = msg
+                .parent_header
+                .as_ref()
+                .is_some_and(|parent| parent.msg_id == request_msg_id);
+            if !belongs_to_request {
+                debug!(
+                    owner = %owner_id,
+                    msg_type = msg.message_type(),
+                    "skipping iopub message from another request"
+                );
+                continue;
+            }
             match msg.content {
                 JupyterMessageContent::Status(status) => {
                     if status.execution_state == ExecutionState::Idle {
@@ -1101,6 +1150,79 @@ print("__tine_isolation__" + _pf_json.dumps(_pf_result, sort_keys=True))
     pub async fn interrupt_tree(&self, tree_id: &ExperimentTreeId) -> TineResult<()> {
         self.interrupt_owned(&Self::owner_id_for_tree(tree_id))
             .await
+    }
+
+    /// Record that `execution_id` now occupies the tree's kernel. Called by
+    /// the scheduler once it holds the tree's execution lock, so that a
+    /// concurrent targeted interrupt can tell which execution is live.
+    pub fn set_tree_current_execution(&self, tree_id: &ExperimentTreeId, execution_id: &str) {
+        self.current_executions
+            .insert(Self::owner_id_for_tree(tree_id), execution_id.to_string());
+    }
+
+    /// Clear the current-execution marker for the tree, but only if it still
+    /// names `execution_id` (so a later occupant's marker is never dropped).
+    pub fn clear_tree_current_execution(&self, tree_id: &ExperimentTreeId, execution_id: &str) {
+        self.current_executions
+            .remove_if(&Self::owner_id_for_tree(tree_id), |_, current| {
+                current == execution_id
+            });
+    }
+
+    /// Interrupt the tree's kernel only if `execution_id` still occupies it.
+    /// Returns whether the interrupt was sent. The current-execution check
+    /// and the SIGINT are issued together while holding the dashmap entry
+    /// lock, which is also what the scheduler takes to set/clear the marker —
+    /// so a different execution cannot become the live occupant between the
+    /// check and the signal.
+    pub async fn interrupt_tree_if_current(
+        &self,
+        tree_id: &ExperimentTreeId,
+        execution_id: &str,
+    ) -> TineResult<bool> {
+        let owner_id = Self::owner_id_for_tree(tree_id);
+        // Helper: true only while `execution_id` is the kernel's marked
+        // occupant. The DashMap shard lock this read takes is the same one
+        // the scheduler's set/clear take, so each check is serialized against
+        // a new execution becoming the occupant.
+        let still_current = |mgr: &Self| {
+            mgr.current_executions
+                .get(&owner_id)
+                .is_some_and(|current| current.value() == execution_id)
+        };
+        if !still_current(self) {
+            return Ok(false);
+        }
+        self.send_sigint(&owner_id);
+        // Best-effort control-channel interrupt to back up the SIGINT (and the
+        // only interrupt mechanism on non-Unix). Re-check occupancy first: the
+        // target may have finished and a different same-tree execution taken
+        // over the shared kernel since the SIGINT, and a control interrupt is
+        // just as capable of hitting the wrong run.
+        if !still_current(self) {
+            return Ok(true);
+        }
+        if let Some(kernel) = self
+            .kernels
+            .get(&owner_id)
+            .map(|entry| Arc::clone(entry.value()))
+        {
+            if let Ok(mut kernel) =
+                tokio::time::timeout(Duration::from_millis(50), kernel.lock()).await
+            {
+                let interrupt_msg: JupyterMessage = InterruptRequest {}.into();
+                if let Err(e) = kernel.control.send(interrupt_msg).await {
+                    warn!(owner = %owner_id, error = %e, "control interrupt failed after SIGINT");
+                    return Ok(true);
+                }
+                match tokio::time::timeout(Duration::from_secs(5), kernel.control.read()).await {
+                    Ok(Ok(_)) => debug!(owner = %owner_id, "interrupt acknowledged"),
+                    Ok(Err(e)) => warn!(owner = %owner_id, error = %e, "interrupt reply error"),
+                    Err(_) => warn!(owner = %owner_id, "interrupt acknowledgement timed out"),
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Shutdown a kernel gracefully via the control channel.
@@ -1349,20 +1471,13 @@ print("__tine_isolation__" + _pf_json.dumps(_pf_result, sort_keys=True))
 
     /// Send tine helper functions into the kernel namespace.
     async fn send_setup_code(&self, owner_id: &KernelOwnerId) -> TineResult<()> {
+        // `%matplotlib inline` semantics come from the MPLBACKEND and
+        // MATPLOTLIBRC env vars set at kernel spawn (see `start_owned_kernel`)
+        // rather than running the magic here: the magic imports all of
+        // matplotlib, costing ~0.3s warm and seconds on a fresh venv, on
+        // every boot — even for notebooks that never plot.
         let setup_code = r#"
 import base64 as _pf_base64, cloudpickle as _pf_pickle, copy as _pf_copy, json as _pf_json, os as _pf_os, sys as _pf_sys, warnings as _pf_warnings
-
-try:
-    from IPython import get_ipython as _pf_get_ipython
-    _pf_ip = _pf_get_ipython()
-    if _pf_ip is not None:
-        _pf_ip.run_line_magic('matplotlib', 'inline')
-except Exception:
-    try:
-        import matplotlib as _pf_matplotlib
-        _pf_matplotlib.use('module://matplotlib_inline.backend_inline')
-    except Exception:
-        pass
 
 def _pf_save_artifact(obj, path):
     """Serialize any Python object to disk via cloudpickle. Returns metadata."""
@@ -1387,9 +1502,14 @@ def _pf_load_artifact(path):
 _pf_branch_snapshots = {}
 
 def _pf_snapshot_namespace():
+    # Callables are included deliberately: a branch defining a function or
+    # class mutates the shared namespace like any assignment, and skipping
+    # them would let those definitions leak across sibling branches without
+    # any contamination signal. cloudpickle can serialize most of them; the
+    # ones it cannot fall back to id()-based change detection.
     snapshot = {}
     for name, obj in list(globals().items()):
-        if name.startswith('_pf_') or name.startswith('_') or callable(obj):
+        if name.startswith('_pf_') or name.startswith('_'):
             continue
         entry = {"type": type(obj).__name__, "id": id(obj), "payload": None}
         try:
@@ -1401,14 +1521,20 @@ def _pf_snapshot_namespace():
     return snapshot
 
 def _pf_snapshot_modules():
+    # Snapshots must not mutate interpreter state: only read the matplotlib
+    # backend when matplotlib is already imported. Importing it here would
+    # change sys.modules between the begin/end snapshots of the very session
+    # being guarded, producing false module-drift contamination signals.
     module_state = {
         "sys_path": list(_pf_sys.path),
         "sys_modules": sorted(_pf_sys.modules.keys()),
         "warnings_filters": _pf_copy.deepcopy(_pf_warnings.filters),
     }
     try:
-        import matplotlib as _pf_matplotlib_runtime
-        module_state["matplotlib_backend"] = _pf_matplotlib_runtime.get_backend()
+        _pf_mpl_loaded = _pf_sys.modules.get("matplotlib")
+        module_state["matplotlib_backend"] = (
+            _pf_mpl_loaded.get_backend() if _pf_mpl_loaded is not None else None
+        )
     except Exception:
         module_state["matplotlib_backend"] = None
     return module_state
@@ -1488,10 +1614,10 @@ def _pf_restore_modules(before_modules):
     except Exception:
         signals.append("restore:warnings.filters")
     try:
-        import matplotlib as _pf_matplotlib_runtime
         backend = before_modules.get("matplotlib_backend")
-        if backend:
-            _pf_matplotlib_runtime.use(backend)
+        _pf_mpl_loaded = _pf_sys.modules.get("matplotlib")
+        if backend and _pf_mpl_loaded is not None:
+            _pf_mpl_loaded.use(backend)
     except Exception:
         if before_modules.get("matplotlib_backend"):
             signals.append("restore:matplotlib_backend")
@@ -2030,6 +2156,61 @@ mod tests {
         assert_eq!(
             kernel_mgr.work_dir,
             expected_root.join(".tine").join("kernels")
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_tree_if_current_only_fires_for_the_marked_occupant() {
+        let kernel_mgr = KernelManager::new(Path::new("."), 1);
+        let tree_id = ExperimentTreeId::new("tree-1");
+
+        // No marker set: nothing occupies the kernel, so no interrupt.
+        assert!(
+            !kernel_mgr
+                .interrupt_tree_if_current(&tree_id, "exec-a")
+                .await
+                .expect("interrupt check failed"),
+            "must not interrupt when no execution occupies the kernel"
+        );
+
+        // exec-a occupies the kernel: a cancel targeting it fires.
+        kernel_mgr.set_tree_current_execution(&tree_id, "exec-a");
+        assert!(
+            kernel_mgr
+                .interrupt_tree_if_current(&tree_id, "exec-a")
+                .await
+                .expect("interrupt check failed"),
+            "must interrupt the execution that currently occupies the kernel"
+        );
+        // A cancel targeting a different execution must not fire — this is
+        // the wrong-victim case after a finalization race.
+        assert!(
+            !kernel_mgr
+                .interrupt_tree_if_current(&tree_id, "exec-b")
+                .await
+                .expect("interrupt check failed"),
+            "must not interrupt a different execution sharing the kernel"
+        );
+
+        // A stale clear (for an execution that no longer holds the marker)
+        // must not drop exec-a's marker.
+        kernel_mgr.clear_tree_current_execution(&tree_id, "exec-b");
+        assert!(
+            kernel_mgr
+                .interrupt_tree_if_current(&tree_id, "exec-a")
+                .await
+                .expect("interrupt check failed"),
+            "a non-matching clear must not drop the live marker"
+        );
+
+        // Once exec-a clears its own marker, no cancel fires.
+        kernel_mgr.clear_tree_current_execution(&tree_id, "exec-a");
+        assert!(
+            !kernel_mgr
+                .interrupt_tree_if_current(&tree_id, "exec-a")
+                .await
+                .expect("interrupt check failed"),
+            "must not interrupt after the occupant cleared its marker"
         );
     }
 

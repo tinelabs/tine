@@ -17,6 +17,21 @@ class _Response:
     body: bytes
 
 
+class TineApiError(RuntimeError):
+    """API failure carrying a stable machine-readable `code`.
+
+    `code` mirrors the server's error classes (`not_found`, `validation`,
+    `kernel_unavailable`, `queue_full`, ...) plus the transport-level codes
+    `unreachable` and `timeout`, so callers can branch on error class
+    instead of parsing the human-readable message.
+    """
+
+    def __init__(self, message: str, *, code: str = "internal", status: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
 # Default request timeout for idempotent calls (GETs, status reads, log
 # reads, etc). Bounds the worst-case wedge where a stalled server would
 # block urlopen indefinitely.
@@ -193,20 +208,23 @@ class TineApiClient:
         self,
         experiment_id: str,
         branch_id: str,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         # Long-but-bounded timeout. A pure `timeout=None` would prevent
         # client-side retries that could double-submit, but it also makes
         # an orphaned submission un-cancellable: the server may have
         # accepted the run while the client never sees the execution_id.
         # The compromise: 600s (10 min) is well above realistic cold-
-        # venv-setup time so normal flows are unaffected, but the
-        # timeout-error message explicitly warns about duplicate-risk so
-        # an agent / user does not blindly retry. A proper fix needs a
-        # server-side idempotency token and is tracked for a future
-        # release.
+        # venv-setup time so normal flows are unaffected, and the
+        # timeout-error message explicitly warns about duplicate-risk.
+        # Pass `idempotency_key` to make retries safe: a resend carrying
+        # the same key returns the original execution instead of starting
+        # a duplicate run. Keys are bound to the submitted code/environment
+        # state — reuse after an edit fails with `idempotency_conflict`.
+        body = {"idempotency_key": idempotency_key} if idempotency_key else None
         return self._post_json(
             f"/api/experiment-trees/{experiment_id}/branches/{branch_id}/execute",
-            None,
+            body,
             timeout=self._long_timeout,
             non_idempotent=True,
         )
@@ -216,11 +234,13 @@ class TineApiClient:
         experiment_id: str,
         branch_id: str,
         cell_id: str,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         # See `execute_branch_in_experiment_tree`.
+        body = {"idempotency_key": idempotency_key} if idempotency_key else None
         return self._post_json(
             f"/api/experiment-trees/{experiment_id}/branches/{branch_id}/cells/{cell_id}/execute",
-            None,
+            body,
             timeout=self._long_timeout,
             non_idempotent=True,
         )
@@ -229,7 +249,11 @@ class TineApiClient:
         self,
         experiment_id: str,
     ) -> list[dict[str, Any]]:
-        # See `execute_branch_in_experiment_tree`.
+        # Long-but-bounded timeout like the single-branch path, but NOTE:
+        # run-all is NOT idempotent. It submits one coordinated isolated
+        # batch and accepts no idempotency key, so a timeout cannot be
+        # safely retried by reattaching — the timeout warning's "otherwise,
+        # check tree state before retrying" branch is the correct recovery.
         response = self._post_json(
             f"/api/experiment-trees/{experiment_id}/execute-all-branches",
             None,
@@ -245,6 +269,20 @@ class TineApiClient:
 
     def status(self, execution_id: str) -> dict[str, Any]:
         return self._get_json(f"/api/executions/{execution_id}")
+
+    def execution_results(self, execution_id: str) -> dict[str, Any]:
+        """Execution status plus every node's logs in one call."""
+        return self._get_json(f"/api/executions/{execution_id}/results")
+
+    def plan_branch_in_experiment_tree(
+        self,
+        experiment_id: str,
+        branch_id: str,
+    ) -> dict[str, Any]:
+        """Dry-run: which cells would run vs cache-hit, and why."""
+        return self._get_json(
+            f"/api/experiment-trees/{experiment_id}/branches/{branch_id}/plan"
+        )
 
     def logs_for_tree_cell(
         self,
@@ -370,9 +408,15 @@ class TineApiClient:
             except json.JSONDecodeError:
                 parsed = None
             if isinstance(parsed, dict) and "error" in parsed:
-                raise RuntimeError(str(parsed["error"])) from None
-            raise RuntimeError(
-                f"request failed with status {exc.code}: {body_text or exc.reason}"
+                raise TineApiError(
+                    str(parsed["error"]),
+                    code=str(parsed.get("code") or "internal"),
+                    status=exc.code,
+                ) from None
+            raise TineApiError(
+                f"request failed with status {exc.code}: {body_text or exc.reason}",
+                code="http_error",
+                status=exc.code,
             ) from None
         except error.URLError as exc:
             # urllib raises URLError for both socket.timeout (transport stall)
@@ -381,18 +425,21 @@ class TineApiClient:
             import socket
 
             if isinstance(exc.reason, socket.timeout) or isinstance(exc, TimeoutError):
-                raise RuntimeError(
-                    self._format_timeout_message(path, request_timeout, non_idempotent)
+                raise TineApiError(
+                    self._format_timeout_message(path, request_timeout, non_idempotent),
+                    code="timeout",
                 ) from None
-            raise RuntimeError(
-                f"failed to reach Tine API at {self.base_url}: {exc.reason}"
+            raise TineApiError(
+                f"failed to reach Tine API at {self.base_url}: {exc.reason}",
+                code="unreachable",
             ) from None
         except (TimeoutError, _SOCKET_TIMEOUT):
             # `socket.timeout` is a distinct exception type on Python 3.9
             # and below (alias for TimeoutError on 3.10+). Some urllib code
             # paths re-raise it directly without wrapping in URLError.
-            raise RuntimeError(
-                self._format_timeout_message(path, request_timeout, non_idempotent)
+            raise TineApiError(
+                self._format_timeout_message(path, request_timeout, non_idempotent),
+                code="timeout",
             ) from None
 
     @staticmethod
@@ -415,9 +462,11 @@ class TineApiClient:
         return (
             f"{base}. WARNING: this was a non-idempotent submission "
             "(write request); the server may have already accepted or applied "
-            "the change. DO NOT retry this call without first checking the "
-            "Tine UI or experiment-tree state for the intended mutation. "
-            "Retrying blindly risks duplicate or conflicting state."
+            "the change. For execute submissions, retry with the same "
+            "idempotency_key to safely reattach to the original run. "
+            "Otherwise, check the Tine UI or experiment-tree state for the "
+            "intended mutation before retrying — retrying blindly risks "
+            "duplicate or conflicting state."
         )
 
     @staticmethod

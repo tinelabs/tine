@@ -40,6 +40,9 @@ pub enum TineError {
     #[error("execution {0} was interrupted")]
     ExecutionInterrupted(ExecutionId),
 
+    #[error("idempotency key conflict: {0}")]
+    IdempotencyConflict(String),
+
     // -- Kernel errors --
     #[error("kernel startup failed for runtime {runtime_id}: {message}")]
     KernelStartupFailed { runtime_id: String, message: String },
@@ -112,9 +115,52 @@ pub enum TineError {
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
+    // -- Caller-addressable lookup failures (bad ids in requests) --
+    #[error("{0}")]
+    NotFound(String),
+
     // -- Generic internal error --
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+impl TineError {
+    /// Stable machine-readable error code, exposed through API error bodies
+    /// so clients (agents in particular) can branch on error class instead
+    /// of parsing prose.
+    pub fn code(&self) -> &'static str {
+        match self {
+            TineError::CycleDetected { .. } => "cycle_detected",
+            TineError::NodeNotFound { .. } => "not_found",
+            TineError::RuntimeNotFound(_) => "not_found",
+            TineError::DuplicateNode { .. } => "duplicate_node",
+            TineError::InvalidEdge { .. } => "invalid_edge",
+            TineError::ExecutionNotFound(_) => "not_found",
+            TineError::ExecutionAlreadyRunning { .. } => "execution_already_running",
+            TineError::NodeExecutionFailed { .. } => "node_execution_failed",
+            TineError::ExecutionInterrupted(_) => "execution_interrupted",
+            TineError::IdempotencyConflict(_) => "idempotency_conflict",
+            TineError::KernelStartupFailed { .. } => "kernel_startup_failed",
+            TineError::KernelNotFound { .. } => "kernel_unavailable",
+            TineError::KernelComm(_) => "kernel_unavailable",
+            TineError::KernelHeartbeatTimeout { .. } => "kernel_unavailable",
+            TineError::ArtifactNotFound(_) => "not_found",
+            TineError::TypeMismatch { .. } => "type_mismatch",
+            TineError::MissingColumn { .. } => "missing_column",
+            TineError::SchemaValidation(_) => "schema_validation",
+            TineError::UvNotFound { .. } => "environment_failed",
+            TineError::EnvironmentFailed { .. } => "environment_failed",
+            TineError::DependencyResolution(_) => "environment_failed",
+            TineError::ProjectNotFound(_) => "not_found",
+            TineError::Database(_) => "database",
+            TineError::BudgetExceeded(_) => "queue_full",
+            TineError::Config(_) => "validation",
+            TineError::Io(_) => "io",
+            TineError::Serialization(_) => "serialization",
+            TineError::NotFound(_) => "not_found",
+            TineError::Internal(_) => "internal",
+        }
+    }
 }
 
 /// Result alias for TineError.

@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -6,7 +7,7 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use tine_core::{
     EnvironmentSpec, ExperimentTreeDef, ExperimentTreeId, ProjectId, TineError, TineResult,
@@ -149,6 +150,52 @@ impl PythonCommand {
     }
 }
 
+/// The interpreter architecture pinned at install / first stage and exported
+/// by the desktop app or pip wrapper as the authoritative platform identity.
+/// Holds Python's `platform.machine()` value (e.g. "arm64", "x86_64",
+/// "aarch64"). When unset — dev runs, source checkouts, tests — architecture
+/// is not enforced and resolution behaves exactly as before.
+///
+/// The comparison against an interpreter is an exact (case-insensitive) token
+/// match, so the pin MUST be sourced from `platform.machine()` on the same OS
+/// family it will run on: the same ISA is reported as `arm64` on macOS but
+/// `aarch64` on Linux (and `AMD64` vs `x86_64` on Windows), so a pin copied
+/// across operating systems would never match. The install-stage producer
+/// records it from the bundled interpreter on the target host, which keeps
+/// pin and probe on the same OS.
+const PINNED_PLATFORM_ENV: &str = "TINE_PYTHON_PLATFORM";
+
+fn pinned_python_platform() -> Option<String> {
+    std::env::var(PINNED_PLATFORM_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Outcome of comparing a pinned architecture against an interpreter's
+/// reported one. Kept as a pure function so the policy is exhaustively
+/// unit-testable without spawning interpreters or mutating the environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlatformMatch {
+    /// No architecture was pinned — enforcement is off.
+    NotPinned,
+    /// Pinned and the interpreter reports the same architecture.
+    Match,
+    /// Pinned but the interpreter reports a different architecture, or its
+    /// architecture could not be determined (fail closed).
+    Mismatch,
+}
+
+fn classify_platform_match(pinned: Option<&str>, actual: Option<&str>) -> PlatformMatch {
+    match pinned {
+        None => PlatformMatch::NotPinned,
+        Some(pin) => match actual {
+            Some(reported) if reported.eq_ignore_ascii_case(pin) => PlatformMatch::Match,
+            _ => PlatformMatch::Mismatch,
+        },
+    }
+}
+
 fn bundled_python_path() -> Option<PathBuf> {
     std::env::var_os("TINE_BUNDLED_PYTHON").map(PathBuf::from)
 }
@@ -170,6 +217,26 @@ pub struct EnvironmentManager {
     /// Serialize venv creation/sync so concurrent branch execution does not
     /// race on the shared workspace environment.
     env_lock: Mutex<()>,
+    /// Whether `uv_path` points at a working uv (checked once per process).
+    uv_available: tokio::sync::OnceCell<bool>,
+    /// Environments verified ready in this process, keyed by venv dir.
+    /// Lets repeat ensures (every execution runs one) skip the subprocess
+    /// round of python-resolve / pip-check / sync / preflight entirely.
+    ready_environments: std::sync::Mutex<HashMap<PathBuf, EnvironmentReadyStamp>>,
+}
+
+/// Proof that a venv was verified for a given package set; invalidated when
+/// the requested packages change or the venv's python binary changes on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnvironmentReadyStamp {
+    packages_fingerprint: String,
+    python_modified: Option<std::time::SystemTime>,
+}
+
+fn python_modified_time(python_path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(python_path)
+        .and_then(|meta| meta.modified())
+        .ok()
 }
 
 fn global_env_lock() -> &'static Mutex<()> {
@@ -209,17 +276,59 @@ impl TreeEnvironmentDescriptor {
 impl EnvironmentManager {
     pub fn new(workspace_root: PathBuf) -> Self {
         let workspace_root = normalize_workspace_root(workspace_root);
-        // Default: look for uv on PATH
+        // Resolution order: TINE_UV_PATH (pip wrapper / desktop / CI sets
+        // this explicitly) → `uv` on PATH. Availability is probed lazily and
+        // installs fall back to pip when uv is absent.
+        let uv_path = std::env::var_os("TINE_UV_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("uv"));
         Self {
-            uv_path: PathBuf::from("uv"),
+            uv_path,
             workspace_root,
             env_lock: Mutex::new(()),
+            uv_available: tokio::sync::OnceCell::new(),
+            ready_environments: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
     pub fn with_uv_path(mut self, path: PathBuf) -> Self {
         self.uv_path = path;
+        self.uv_available = tokio::sync::OnceCell::new();
         self
+    }
+
+    /// Which package installer this manager will use, for diagnostics.
+    pub async fn installer_description(&self) -> String {
+        if self.uv_is_available().await {
+            format!("uv ({})", self.uv_path.display())
+        } else {
+            "pip (uv not found; installs will be slower — set TINE_UV_PATH or put `uv` on PATH)"
+                .to_string()
+        }
+    }
+
+    /// Probe `uv --version` once per process.
+    async fn uv_is_available(&self) -> bool {
+        *self
+            .uv_available
+            .get_or_init(|| async {
+                let available = Command::new(&self.uv_path)
+                    .arg("--version")
+                    .output()
+                    .await
+                    .map(|output| output.status.success())
+                    .unwrap_or(false);
+                if available {
+                    info!(uv = %self.uv_path.display(), "package installs will use uv");
+                } else {
+                    warn!(
+                        uv = %self.uv_path.display(),
+                        "uv not available; falling back to pip for package installs"
+                    );
+                }
+                available
+            })
+            .await
     }
 
     /// Verify uv is available.
@@ -284,8 +393,15 @@ impl EnvironmentManager {
             )
             .await?;
             let required_packages = required_runtime_packages().to_vec();
-            self.sync_packages(&runtime_id, &venv_dir, &required_packages, &mut logs)
-                .await?;
+            let use_uv = self.uv_is_available().await;
+            self.sync_packages(
+                &runtime_id,
+                &venv_dir,
+                &required_packages,
+                use_uv,
+                &mut logs,
+            )
+            .await?;
             let python_path = self.python_path(&venv_dir);
             self.preflight_kernel_runtime(&runtime_id, &python_path, &venv_dir, &mut logs)
                 .await?;
@@ -366,6 +482,58 @@ impl EnvironmentManager {
         .await
     }
 
+    /// Fingerprint of everything that determines an ensure's outcome for a
+    /// given venv: the user-declared deps plus whether the bundled runtime
+    /// supplies the baseline. Deliberately avoids subprocess calls so the
+    /// memoization fast path stays free.
+    fn environment_fingerprint(spec: &EnvironmentSpec) -> String {
+        Self::environment_fingerprint_with(bundled_python_path().is_some(), spec)
+    }
+
+    fn environment_fingerprint_with(uses_bundled_python: bool, spec: &EnvironmentSpec) -> String {
+        // The pinned architecture is part of the identity: if the install-stage
+        // pin changes, a previously-verified venv must be re-validated rather
+        // than reused from the in-process ready stamp.
+        format!(
+            "bundled={}|arch={}|deps={}",
+            uses_bundled_python,
+            pinned_python_platform().unwrap_or_default(),
+            spec.dependencies.join("\n")
+        )
+    }
+
+    /// True when this venv was already verified for this spec in this
+    /// process and its python binary is unchanged on disk.
+    fn environment_is_ready(&self, venv_dir: &Path, fingerprint: &str) -> bool {
+        let stamp = match self
+            .ready_environments
+            .lock()
+            .expect("ready_environments lock poisoned")
+            .get(venv_dir)
+            .cloned()
+        {
+            Some(stamp) => stamp,
+            None => return false,
+        };
+        stamp.packages_fingerprint == fingerprint
+            && stamp.python_modified.is_some()
+            && stamp.python_modified == python_modified_time(&self.python_path(venv_dir))
+    }
+
+    fn mark_environment_ready(&self, venv_dir: PathBuf, fingerprint: String) {
+        let python_modified = python_modified_time(&self.python_path(&venv_dir));
+        self.ready_environments
+            .lock()
+            .expect("ready_environments lock poisoned")
+            .insert(
+                venv_dir,
+                EnvironmentReadyStamp {
+                    packages_fingerprint: fingerprint,
+                    python_modified,
+                },
+            );
+    }
+
     async fn ensure_environment_with_owner(
         &self,
         runtime_id: &str,
@@ -373,35 +541,84 @@ impl EnvironmentManager {
         venv_dir: &Path,
     ) -> TineResult<(PathBuf, String)> {
         let mut total_timer = OutcomeTimer::start(METRIC_ENV_ENSURE_TOTAL);
+        let venv_dir = self.normalize_venv_dir(venv_dir);
+
+        // Fast path: this venv was verified for this exact spec earlier in
+        // this process and its python binary hasn't changed. Every execution
+        // runs an ensure, so without this each run pays several subprocess
+        // spawns (python resolve, pip check, sync, preflight) for a no-op.
+        let fingerprint = Self::environment_fingerprint(spec);
+        if self.environment_is_ready(&venv_dir, &fingerprint) {
+            total_timer.set_outcome("cached");
+            return Ok((venv_dir, "Environment ready (cached)".to_string()));
+        }
+
         let mut lock_wait_timer = OutcomeTimer::start(METRIC_ENV_ENSURE_LOCK_WAIT);
         let _global_env_guard = global_env_lock().lock().await;
         let _env_guard = self.env_lock.lock().await;
         lock_wait_timer.set_outcome("success");
         drop(lock_wait_timer);
-        let venv_dir = self.normalize_venv_dir(venv_dir);
+
+        // Re-check under the lock: a concurrent ensure may have finished the
+        // verification while this task waited.
+        if self.environment_is_ready(&venv_dir, &fingerprint) {
+            total_timer.set_outcome("cached");
+            return Ok((venv_dir, "Environment ready (cached)".to_string()));
+        }
+
         let mut logs = Vec::new();
         let python_command = self.resolve_python_command(DEFAULT_PYTHON_VERSION).await?;
         let uses_bundled_python = bundled_python_path()
             .as_ref()
             .is_some_and(|path| path == &python_command.program);
+        let use_uv = self.uv_is_available().await;
 
         info!(
             owner = runtime_id,
             venv = %venv_dir.display(),
             deps = spec.dependencies.len(),
+            installer = if use_uv { "uv" } else { "pip" },
             "ensuring environment"
         );
 
-        if venv_dir.exists() && !self.venv_looks_valid(&venv_dir) {
-            eprintln!("[tine-env] removing broken venv at {}", venv_dir.display());
+        // An existing venv may have been built for a different architecture by
+        // an earlier install (e.g. before an arch migration, or under
+        // emulation). The in-process ready stamp cannot catch this across
+        // restarts, so probe the venv's own interpreter against the pin and
+        // recreate on mismatch. Only runs when an architecture is pinned.
+        let pinned = pinned_python_platform();
+        let venv_arch_mismatch = if pinned.is_some()
+            && venv_dir.exists()
+            && self.venv_looks_valid(&venv_dir)
+        {
+            let venv_python = PythonCommand::new(self.python_path(&venv_dir), Vec::new());
+            matches!(
+                self.classify_python_platform(&venv_python, pinned.as_deref())
+                    .await,
+                PlatformMatch::Mismatch
+            )
+        } else {
+            false
+        };
+
+        if venv_dir.exists() && (!self.venv_looks_valid(&venv_dir) || venv_arch_mismatch) {
+            let reason = if venv_arch_mismatch {
+                "architecture-mismatched"
+            } else {
+                "broken"
+            };
+            eprintln!(
+                "[tine-env] removing {reason} venv at {}",
+                venv_dir.display()
+            );
             logs.push(format!(
-                "Removing broken venv at {} before recreation",
+                "Removing {reason} venv at {} before recreation",
                 venv_dir.display()
             ));
             tokio::fs::remove_dir_all(&venv_dir).await.map_err(|e| {
                 TineError::EnvironmentFailed {
                     runtime_id: runtime_id.to_string(),
-                    message: format!("failed to remove broken venv dir: {}", e),
+                    message: format!("failed to remove {reason} venv dir: {}", e),
                 }
             })?;
         }
@@ -421,13 +638,18 @@ impl EnvironmentManager {
             logs.push(format!("Using existing venv at {}", venv_dir.display()));
         }
 
-        let mut pip_check_timer = OutcomeTimer::start(METRIC_ENV_ENSURE_PIP_CHECK);
-        self.ensure_pip_available(runtime_id, &venv_dir, &mut logs)
-            .await?;
-        pip_check_timer.set_outcome("success");
-        drop(pip_check_timer);
+        // pip bootstrap is only needed when pip itself performs installs.
+        // In uv mode pip is delivered as an ordinary package below (cells
+        // still use `!pip install`), which avoids the slow ensurepip step.
+        if !use_uv {
+            let mut pip_check_timer = OutcomeTimer::start(METRIC_ENV_ENSURE_PIP_CHECK);
+            self.ensure_pip_available(runtime_id, &venv_dir, &mut logs)
+                .await?;
+            pip_check_timer.set_outcome("success");
+            drop(pip_check_timer);
+        }
 
-        let packages_to_sync = if uses_bundled_python {
+        let mut packages_to_sync = if uses_bundled_python {
             if spec.dependencies.is_empty() {
                 logs.push(
                     "Bundled runtime already provides baseline packages; no package sync required"
@@ -443,8 +665,13 @@ impl EnvironmentManager {
         } else {
             resolve_packages(&spec.dependencies)
         };
+        if use_uv && !uses_bundled_python {
+            // Notebook cells rely on `!pip install`; in uv mode pip arrives
+            // like any other package instead of via ensurepip.
+            packages_to_sync.push("pip".to_string());
+        }
         let mut sync_timer = OutcomeTimer::start(METRIC_ENV_ENSURE_SYNC);
-        self.sync_packages(runtime_id, &venv_dir, &packages_to_sync, &mut logs)
+        self.sync_packages(runtime_id, &venv_dir, &packages_to_sync, use_uv, &mut logs)
             .await?;
         sync_timer.set_outcome("success");
         drop(sync_timer);
@@ -456,6 +683,7 @@ impl EnvironmentManager {
         preflight_timer.set_outcome("success");
         drop(preflight_timer);
 
+        self.mark_environment_ready(venv_dir.clone(), fingerprint);
         total_timer.set_outcome("success");
         Ok((venv_dir, logs.join("\n\n")))
     }
@@ -704,6 +932,7 @@ impl EnvironmentManager {
         runtime_id: &str,
         venv_dir: &Path,
         packages: &[String],
+        use_uv: bool,
         logs: &mut Vec<String>,
     ) -> TineResult<()> {
         let requirements_path = self.effective_requirements_path(venv_dir);
@@ -762,13 +991,29 @@ impl EnvironmentManager {
                 ),
             });
         }
-        let mut cmd = Command::new(&python_path);
-        cmd.arg("-m")
-            .arg("pip")
-            .arg("install")
-            .arg("-r")
-            .arg(&requirements_path)
-            .current_dir(&self.workspace_root);
+        // uv installs the same requirements an order of magnitude faster
+        // than pip (parallel downloads, hardlinked wheel cache); pip remains
+        // the fallback when uv is unavailable.
+        let mut cmd = if use_uv {
+            let mut cmd = Command::new(&self.uv_path);
+            cmd.arg("pip")
+                .arg("install")
+                .arg("--python")
+                .arg(&python_path)
+                .arg("-r")
+                .arg(&requirements_path)
+                .current_dir(&self.workspace_root);
+            cmd
+        } else {
+            let mut cmd = Command::new(&python_path);
+            cmd.arg("-m")
+                .arg("pip")
+                .arg("install")
+                .arg("-r")
+                .arg(&requirements_path)
+                .current_dir(&self.workspace_root);
+            cmd
+        };
         self.apply_venv_env(&mut cmd, venv_dir);
 
         let output = cmd
@@ -863,38 +1108,70 @@ impl EnvironmentManager {
 
     async fn resolve_python_command(&self, python_version: &str) -> TineResult<PythonCommand> {
         let mut attempted = Vec::new();
+        let pinned = pinned_python_platform();
 
+        // Explicitly configured interpreters (TINE_PYTHON / TINE_BUNDLED_PYTHON
+        // / TINE_WRAPPER_PYTHON). A pinned-architecture mismatch here is a
+        // misconfiguration — someone pointed us at a specific interpreter and
+        // it is the wrong arch — so it is a hard error, not something to
+        // silently route around.
         for command in self.explicit_python_commands() {
             attempted.push(command.display.clone());
-            match self
-                .python_command_matches_version(&command, python_version)
-                .await
-            {
-                Ok(true) => return Ok(command),
-                Ok(false) => {}
-                Err(_) => {}
+            if !matches!(
+                self.python_command_matches_version(&command, python_version)
+                    .await,
+                Ok(true)
+            ) {
+                continue;
+            }
+            match self.classify_python_platform(&command, pinned.as_deref()).await {
+                PlatformMatch::NotPinned | PlatformMatch::Match => return Ok(command),
+                PlatformMatch::Mismatch => {
+                    return Err(TineError::Config(format!(
+                        "configured Python interpreter '{}' does not match the required architecture '{}'. \
+                         Point TINE_PYTHON/TINE_BUNDLED_PYTHON at a {}-native interpreter.",
+                        command.display,
+                        pinned.as_deref().unwrap_or_default(),
+                        pinned.as_deref().unwrap_or_default(),
+                    )));
+                }
             }
         }
 
+        // uv-managed interpreter: uv downloads host-native by default, but if
+        // it returns a mismatched arch (e.g. running under emulation) fall
+        // through to the system candidates rather than failing outright.
         if let Some(command) = self.resolve_python_via_uv(python_version).await {
-            return Ok(command);
+            attempted.push(command.display.clone());
+            match self.classify_python_platform(&command, pinned.as_deref()).await {
+                PlatformMatch::NotPinned | PlatformMatch::Match => return Ok(command),
+                PlatformMatch::Mismatch => {}
+            }
         }
 
+        // System interpreters: skip any whose arch does not match the pin.
         for command in self.python_command_candidates(python_version) {
             attempted.push(command.display.clone());
-            match self
-                .python_command_matches_version(&command, python_version)
-                .await
-            {
-                Ok(true) => return Ok(command),
-                Ok(false) => {}
-                Err(_) => {}
+            if !matches!(
+                self.python_command_matches_version(&command, python_version)
+                    .await,
+                Ok(true)
+            ) {
+                continue;
+            }
+            match self.classify_python_platform(&command, pinned.as_deref()).await {
+                PlatformMatch::NotPinned | PlatformMatch::Match => return Ok(command),
+                PlatformMatch::Mismatch => continue,
             }
         }
 
         Err(TineError::Config(format!(
-            "Python {}+ is not available. Tried {}",
+            "Python {}+ ({}) is not available. Tried {}",
             python_version,
+            pinned
+                .as_deref()
+                .map(|arch| format!("architecture {arch}"))
+                .unwrap_or_else(|| "any architecture".to_string()),
             attempted.join(", ")
         )))
     }
@@ -1006,6 +1283,39 @@ impl EnvironmentManager {
         let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
         Ok(supported_python_version(&actual))
     }
+
+    /// Report the interpreter's architecture via `platform.machine()` — the
+    /// same value the install-stage pin records. `None` if the interpreter
+    /// cannot be run or prints nothing.
+    async fn probe_python_platform(&self, command: &PythonCommand) -> Option<String> {
+        let mut probe = Command::new(&command.program);
+        probe
+            .args(&command.args)
+            .arg("-c")
+            .arg("import platform; print(platform.machine())")
+            .current_dir(&self.workspace_root);
+        let output = probe.output().await.ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let machine = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!machine.is_empty()).then_some(machine)
+    }
+
+    /// Compare a candidate interpreter against the pinned architecture.
+    /// Probes the interpreter only when a pin is actually set, so unpinned
+    /// (dev) resolution pays no extra subprocess.
+    async fn classify_python_platform(
+        &self,
+        command: &PythonCommand,
+        pinned: Option<&str>,
+    ) -> PlatformMatch {
+        if pinned.is_none() {
+            return PlatformMatch::NotPinned;
+        }
+        let actual = self.probe_python_platform(command).await;
+        classify_platform_match(pinned, actual.as_deref())
+    }
 }
 
 fn normalize_workspace_root(workspace_root: PathBuf) -> PathBuf {
@@ -1108,6 +1418,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn explicit_python_commands_prioritize_env_vars_without_duplicates() {
         let manager = EnvironmentManager::new(PathBuf::from("/tmp/tine-workspace"));
         let bundled = if cfg!(windows) {
@@ -1153,6 +1464,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn bundled_python_path_reads_env_var() {
         let bundled = if cfg!(windows) {
             r"C:\runtime\python.exe"
@@ -1234,5 +1546,329 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    fn venv_with_python(root: &Path) -> PathBuf {
+        let venv = root.join("venv");
+        let bin = venv.join(if cfg!(windows) { "Scripts" } else { "bin" });
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            bin.join(if cfg!(windows) {
+                "python.exe"
+            } else {
+                "python"
+            }),
+            b"#!/bin/sh\n",
+        )
+        .unwrap();
+        venv
+    }
+
+    #[test]
+    fn environment_ready_stamp_round_trips_and_invalidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = EnvironmentManager::new(tmp.path().to_path_buf());
+        let venv = venv_with_python(tmp.path());
+
+        // Not ready before any successful ensure.
+        assert!(!manager.environment_is_ready(&venv, "fp-a"));
+
+        manager.mark_environment_ready(venv.clone(), "fp-a".to_string());
+        assert!(manager.environment_is_ready(&venv, "fp-a"));
+
+        // A different package fingerprint must miss.
+        assert!(!manager.environment_is_ready(&venv, "fp-b"));
+
+        // Rewriting the python binary (recreated venv) must invalidate.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let python = manager.python_path(&venv);
+        std::fs::write(&python, b"#!/bin/sh\n# changed\n").unwrap();
+        let now = std::time::SystemTime::now();
+        let _ = filetime_set(&python, now);
+        if python_modified_time(&python)
+            == manager
+                .ready_environments
+                .lock()
+                .unwrap()
+                .get(&venv)
+                .and_then(|stamp| stamp.python_modified)
+        {
+            // mtime granularity too coarse on this filesystem; skip the
+            // invalidation assertion rather than flake.
+            return;
+        }
+        assert!(!manager.environment_is_ready(&venv, "fp-a"));
+    }
+
+    fn filetime_set(path: &Path, time: std::time::SystemTime) -> std::io::Result<()> {
+        // Touch by reopening with append; falls back to best effort.
+        let file = std::fs::OpenOptions::new().append(true).open(path)?;
+        file.set_modified(time)?;
+        Ok(())
+    }
+
+    #[test]
+    fn environment_ready_requires_python_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = EnvironmentManager::new(tmp.path().to_path_buf());
+        let venv = tmp.path().join("venv-without-python");
+        std::fs::create_dir_all(&venv).unwrap();
+
+        // Marking a venv whose python is missing records no mtime, so it can
+        // never satisfy a readiness check.
+        manager.mark_environment_ready(venv.clone(), "fp".to_string());
+        assert!(!manager.environment_is_ready(&venv, "fp"));
+    }
+
+    #[test]
+    fn environment_fingerprint_tracks_dependencies() {
+        // Test the pure variant: the public one reads TINE_BUNDLED_PYTHON,
+        // which a sibling test mutates, making it racy under parallel runs.
+        let spec_a = EnvironmentSpec {
+            dependencies: vec!["pandas".to_string()],
+        };
+        let spec_b = EnvironmentSpec {
+            dependencies: vec!["polars".to_string()],
+        };
+        assert_eq!(
+            EnvironmentManager::environment_fingerprint_with(false, &spec_a),
+            EnvironmentManager::environment_fingerprint_with(false, &spec_a),
+        );
+        assert_ne!(
+            EnvironmentManager::environment_fingerprint_with(false, &spec_a),
+            EnvironmentManager::environment_fingerprint_with(false, &spec_b),
+        );
+        assert_ne!(
+            EnvironmentManager::environment_fingerprint_with(false, &spec_a),
+            EnvironmentManager::environment_fingerprint_with(true, &spec_a),
+            "bundled-runtime mode must be part of the fingerprint"
+        );
+    }
+
+    // ---- Architecture-pin enforcement ------------------------------------
+
+    /// Restores an env var to its prior value on drop, so serial env-mutating
+    /// tests don't leak state into each other.
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    // Pure policy: exhaustive and deterministic, no subprocess/env.
+    #[test]
+    fn classify_platform_match_covers_pin_states() {
+        assert_eq!(
+            classify_platform_match(None, Some("arm64")),
+            PlatformMatch::NotPinned,
+            "no pin disables enforcement"
+        );
+        assert_eq!(
+            classify_platform_match(Some("arm64"), Some("arm64")),
+            PlatformMatch::Match
+        );
+        assert_eq!(
+            classify_platform_match(Some("ARM64"), Some("arm64")),
+            PlatformMatch::Match,
+            "comparison is case-insensitive"
+        );
+        assert_eq!(
+            classify_platform_match(Some("arm64"), Some("x86_64")),
+            PlatformMatch::Mismatch
+        );
+        assert_eq!(
+            classify_platform_match(Some("arm64"), None),
+            PlatformMatch::Mismatch,
+            "unknown interpreter arch fails closed"
+        );
+    }
+
+    /// Resolve a real host interpreter (unpinned) and probe its arch, so the
+    /// e2e tests below are portable across whatever arch the runner is on.
+    /// Returns None when no interpreter is available; the e2e tests then skip
+    /// rather than fail. The pure-logic tests (`classify_platform_match_*`,
+    /// `environment_fingerprint_includes_pinned_arch`) stay non-skippable, so
+    /// CI must provide a Python interpreter for the e2e arch tests to have
+    /// teeth — which it does, since tine cannot run kernels without one.
+    async fn host_interpreter(manager: &EnvironmentManager) -> Option<(PythonCommand, String)> {
+        let command = manager.resolve_python_command(DEFAULT_PYTHON_VERSION).await.ok()?;
+        let arch = manager.probe_python_platform(&command).await?;
+        Some((command, arch))
+    }
+
+    fn wrong_arch(host_arch: &str) -> &'static str {
+        if host_arch.eq_ignore_ascii_case("x86_64") {
+            "arm64"
+        } else {
+            "x86_64"
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn probe_reports_a_real_interpreter_architecture() {
+        let manager = EnvironmentManager::new(std::env::temp_dir());
+        let _pin = EnvVarGuard::unset(PINNED_PLATFORM_ENV);
+        let Some((command, arch)) = host_interpreter(&manager).await else {
+            eprintln!("no host python available; skipping");
+            return;
+        };
+        assert!(!arch.is_empty(), "probe must report a non-empty arch");
+        // Classify the real interpreter against itself and against a wrong arch.
+        assert_eq!(
+            manager.classify_python_platform(&command, Some(&arch)).await,
+            PlatformMatch::Match
+        );
+        assert_eq!(
+            manager
+                .classify_python_platform(&command, Some(wrong_arch(&arch)))
+                .await,
+            PlatformMatch::Mismatch
+        );
+        assert_eq!(
+            manager.classify_python_platform(&command, None).await,
+            PlatformMatch::NotPinned
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolve_accepts_interpreter_matching_the_pin() {
+        let manager = EnvironmentManager::new(std::env::temp_dir());
+        let arch = {
+            let _pin = EnvVarGuard::unset(PINNED_PLATFORM_ENV);
+            let Some((_, arch)) = host_interpreter(&manager).await else {
+                eprintln!("no host python available; skipping");
+                return;
+            };
+            arch
+        };
+        let _pin = EnvVarGuard::set(PINNED_PLATFORM_ENV, &arch);
+        manager
+            .resolve_python_command(DEFAULT_PYTHON_VERSION)
+            .await
+            .expect("a host-arch pin must resolve the native interpreter");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolve_hard_fails_when_explicit_interpreter_mismatches_pin() {
+        let manager = EnvironmentManager::new(std::env::temp_dir());
+        let (program, arch) = {
+            let _pin = EnvVarGuard::unset(PINNED_PLATFORM_ENV);
+            let _clear_explicit = EnvVarGuard::unset("TINE_PYTHON");
+            let Some((command, arch)) = host_interpreter(&manager).await else {
+                eprintln!("no host python available; skipping");
+                return;
+            };
+            (command.program, arch)
+        };
+        // Point TINE_PYTHON at a real interpreter but pin a different arch.
+        let _explicit = EnvVarGuard::set("TINE_PYTHON", &program.to_string_lossy());
+        let _pin = EnvVarGuard::set(PINNED_PLATFORM_ENV, wrong_arch(&arch));
+        let err = manager
+            .resolve_python_command(DEFAULT_PYTHON_VERSION)
+            .await
+            .expect_err("an explicitly-configured wrong-arch interpreter must hard-fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("architecture"),
+            "error must explain the architecture mismatch: {message}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resolve_is_unaffected_when_no_arch_is_pinned() {
+        let manager = EnvironmentManager::new(std::env::temp_dir());
+        let _pin = EnvVarGuard::unset(PINNED_PLATFORM_ENV);
+        // Regression: default (unpinned) resolution must still find a python.
+        if manager
+            .resolve_python_command(DEFAULT_PYTHON_VERSION)
+            .await
+            .is_err()
+        {
+            eprintln!("no host python available; skipping");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn created_venv_interpreter_is_probed_against_the_pin() {
+        let manager = EnvironmentManager::new(std::env::temp_dir());
+        let (command, arch) = {
+            let _pin = EnvVarGuard::unset(PINNED_PLATFORM_ENV);
+            let Some(pair) = host_interpreter(&manager).await else {
+                eprintln!("no host python available; skipping");
+                return;
+            };
+            pair
+        };
+
+        let temp = tempdir().expect("temp dir");
+        let venv_dir = temp.path().join("venv");
+        let mut logs = Vec::new();
+        manager
+            .create_venv("test-runtime", &command, &venv_dir, false, &mut logs)
+            .await
+            .expect("venv creation should succeed with the host interpreter");
+        assert!(manager.venv_looks_valid(&venv_dir), "venv must be valid");
+
+        // The on-disk guard probes the venv's OWN interpreter. A real venv
+        // built from the host python must match the host arch, mismatch a
+        // foreign arch, and be exempt when nothing is pinned.
+        let venv_python = PythonCommand::new(manager.python_path(&venv_dir), Vec::new());
+        assert_eq!(
+            manager.classify_python_platform(&venv_python, Some(&arch)).await,
+            PlatformMatch::Match
+        );
+        assert_eq!(
+            manager
+                .classify_python_platform(&venv_python, Some(wrong_arch(&arch)))
+                .await,
+            PlatformMatch::Mismatch,
+            "a foreign-arch pin must flag the venv for recreation"
+        );
+        assert_eq!(
+            manager.classify_python_platform(&venv_python, None).await,
+            PlatformMatch::NotPinned
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn environment_fingerprint_includes_pinned_arch() {
+        let _guard = EnvVarGuard::set(PINNED_PLATFORM_ENV, "arm64");
+        let with_arm = EnvironmentManager::environment_fingerprint_with(false, &EnvironmentSpec::default());
+        drop(_guard);
+        let _guard = EnvVarGuard::set(PINNED_PLATFORM_ENV, "x86_64");
+        let with_x86 = EnvironmentManager::environment_fingerprint_with(false, &EnvironmentSpec::default());
+        drop(_guard);
+        assert_ne!(
+            with_arm, with_x86,
+            "changing the pinned arch must change the fingerprint so the ready stamp invalidates"
+        );
     }
 }

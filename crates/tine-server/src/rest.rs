@@ -206,6 +206,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(execute_experiment_tree_branch),
         )
         .route(
+            "/api/experiment-trees/{id}/branches/{branch_id}/plan",
+            get(plan_experiment_tree_branch),
+        )
+        .route(
             "/api/experiment-trees/{id}/execute-all-branches",
             post(execute_all_experiment_tree_branches),
         )
@@ -218,6 +222,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(export_experiment_tree_branch_ipynb),
         )
         .route("/api/executions/{id}", get(get_execution_status))
+        .route("/api/executions/{id}/results", get(get_execution_results))
         .route("/api/executions/{id}/cancel", post(cancel_execution))
         .route("/api/files", get(list_files_handler))
         .route("/api/files/read", get(read_file_handler))
@@ -303,6 +308,9 @@ async fn create_experiment_tree_handler(
         .workspace
         .create_experiment_tree(&req.name, project_id.as_ref())
         .await?;
+    // Boot the environment and kernel in the background while the user
+    // writes their first cell, so the first run pays only for the cell.
+    Workspace::spawn_runtime_prewarm(state.workspace.clone(), &tree);
     Ok((StatusCode::CREATED, Json(tree)))
 }
 
@@ -530,8 +538,11 @@ async fn add_experiment_tree_branch_cell(
     State(state): State<Arc<AppState>>,
     Path((id, branch_id)): Path<(String, String)>,
     Json(req): Json<AddExperimentTreeBranchCellRequest>,
-) -> Result<StatusCode, AppError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     let after = req.after_cell_id.map(CellId::new);
+    // Echo the cell id back: clients that let the adapter/UI generate the id
+    // need it for every follow-up call (update, execute, logs).
+    let cell_id = req.cell.id.as_str().to_string();
     state
         .workspace
         .add_cell_to_experiment_tree_branch(
@@ -541,7 +552,10 @@ async fn add_experiment_tree_branch_cell(
             after.as_ref(),
         )
         .await?;
-    Ok(StatusCode::CREATED)
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "cell_id": cell_id })),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -614,15 +628,51 @@ async fn delete_experiment_tree_branch(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Optional body for execute submissions. Absent bodies keep the legacy
+/// fire-and-forget semantics; `idempotency_key` makes retries safe (a resend
+/// with the same key returns the original execution).
+#[derive(Deserialize, Default)]
+struct ExecuteRequest {
+    idempotency_key: Option<String>,
+}
+
+/// Extract the idempotency key from an execute request body. Execute
+/// endpoints historically accept empty bodies (with or without a JSON
+/// content-type), so an empty body keeps the legacy "no options" path —
+/// but a non-empty body that doesn't parse is rejected: silently dropping
+/// it would accept the execution without the dedupe guarantee the caller
+/// asked for.
+fn execute_request_idempotency_key(body: &[u8]) -> Result<Option<String>, AppError> {
+    if body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(None);
+    }
+    let request: ExecuteRequest = serde_json::from_slice(body).map_err(|e| {
+        AppError(tine_core::TineError::Config(format!(
+            "invalid execute request body: {e}"
+        )))
+    })?;
+    if let Some(key) = &request.idempotency_key {
+        if key.trim().is_empty() {
+            return Err(AppError(tine_core::TineError::Config(
+                "idempotency_key must be a non-empty string".to_string(),
+            )));
+        }
+    }
+    Ok(request.idempotency_key)
+}
+
 async fn execute_experiment_tree_branch_cell(
     State(state): State<Arc<AppState>>,
     Path((id, branch_id, cell_id)): Path<(String, String, String)>,
+    body: axum::body::Bytes,
 ) -> Result<(StatusCode, Json<ExecutionAccepted>), AppError> {
-    let accepted = Workspace::submit_cell_execution_in_experiment_tree_branch(
+    let idempotency_key = execute_request_idempotency_key(&body)?;
+    let accepted = Workspace::submit_cell_execution_in_experiment_tree_branch_with_options(
         state.workspace.clone(),
         &ExperimentTreeId::new(id),
         &BranchId::new(branch_id),
         &CellId::new(cell_id),
+        idempotency_key.as_deref(),
     )
     .await?;
     Ok((StatusCode::ACCEPTED, Json(accepted)))
@@ -631,12 +681,18 @@ async fn execute_experiment_tree_branch_cell(
 async fn execute_experiment_tree_branch(
     State(state): State<Arc<AppState>>,
     Path((id, branch_id)): Path<(String, String)>,
+    body: axum::body::Bytes,
 ) -> Result<(StatusCode, Json<ExecutionAccepted>), AppError> {
     let tree_id = ExperimentTreeId::new(id);
     let branch_id = BranchId::new(branch_id);
+    let idempotency_key = execute_request_idempotency_key(&body)?;
     let exec_id = state
         .workspace
-        .execute_branch_in_experiment_tree(&tree_id, &branch_id)
+        .execute_branch_in_experiment_tree_with_options(
+            &tree_id,
+            &branch_id,
+            idempotency_key.as_deref(),
+        )
         .await?;
     Ok((
         StatusCode::ACCEPTED,
@@ -727,6 +783,40 @@ async fn get_execution_status(
 ) -> Result<Json<ExecutionStatus>, AppError> {
     let status = state.workspace.status(&ExecutionId::new(id)).await?;
     Ok(Json(status))
+}
+
+/// Execution status plus every node's logs in one response — saves clients a
+/// logs round-trip per cell, and doubles as a progress feed for running
+/// executions (live streaming chunks are folded in).
+async fn get_execution_results(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (status, node_logs) = state
+        .workspace
+        .execution_results(&ExecutionId::new(id))
+        .await?;
+    Ok(Json(serde_json::json!({
+        "status": status,
+        "node_logs": node_logs,
+    })))
+}
+
+/// Dry-run of a branch execution: which cells would run vs cache-hit and why.
+async fn plan_experiment_tree_branch(
+    State(state): State<Arc<AppState>>,
+    Path((id, branch_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cells = state
+        .workspace
+        .preview_branch_execution_plan(&ExperimentTreeId::new(id), &BranchId::new(branch_id))
+        .await?;
+    let run = cells.iter().filter(|cell| cell.action == "run").count();
+    let cache_hits = cells.len() - run;
+    Ok(Json(serde_json::json!({
+        "cells": cells,
+        "summary": { "run": run, "cache_hits": cache_hits },
+    })))
 }
 
 async fn cancel_execution(
@@ -1237,17 +1327,22 @@ impl axum::response::IntoResponse for AppError {
             | tine_core::TineError::ArtifactNotFound(_)
             | tine_core::TineError::ProjectNotFound(_)
             | tine_core::TineError::KernelNotFound { .. }
+            | tine_core::TineError::NotFound(_)
             | tine_core::TineError::NodeNotFound { .. } => StatusCode::NOT_FOUND,
             tine_core::TineError::DuplicateNode { .. }
             | tine_core::TineError::CycleDetected { .. }
             | tine_core::TineError::InvalidEdge { .. }
             | tine_core::TineError::Config(_) => StatusCode::BAD_REQUEST,
             tine_core::TineError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
+            tine_core::TineError::IdempotencyConflict(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
+        // `code` is the stable machine-readable error class; clients branch
+        // on it instead of parsing the human-readable message.
         let body = serde_json::json!({
             "error": self.0.to_string(),
+            "code": self.0.code(),
         });
 
         (status, Json(body)).into_response()
@@ -1268,8 +1363,8 @@ mod tests {
     use tempfile::TempDir;
     use tine_core::{
         ArtifactKey, ArtifactMetadata, ArtifactStore, BranchId, BranchIsolationMode, CellId,
-        CellRuntimeState, ExperimentTreeDef, ExperimentTreeId, ProjectId, TineResult,
-        TreeKernelState, TreeRuntimeState,
+        CellRuntimeState, ExecutionLifecycleStatus, ExperimentTreeDef, ExperimentTreeId, ProjectId,
+        TineResult, TreeKernelState, TreeRuntimeState,
     };
     use tower::util::ServiceExt;
 
@@ -3278,5 +3373,307 @@ mod tests {
         std::env::remove_var("TINE_UI_DIR");
 
         assert_eq!(resolved, packaged_ui);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_error_bodies_carry_machine_readable_code() {
+        let (_tmp, app) = test_app().await;
+
+        let response = send_json(&app, Method::GET, "/api/experiment-trees/missing", None).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value = read_json(response).await;
+        assert_eq!(body["code"], "not_found");
+        assert!(body["error"].as_str().unwrap().contains("not found"));
+
+        let response = send_json(&app, Method::GET, "/api/executions/missing/results", None).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value = read_json(response).await;
+        assert_eq!(body["code"], "not_found");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_plan_endpoint_previews_cache_state_without_executing() {
+        let (_tmp, app) = test_app().await;
+        let create = send_json(
+            &app,
+            Method::POST,
+            "/api/experiment-trees",
+            Some(create_tree_payload("plan-preview", None)),
+        )
+        .await;
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let tree: serde_json::Value = read_json(create).await;
+        let tree_id = tree["id"].as_str().unwrap();
+        let branch_id = tree["root_branch_id"].as_str().unwrap();
+
+        let response = send_json(
+            &app,
+            Method::GET,
+            &format!("/api/experiment-trees/{tree_id}/branches/{branch_id}/plan"),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let plan: serde_json::Value = read_json(response).await;
+        assert_eq!(plan["summary"]["run"], 1);
+        assert_eq!(plan["summary"]["cache_hits"], 0);
+        assert_eq!(plan["cells"][0]["action"], "run");
+        // The default root cell is cache-enabled but has never run.
+        assert_eq!(plan["cells"][0]["reason"], "no_prior_run");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn test_execute_with_idempotency_key_dedupes_and_results_returns_node_logs() {
+        let (_tmp, app) = test_app().await;
+        let create = send_json(
+            &app,
+            Method::POST,
+            "/api/experiment-trees",
+            Some(create_tree_payload("idempotent-exec", None)),
+        )
+        .await;
+        let tree: serde_json::Value = read_json(create).await;
+        let tree_id = tree["id"].as_str().unwrap().to_string();
+        let branch_id = tree["root_branch_id"].as_str().unwrap().to_string();
+        let cell_id = tree["cells"][0]["id"].as_str().unwrap().to_string();
+
+        let update = send_json(
+            &app,
+            Method::POST,
+            &format!("/api/experiment-trees/{tree_id}/branches/{branch_id}/cells/{cell_id}/code"),
+            Some(serde_json::json!({ "source": "print('idempotent run', flush=True)\nvalue = 7" })),
+        )
+        .await;
+        assert_eq!(update.status(), StatusCode::OK);
+
+        let first = send_json(
+            &app,
+            Method::POST,
+            &format!("/api/experiment-trees/{tree_id}/branches/{branch_id}/execute"),
+            Some(serde_json::json!({ "idempotency_key": "rest-test-key-1" })),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_accepted: serde_json::Value = read_json(first).await;
+        let execution_id = first_accepted["execution_id"].as_str().unwrap().to_string();
+
+        // A retried submission with the same key reattaches to the original
+        // execution instead of starting a duplicate run.
+        let second = send_json(
+            &app,
+            Method::POST,
+            &format!("/api/experiment-trees/{tree_id}/branches/{branch_id}/execute"),
+            Some(serde_json::json!({ "idempotency_key": "rest-test-key-1" })),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
+        let second_accepted: serde_json::Value = read_json(second).await;
+        assert_eq!(
+            second_accepted["execution_id"].as_str().unwrap(),
+            execution_id,
+            "same idempotency key must return the original execution"
+        );
+
+        let status = wait_for_finished_status(&app, &execution_id).await;
+        assert_eq!(status.status, ExecutionLifecycleStatus::Completed);
+
+        // Results: status + all node logs in one call.
+        let results = send_json(
+            &app,
+            Method::GET,
+            &format!("/api/executions/{execution_id}/results"),
+            None,
+        )
+        .await;
+        assert_eq!(results.status(), StatusCode::OK);
+        let results: serde_json::Value = read_json(results).await;
+        assert_eq!(results["status"]["status"], "completed");
+        let stdout = results["node_logs"][&cell_id]["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains("idempotent run"),
+            "results must include node stdout, got {stdout:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn test_idempotency_key_is_scoped_to_the_execute_target() {
+        let (_tmp, app) = test_app().await;
+        let create = send_json(
+            &app,
+            Method::POST,
+            "/api/experiment-trees",
+            Some(create_tree_payload("idempotent-scope", None)),
+        )
+        .await;
+        let tree: serde_json::Value = read_json(create).await;
+        let tree_id = tree["id"].as_str().unwrap().to_string();
+        let branch_id = tree["root_branch_id"].as_str().unwrap().to_string();
+        let cell_id = tree["cells"][0]["id"].as_str().unwrap().to_string();
+
+        let branch_exec = send_json(
+            &app,
+            Method::POST,
+            &format!("/api/experiment-trees/{tree_id}/branches/{branch_id}/execute"),
+            Some(serde_json::json!({ "idempotency_key": "rest-scope-key-1" })),
+        )
+        .await;
+        assert_eq!(branch_exec.status(), StatusCode::ACCEPTED);
+        let branch_accepted: serde_json::Value = read_json(branch_exec).await;
+        let branch_execution_id = branch_accepted["execution_id"].as_str().unwrap().to_string();
+
+        // The same key on a different execute target (a cell submission)
+        // must start its own execution, not attach to the branch run.
+        let cell_exec = send_json(
+            &app,
+            Method::POST,
+            &format!(
+                "/api/experiment-trees/{tree_id}/branches/{branch_id}/cells/{cell_id}/execute"
+            ),
+            Some(serde_json::json!({ "idempotency_key": "rest-scope-key-1" })),
+        )
+        .await;
+        assert_eq!(cell_exec.status(), StatusCode::ACCEPTED);
+        let cell_accepted: serde_json::Value = read_json(cell_exec).await;
+        let cell_execution_id = cell_accepted["execution_id"].as_str().unwrap().to_string();
+        assert_ne!(
+            cell_execution_id, branch_execution_id,
+            "a reused idempotency key on a different target must not reattach"
+        );
+
+        // A genuine retry of the cell submission still dedupes.
+        let cell_retry = send_json(
+            &app,
+            Method::POST,
+            &format!(
+                "/api/experiment-trees/{tree_id}/branches/{branch_id}/cells/{cell_id}/execute"
+            ),
+            Some(serde_json::json!({ "idempotency_key": "rest-scope-key-1" })),
+        )
+        .await;
+        assert_eq!(cell_retry.status(), StatusCode::ACCEPTED);
+        let cell_retry_accepted: serde_json::Value = read_json(cell_retry).await;
+        assert_eq!(
+            cell_retry_accepted["execution_id"].as_str().unwrap(),
+            cell_execution_id,
+            "a retried cell submission with the same key must reattach to the cell run"
+        );
+
+        let status = wait_for_finished_status(&app, &branch_execution_id).await;
+        assert_eq!(status.status, ExecutionLifecycleStatus::Completed);
+        let status = wait_for_finished_status(&app, &cell_execution_id).await;
+        assert_eq!(status.status, ExecutionLifecycleStatus::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn test_idempotency_key_reuse_after_edit_is_a_conflict() {
+        let (_tmp, app) = test_app().await;
+        let create = send_json(
+            &app,
+            Method::POST,
+            "/api/experiment-trees",
+            Some(create_tree_payload("idempotent-fingerprint", None)),
+        )
+        .await;
+        let tree: serde_json::Value = read_json(create).await;
+        let tree_id = tree["id"].as_str().unwrap().to_string();
+        let branch_id = tree["root_branch_id"].as_str().unwrap().to_string();
+        let cell_id = tree["cells"][0]["id"].as_str().unwrap().to_string();
+
+        let first = send_json(
+            &app,
+            Method::POST,
+            &format!("/api/experiment-trees/{tree_id}/branches/{branch_id}/execute"),
+            Some(serde_json::json!({ "idempotency_key": "rest-fingerprint-key-1" })),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_accepted: serde_json::Value = read_json(first).await;
+        let execution_id = first_accepted["execution_id"].as_str().unwrap().to_string();
+
+        // Editing the cell changes the execution-relevant state: reusing the
+        // old key is no longer a retry, so it must conflict instead of
+        // silently returning the stale execution.
+        let update = send_json(
+            &app,
+            Method::POST,
+            &format!("/api/experiment-trees/{tree_id}/branches/{branch_id}/cells/{cell_id}/code"),
+            Some(serde_json::json!({ "source": "value = 'edited'" })),
+        )
+        .await;
+        assert_eq!(update.status(), StatusCode::OK);
+
+        let reused = send_json(
+            &app,
+            Method::POST,
+            &format!("/api/experiment-trees/{tree_id}/branches/{branch_id}/execute"),
+            Some(serde_json::json!({ "idempotency_key": "rest-fingerprint-key-1" })),
+        )
+        .await;
+        assert_eq!(
+            reused.status(),
+            StatusCode::CONFLICT,
+            "key reuse after an edit must be rejected"
+        );
+        let error: serde_json::Value = read_json(reused).await;
+        assert_eq!(error["code"], "idempotency_conflict");
+
+        let status = wait_for_finished_status(&app, &execution_id).await;
+        assert_eq!(status.status, ExecutionLifecycleStatus::Completed);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_execute_rejects_malformed_request_bodies() {
+        let (_tmp, app) = test_app().await;
+        let create = send_json(
+            &app,
+            Method::POST,
+            "/api/experiment-trees",
+            Some(create_tree_payload("malformed-body", None)),
+        )
+        .await;
+        let tree: serde_json::Value = read_json(create).await;
+        let tree_id = tree["id"].as_str().unwrap().to_string();
+        let branch_id = tree["root_branch_id"].as_str().unwrap().to_string();
+        let execute_uri =
+            format!("/api/experiment-trees/{tree_id}/branches/{branch_id}/execute");
+
+        // Invalid JSON must not silently drop the caller's idempotency
+        // options and start an unprotected execution.
+        let invalid_json = Request::builder()
+            .method(Method::POST)
+            .uri(&execute_uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{not json"))
+            .unwrap();
+        let response = app.clone().oneshot(invalid_json).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error: serde_json::Value = read_json(response).await;
+        assert_eq!(error["code"], "validation");
+
+        // A non-string idempotency_key is schema skew, not "no options".
+        let non_string_key = send_json(
+            &app,
+            Method::POST,
+            &execute_uri,
+            Some(serde_json::json!({ "idempotency_key": 42 })),
+        )
+        .await;
+        assert_eq!(non_string_key.status(), StatusCode::BAD_REQUEST);
+
+        // An empty-string key would dedupe unrelated submissions.
+        let empty_key = send_json(
+            &app,
+            Method::POST,
+            &execute_uri,
+            Some(serde_json::json!({ "idempotency_key": "" })),
+        )
+        .await;
+        assert_eq!(empty_key.status(), StatusCode::BAD_REQUEST);
     }
 }

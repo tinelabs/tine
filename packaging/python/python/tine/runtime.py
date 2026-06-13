@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import platform
 import re
@@ -134,6 +135,62 @@ def bundled_python_path_for_root(runtime_root: Path) -> Path:
             return candidate
 
     return preferred
+
+
+# Install-stage architecture descriptor, written next to the bundled
+# interpreter by scripts/release at build time (see standalone_python.py).
+PLATFORM_DESCRIPTOR_FILENAME = ".tine-platform.json"
+
+
+def bundled_platform_descriptor_path(runtime_root: Path) -> Path | None:
+    """Locate the platform descriptor that ships next to the bundled python
+    (in the interpreter's root dir), or None when there is no bundled python."""
+    python_exe = bundled_python_path_for_root(runtime_root)
+    if not python_exe.is_file():
+        return None
+    python_root = (
+        python_exe.parent
+        if platform.system() == "Windows"
+        else python_exe.parent.parent
+    )
+    return python_root / PLATFORM_DESCRIPTOR_FILENAME
+
+
+def bundled_platform_machine(runtime_root: Path) -> str | None:
+    """The bundled interpreter's recorded architecture (`platform.machine()`),
+    or None when no descriptor ships with this runtime."""
+    path = bundled_platform_descriptor_path(runtime_root)
+    if path is None or not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    machine = str(payload.get("machine") or "").strip()
+    return machine or None
+
+
+def process_is_translated() -> bool:
+    """True when this process runs under Rosetta 2 (an x86_64 process on
+    arm64 macOS hardware). Used only to warn about a non-native bundle."""
+    if platform.system() != "Darwin":
+        return False
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.dylib", use_errno=True)
+        value = ctypes.c_int(0)
+        size = ctypes.c_size_t(ctypes.sizeof(value))
+        res = libc.sysctlbyname(
+            b"sysctl.proc_translated",
+            ctypes.byref(value),
+            ctypes.byref(size),
+            None,
+            0,
+        )
+        return res == 0 and value.value == 1
+    except Exception:
+        return False
 
 
 def release_base_url(version: str | None = None) -> str:

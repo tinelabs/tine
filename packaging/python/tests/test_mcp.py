@@ -24,6 +24,7 @@ class _Handler(BaseHTTPRequestHandler):
     last_update_cell_payload: dict[str, object] | None = None
     last_move_cell_payload: dict[str, object] | None = None
     deleted_path: str | None = None
+    last_execute_payload: dict[str, object] | None = None
     cancel_requested = False
     restart_requested = False
     wait_status_requests = 0
@@ -72,6 +73,72 @@ class _Handler(BaseHTTPRequestHandler):
                     "replay_required": type(self).restart_requested,
                     "active_branch_id": "main",
                     "runtime_epoch": 4,
+                },
+            )
+            return
+        if self.path == "/api/executions/exec_branch_1":
+            self._json(
+                200,
+                {
+                    "execution_id": "exec_branch_1",
+                    "status": "completed",
+                    "phase": "completed",
+                    "cancellation_requested_at": None,
+                    "node_statuses": {"cell_1": "completed"},
+                    "finished_at": "2026-04-07T10:15:05Z",
+                },
+            )
+            return
+        if self.path == "/api/executions/exec_branch_1/results":
+            self._json(
+                200,
+                {
+                    "status": {
+                        "execution_id": "exec_branch_1",
+                        "status": "completed",
+                        "phase": "completed",
+                        "node_statuses": {"cell_1": "completed"},
+                        "finished_at": "2026-04-07T10:15:05Z",
+                    },
+                    "node_logs": {
+                        "cell_1": {
+                            "stdout": "line1\nline2\n",
+                            "stderr": "",
+                            "outputs": [
+                                {"data": {"image/png": "A" * 9000}, "metadata": {}}
+                            ],
+                            "error": None,
+                            "duration_ms": 5,
+                            "metrics": {},
+                        }
+                    },
+                },
+            )
+            return
+        if self.path == "/api/executions/exec_logs_error":
+            self._json(
+                200,
+                {
+                    "execution_id": "exec_logs_error",
+                    "status": "completed",
+                    "phase": "completed",
+                    "cancellation_requested_at": None,
+                    "node_statuses": {"cell_1": "completed"},
+                    "finished_at": "2026-04-07T10:15:05Z",
+                },
+            )
+            return
+        if self.path == "/api/executions/exec_logs_error/results":
+            self._json(500, {"error": "results store unavailable", "code": "database"})
+            return
+        if self.path == "/api/experiment-trees/tree_1/branches/main/plan":
+            self._json(
+                200,
+                {
+                    "cells": [
+                        {"cell_id": "cell_1", "action": "cache_hit", "reason": "cached"}
+                    ],
+                    "summary": {"run": 0, "cache_hits": 1},
                 },
             )
             return
@@ -164,7 +231,7 @@ class _Handler(BaseHTTPRequestHandler):
                 },
             )
             return
-        self._json(404, {"error": "not found"})
+        self._json(404, {"error": "not found", "code": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
         length = int(self.headers.get("Content-Length", "0"))
@@ -200,6 +267,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if self.path == "/api/experiment-trees/tree_1/branches/main/execute":
+            type(self).last_execute_payload = payload
             self._json(
                 202,
                 {
@@ -267,7 +335,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             return
-        self._json(404, {"error": "not found"})
+        self._json(404, {"error": "not found", "code": "not_found"})
 
     def do_PUT(self) -> None:  # noqa: N802
         length = int(self.headers.get("Content-Length", "0"))
@@ -276,7 +344,7 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/api/experiment-trees/tree_1":
             self._json(200, payload)
             return
-        self._json(404, {"error": "not found"})
+        self._json(404, {"error": "not found", "code": "not_found"})
 
     def do_DELETE(self) -> None:  # noqa: N802
         if self.path in {
@@ -287,7 +355,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(204)
             self.end_headers()
             return
-        self._json(404, {"error": "not found"})
+        self._json(404, {"error": "not found", "code": "not_found"})
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003
         return
@@ -316,6 +384,7 @@ class McpPythonTests(unittest.TestCase):
         _Handler.last_update_cell_payload = None
         _Handler.last_move_cell_payload = None
         _Handler.deleted_path = None
+        _Handler.last_execute_payload = None
         _Handler.cancel_requested = False
         _Handler.restart_requested = False
         _Handler.wait_status_requests = 0
@@ -448,8 +517,10 @@ class McpPythonTests(unittest.TestCase):
             "restart_kernel", {"experiment_id": "tree_1"}
         )
         self.assertFalse(restart_kernel.is_error)
+        restart_payload = json.loads(restart_kernel.content[0]["text"])
+        self.assertEqual(restart_payload["experiment_id"], "tree_1")
         self.assertEqual(
-            restart_kernel.content[0]["text"],
+            restart_payload["message"],
             "Kernel restart requested for experiment tree_1",
         )
 
@@ -509,10 +580,8 @@ class McpPythonTests(unittest.TestCase):
 
         cancel = self.server.call_tool("cancel", {"execution_id": "exec_1"})
         self.assertFalse(cancel.is_error)
-        self.assertEqual(
-            cancel.content[0]["text"],
-            "Cancellation requested for execution exec_1",
-        )
+        cancel_payload = json.loads(cancel.content[0]["text"])
+        self.assertEqual(cancel_payload["execution_id"], "exec_1")
 
         requested_status = self.server.call_tool("status", {"execution_id": "exec_1"})
         self.assertFalse(requested_status.is_error)
@@ -897,7 +966,9 @@ class McpPythonTests(unittest.TestCase):
         )
 
         self.assertFalse(result.is_error)
-        self.assertEqual(result.content[0]["text"], "Branch created: branch_1")
+        branch_payload = json.loads(result.content[0]["text"])
+        self.assertEqual(branch_payload["branch_id"], "branch_1")
+        self.assertTrue(str(branch_payload["first_cell_id"]).startswith("cell_"))
         payload = _Handler.last_create_branch_payload
         self.assertIsNotNone(payload)
         assert payload is not None
@@ -929,7 +1000,9 @@ class McpPythonTests(unittest.TestCase):
         )
 
         self.assertFalse(result.is_error)
-        self.assertEqual(result.content[0]["text"], "Cell added to branch main")
+        add_payload = json.loads(result.content[0]["text"])
+        self.assertEqual(add_payload["branch_id"], "main")
+        self.assertTrue(str(add_payload["cell_id"]).startswith("cell_"))
         payload = _Handler.last_add_cell_payload
         self.assertIsNotNone(payload)
         assert payload is not None
@@ -954,7 +1027,9 @@ class McpPythonTests(unittest.TestCase):
             },
         )
         self.assertFalse(updated.is_error)
-        self.assertEqual(updated.content[0]["text"], "Cell cell_1 updated in branch main")
+        updated_payload = json.loads(updated.content[0]["text"])
+        self.assertEqual(updated_payload["cell_id"], "cell_1")
+        self.assertEqual(updated_payload["branch_id"], "main")
         self.assertEqual(_Handler.last_update_cell_payload, {"source": "value = 2\n"})
 
         moved = self.server.call_tool(
@@ -967,7 +1042,8 @@ class McpPythonTests(unittest.TestCase):
             },
         )
         self.assertFalse(moved.is_error)
-        self.assertEqual(moved.content[0]["text"], "Cell cell_1 moved down in branch main")
+        moved_payload = json.loads(moved.content[0]["text"])
+        self.assertEqual(moved_payload["cell_id"], "cell_1")
         self.assertEqual(_Handler.last_move_cell_payload, {"direction": "down"})
 
         deleted = self.server.call_tool(
@@ -979,7 +1055,8 @@ class McpPythonTests(unittest.TestCase):
             },
         )
         self.assertFalse(deleted.is_error)
-        self.assertEqual(deleted.content[0]["text"], "Cell cell_1 deleted from branch main")
+        deleted_payload = json.loads(deleted.content[0]["text"])
+        self.assertEqual(deleted_payload["cell_id"], "cell_1")
         self.assertEqual(
             _Handler.deleted_path,
             "/api/experiment-trees/tree_1/branches/main/cells/cell_1",
@@ -992,7 +1069,8 @@ class McpPythonTests(unittest.TestCase):
         )
 
         self.assertFalse(result.is_error)
-        self.assertEqual(result.content[0]["text"], "Branch branch_1 deleted")
+        delete_payload = json.loads(result.content[0]["text"])
+        self.assertEqual(delete_payload["branch_id"], "branch_1")
         self.assertEqual(_Handler.deleted_path, "/api/experiment-trees/tree_1/branches/branch_1")
 
     def test_inspect_cell_round_trips_over_api(self) -> None:
@@ -1066,6 +1144,125 @@ class McpPythonTests(unittest.TestCase):
         self.assertIn("cloudpickle==3.1.2", required)
         self.assertIn("pandas==3.0.2", defaults)
         self.assertIn("scikit-learn==1.8.0", defaults)
+
+    def test_execute_branch_waits_for_terminal_and_passes_idempotency_key(self) -> None:
+        result = self.server.call_tool(
+            "execute_branch",
+            {
+                "experiment_id": "tree_1",
+                "wait_timeout_secs": 5,
+                "include_logs": True,
+                "idempotency_key": "agent-key-1",
+            },
+        )
+
+        self.assertFalse(result.is_error)
+        payload = json.loads(result.content[0]["text"])
+        self.assertTrue(payload["terminal"])
+        self.assertEqual(payload["status"], "completed")
+        self.assertIn("cell_1", payload["node_logs"])
+        self.assertEqual(
+            _Handler.last_execute_payload, {"idempotency_key": "agent-key-1"}
+        )
+
+    def test_execute_branch_without_wait_returns_submission_envelope(self) -> None:
+        result = self.server.call_tool("execute_branch", {"experiment_id": "tree_1"})
+
+        self.assertFalse(result.is_error)
+        payload = json.loads(result.content[0]["text"])
+        self.assertEqual(payload["execution_id"], "exec_branch_1")
+        self.assertNotIn("terminal", payload)
+
+    def test_execute_branch_auto_generates_and_echoes_idempotency_key(self) -> None:
+        """Execute submissions must be retry-safe by default: when the agent
+        omits an idempotency key, the adapter generates one, sends it with
+        the request, and echoes it in the response so a timed-out submission
+        can be retried with the same key."""
+        result = self.server.call_tool("execute_branch", {"experiment_id": "tree_1"})
+
+        self.assertFalse(result.is_error)
+        sent = _Handler.last_execute_payload or {}
+        generated_key = str(sent.get("idempotency_key") or "")
+        self.assertTrue(
+            generated_key,
+            "execute_branch must submit an auto-generated idempotency key",
+        )
+        payload = json.loads(result.content[0]["text"])
+        self.assertEqual(payload["idempotency_key"], generated_key)
+
+    def test_execute_branch_wait_result_includes_idempotency_key(self) -> None:
+        result = self.server.call_tool(
+            "execute_branch",
+            {
+                "experiment_id": "tree_1",
+                "wait_timeout_secs": 5,
+                "poll_interval_ms": 50,
+            },
+        )
+
+        self.assertFalse(result.is_error)
+        sent = _Handler.last_execute_payload or {}
+        payload = json.loads(result.content[0]["text"])
+        self.assertEqual(payload["idempotency_key"], sent.get("idempotency_key"))
+
+    def test_wait_with_include_logs_surfaces_log_retrieval_failure(self) -> None:
+        """A failed results fetch must be distinguishable from an execution
+        that produced no logs: the wait result stays valid but carries a
+        structured logs_error instead of silently returning empty logs."""
+        result = self.server.call_tool(
+            "wait_for_execution",
+            {
+                "execution_id": "exec_logs_error",
+                "wait_timeout_secs": 5,
+                "poll_interval_ms": 50,
+                "include_logs": True,
+            },
+        )
+
+        self.assertFalse(result.is_error)
+        payload = json.loads(result.content[0]["text"])
+        self.assertEqual(payload["node_logs"], {})
+        self.assertIn("logs_error", payload)
+        self.assertTrue(payload["logs_error"]["message"])
+        self.assertTrue(payload["logs_error"]["code"])
+
+    def test_results_caps_large_inline_outputs_by_default(self) -> None:
+        capped = self.server.call_tool("results", {"execution_id": "exec_branch_1"})
+        self.assertFalse(capped.is_error)
+        capped_logs = json.loads(capped.content[0]["text"])["node_logs"]["cell_1"]
+        self.assertTrue(capped_logs["outputs_truncated"])
+        self.assertIn("bytes omitted", capped_logs["outputs"][0]["data"]["image/png"])
+
+        full = self.server.call_tool(
+            "results", {"execution_id": "exec_branch_1", "include_outputs": True}
+        )
+        full_logs = json.loads(full.content[0]["text"])["node_logs"]["cell_1"]
+        self.assertEqual(len(full_logs["outputs"][0]["data"]["image/png"]), 9000)
+
+    def test_plan_branch_round_trips_over_api(self) -> None:
+        result = self.server.call_tool("plan_branch", {"experiment_id": "tree_1"})
+
+        self.assertFalse(result.is_error)
+        payload = json.loads(result.content[0]["text"])
+        self.assertEqual(payload["summary"], {"run": 0, "cache_hits": 1})
+        self.assertEqual(payload["cells"][0]["reason"], "cached")
+
+    def test_errors_carry_machine_readable_code_and_next_action(self) -> None:
+        missing = self.server.call_tool(
+            "get_experiment", {"experiment_id": "missing_tree"}
+        )
+        self.assertTrue(missing.is_error)
+        missing_error = json.loads(missing.content[0]["text"])["error"]
+        self.assertEqual(missing_error["code"], "not_found")
+        self.assertIn("suggested_next_action", missing_error)
+
+        invalid = self.server.call_tool(
+            "move_cell",
+            {"experiment_id": "tree_1", "cell_id": "cell_1", "direction": "sideways"},
+        )
+        self.assertTrue(invalid.is_error)
+        invalid_error = json.loads(invalid.content[0]["text"])["error"]
+        self.assertEqual(invalid_error["code"], "validation")
 
 
 class _StallingHandler(BaseHTTPRequestHandler):
@@ -1160,7 +1357,7 @@ class StalledServerFailureTests(unittest.TestCase):
             f"timeout error must escalate visibility for non-idempotent submissions: {message}",
         )
         self.assertIn(
-            "DO NOT retry",
+            "idempotency_key",
             message,
             f"timeout error must instruct against blind retry to prevent "
             f"duplicate executions: {message}",
@@ -1169,6 +1366,24 @@ class StalledServerFailureTests(unittest.TestCase):
             "duplicate",
             message.lower(),
             f"timeout error must mention duplicate-risk: {message}",
+        )
+
+    def test_execute_branch_timeout_error_echoes_generated_idempotency_key(self) -> None:
+        """When an execute submission times out, the MCP error envelope must
+        carry the idempotency key that was sent (auto-generated when the
+        agent omitted one) — without it, the recovery advice to 'retry with
+        the same idempotency_key' is impossible to follow."""
+        server = McpServer("http://placeholder")
+        server.api = self.api
+
+        result = server.call_tool("execute_branch", {"experiment_id": "tree_1"})
+
+        self.assertTrue(result.is_error)
+        error = json.loads(result.content[0]["text"])["error"]
+        self.assertEqual(error["code"], "timeout")
+        self.assertTrue(
+            str(error.get("idempotency_key", "")).startswith("mcp-"),
+            f"timeout error must echo the generated idempotency key: {error}",
         )
 
     def test_create_experiment_tree_timeout_warns_about_duplicate_mutation_risk(self) -> None:
@@ -1185,7 +1400,7 @@ class StalledServerFailureTests(unittest.TestCase):
             f"timeout error must escalate visibility for mutating writes: {message}",
         )
         self.assertIn(
-            "DO NOT retry",
+            "idempotency_key",
             message,
             f"timeout error must instruct against blind retry for mutating writes: {message}",
         )

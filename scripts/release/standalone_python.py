@@ -106,6 +106,49 @@ def python_executable(python_root: Path) -> Path:
     raise RuntimeError(f"python executable missing from extracted runtime at {python_root}")
 
 
+# The install-stage architecture descriptor. Written into the bundled python
+# root (next to `bin/`) at build/stage time, shipped with the runtime, and read
+# at first run by the desktop app and the pip wrapper, which export its
+# `machine` as `TINE_PYTHON_PLATFORM`. The engine (tine-env) then refuses to
+# build a venv with an interpreter whose architecture disagrees. Recording the
+# interpreter's OWN reported identity (not the build `--target` string) means
+# the pin reflects what the binary actually is.
+PLATFORM_DESCRIPTOR_FILENAME = ".tine-platform.json"
+
+
+def platform_descriptor_payload(python_exe: Path) -> dict:
+    """Probe an interpreter for its architecture identity. Runs the target
+    interpreter itself so the values reflect that binary, not the host."""
+    script = (
+        "import json, platform, sysconfig; "
+        "print(json.dumps({"
+        "'machine': platform.machine(), "
+        "'platform_tag': sysconfig.get_platform(), "
+        "'python_version': platform.python_version()}))"
+    )
+    result = subprocess.run(
+        [str(python_exe), "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout.strip())
+
+
+def platform_descriptor_path(python_root: Path) -> Path:
+    return python_root / PLATFORM_DESCRIPTOR_FILENAME
+
+
+def write_platform_descriptor(python_root: Path) -> dict:
+    """Probe the staged interpreter and persist its architecture descriptor
+    into the python root so it ships with the runtime. Returns the payload."""
+    payload = platform_descriptor_payload(python_executable(python_root))
+    platform_descriptor_path(python_root).write_text(
+        json.dumps(payload, indent=2) + "\n"
+    )
+    return payload
+
+
 def upgrade_pip(python_root: Path) -> None:
     python_path = python_executable(python_root)
     subprocess.run(
