@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool};
 use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::branch_projection::{branch_lineage, plan_branch_transition, BranchProjection};
 use tine_catalog::DataCatalog;
@@ -79,7 +79,28 @@ pub struct FileEntry {
     pub size: u64,
 }
 
+/// One cell's entry in a branch execution dry-run (see
+/// [`Workspace::preview_branch_execution_plan`]).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BranchPlanPreviewCell {
+    pub cell_id: String,
+    /// "run" | "cache_hit"
+    pub action: &'static str,
+    /// "cached" | "cache_disabled" | "upstream_will_run" | "no_prior_run"
+    /// | "code_changed" | "inputs_or_environment_changed"
+    pub reason: &'static str,
+}
+
 #[derive(Debug, Clone)]
+/// Client-supplied idempotency reservation for an execute submission,
+/// scoped to its target and fingerprinted against the execution-relevant
+/// request state.
+struct ExecutionIdempotency<'a> {
+    key: &'a str,
+    scope: &'a str,
+    fingerprint: &'a str,
+}
+
 struct TreeBranchExecutionPlan {
     executable_branch: ExecutableTreeBranch,
     target: ExecutionTargetRef,
@@ -251,12 +272,23 @@ impl Workspace {
     }
 
     async fn reject_execution(&self, execution_id: &ExecutionId) -> TineResult<()> {
+        // A rejected submission was never accepted, so release its
+        // idempotency reservation first: a retry with the same key must
+        // start a fresh execution, not reattach to this rejected one.
+        sqlx::query(
+            "UPDATE executions SET idempotency_key = NULL, idempotency_scope = NULL, idempotency_fingerprint = NULL WHERE id = ?",
+        )
+        .bind(execution_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| TineError::Database(e.to_string()))?;
         Self::update_execution_status_record(&self.pool, execution_id, |status| {
             status.queue_position = None;
             status.finished_at = Some(Utc::now());
             Self::apply_execution_phase(status, ExecutionPhase::Rejected);
         })
-        .await
+        .await?;
+        Ok(())
     }
 
     async fn wait_for_execution_slot_with(
@@ -376,7 +408,7 @@ impl Workspace {
 
         let mut lineage = Vec::new();
         let mut current = branch_by_id.get(branch_id).copied().ok_or_else(|| {
-            TineError::Internal(format!(
+            TineError::NotFound(format!(
                 "branch '{}' not found in tree '{}'",
                 branch_id, tree.id
             ))
@@ -386,7 +418,7 @@ impl Workspace {
             match &current.parent_branch_id {
                 Some(parent_id) => {
                     current = branch_by_id.get(parent_id).copied().ok_or_else(|| {
-                        TineError::Internal(format!(
+                        TineError::NotFound(format!(
                             "parent branch '{}' not found in tree '{}'",
                             parent_id, tree.id
                         ))
@@ -406,7 +438,7 @@ impl Workspace {
                         .iter()
                         .position(|cell_id| cell_id == branch_point)
                         .ok_or_else(|| {
-                            TineError::Internal(format!(
+                            TineError::NotFound(format!(
                                 "branch point '{}' not found in branch '{}' for tree '{}'",
                                 branch_point, branch.id, tree.id
                             ))
@@ -430,13 +462,13 @@ impl Workspace {
             .iter()
             .find(|branch| &branch.id == branch_id)
             .ok_or_else(|| {
-                TineError::Internal(format!(
+                TineError::NotFound(format!(
                     "branch '{}' not found in tree '{}'",
                     branch_id, tree.id
                 ))
             })?;
         if !branch.cell_order.iter().any(|existing| existing == cell_id) {
-            return Err(TineError::Internal(format!(
+            return Err(TineError::NotFound(format!(
                 "cell '{}' not found in branch '{}' for tree '{}'",
                 cell_id, branch_id, tree.id
             )));
@@ -484,7 +516,7 @@ impl Workspace {
             .iter()
             .find(|cell| &cell.id == cell_id)
             .ok_or_else(|| {
-                TineError::Internal(format!(
+                TineError::NotFound(format!(
                     "cell '{}' not found in branch '{}' for tree '{}'",
                     cell_id, target_branch_id, tree.id
                 ))
@@ -498,7 +530,12 @@ impl Workspace {
             code: cell.code.clone(),
             inputs: HashMap::new(),
             outputs: cell.declared_outputs.clone(),
-            cache: cell.cache,
+            // A single-cell plan strips the cell's inputs, so a cache key
+            // derived from it would ignore upstream data entirely — it could
+            // skip the cell with stale results and write entries that collide
+            // with branch-run keys. Explicit cell submission therefore always
+            // executes and never touches the cache.
+            cache: false,
             map_over: cell.map_over.clone(),
             map_concurrency: cell.map_concurrency,
             tags: cell.tags.clone(),
@@ -534,6 +571,27 @@ impl Workspace {
         target: &ExecutionTargetRef,
         topo_order: &[CellId],
     ) -> TineResult<()> {
+        Self::insert_branch_execution_record_with_key(
+            pool,
+            execution_id,
+            tree_id,
+            branch_id,
+            target,
+            topo_order,
+            None,
+        )
+        .await
+    }
+
+    async fn insert_branch_execution_record_with_key(
+        pool: &SqlitePool,
+        execution_id: &ExecutionId,
+        tree_id: &ExperimentTreeId,
+        branch_id: &BranchId,
+        target: &ExecutionTargetRef,
+        topo_order: &[CellId],
+        idempotency: Option<&ExecutionIdempotency<'_>>,
+    ) -> TineResult<()> {
         let initial_status = ExecutionStatus {
             execution_id: execution_id.clone(),
             tree_id: Some(tree_id.clone()),
@@ -555,13 +613,16 @@ impl Workspace {
         };
         let status_json = serde_json::to_string(&initial_status).unwrap_or_default();
         sqlx::query(
-            "INSERT INTO executions (id, tree_id, branch_id, target_kind, status, started_at) VALUES (?, ?, ?, ?, ?, datetime('now'))",
+            "INSERT INTO executions (id, tree_id, branch_id, target_kind, status, started_at, idempotency_key, idempotency_scope, idempotency_fingerprint) VALUES (?, ?, ?, ?, ?, datetime('now'), ?, ?, ?)",
         )
         .bind(execution_id.as_str())
         .bind(tree_id.as_str())
         .bind(branch_id.as_str())
         .bind("experiment_tree_branch")
         .bind(&status_json)
+        .bind(idempotency.map(|record| record.key))
+        .bind(idempotency.map(|record| record.scope))
+        .bind(idempotency.map(|record| record.fingerprint))
         .execute(pool)
         .await
         .map_err(|e| TineError::Database(e.to_string()))?;
@@ -658,14 +719,23 @@ impl Workspace {
         let status_json = serde_json::to_string(&status).unwrap_or_default();
         let logs_json = serde_json::to_string(&merged_node_logs).unwrap_or_default();
 
-        let _ = sqlx::query(
-            "UPDATE executions SET status = ?, node_logs = ?, finished_at = datetime('now') WHERE id = ?",
+        // The pre-read above is best-effort merging; this conditional UPDATE is
+        // the authoritative guard. Concurrent finalizers (e.g. cancel racing
+        // completion) race the read-check, so only the writer that flips
+        // finished_at from NULL wins — the loser must not write metrics either.
+        let finalized = sqlx::query(
+            "UPDATE executions SET status = ?, node_logs = ?, finished_at = datetime('now') WHERE id = ? AND finished_at IS NULL",
         )
         .bind(&status_json)
         .bind(&logs_json)
         .bind(execution_id.as_str())
         .execute(pool)
-        .await;
+        .await
+        .map(|result| result.rows_affected() > 0)
+        .unwrap_or(false);
+        if !finalized {
+            return;
+        }
 
         for (node_id, logs) in &merged_node_logs {
             for (name, value) in &logs.metrics {
@@ -729,8 +799,10 @@ impl Workspace {
             finished_at: Some(Utc::now()),
         };
         let status_json = serde_json::to_string(&status).unwrap_or_default();
+        // Conditional on finished_at IS NULL: a concurrent finalizer that
+        // already terminalized this record must not be overwritten.
         let _ = sqlx::query(
-            "UPDATE executions SET status = ?, node_logs = COALESCE(?, node_logs), finished_at = datetime('now') WHERE id = ?",
+            "UPDATE executions SET status = ?, node_logs = COALESCE(?, node_logs), finished_at = datetime('now') WHERE id = ? AND finished_at IS NULL",
         )
         .bind(&status_json)
         .bind(existing_logs_json)
@@ -987,7 +1059,10 @@ impl Workspace {
             Self::reconcile_cancelled_execution_status(status, cancellation_requested_at);
         let status_json = serde_json::to_string(&cancelled_status).unwrap_or_default();
 
-        sqlx::query("UPDATE executions SET status = ?, finished_at = datetime('now') WHERE id = ?")
+        // Conditional on finished_at IS NULL: if the execution completed (or
+        // failed) just before this cancellation finalize ran, keep that
+        // terminal status rather than overwriting it with Cancelled.
+        sqlx::query("UPDATE executions SET status = ?, finished_at = datetime('now') WHERE id = ? AND finished_at IS NULL")
             .bind(&status_json)
             .bind(execution_id.as_str())
             .execute(pool)
@@ -1043,11 +1118,16 @@ impl Workspace {
         Ok(())
     }
 
+    /// Returns whether the update was committed to a live (non-terminal)
+    /// row. `false` means the execution was missing or already finished —
+    /// callers acting on the updated state (e.g. interrupting a kernel
+    /// after marking cancellation) must treat that as "do nothing", since
+    /// the tree may already be running a different execution.
     async fn update_execution_status_record<F>(
         pool: &SqlitePool,
         execution_id: &ExecutionId,
         update: F,
-    ) -> TineResult<()>
+    ) -> TineResult<bool>
     where
         F: FnOnce(&mut ExecutionStatus),
     {
@@ -1057,18 +1137,20 @@ impl Workspace {
             .await
             .map_err(|e| TineError::Database(e.to_string()))?;
         let Some((status_json,)) = row else {
-            return Ok(());
+            return Ok(false);
         };
 
         let mut status = Self::normalize_execution_status(serde_json::from_str(&status_json)?);
         if status.finished_at.is_some() {
-            return Ok(());
+            return Ok(false);
         }
         update(&mut status);
         let updated_status_json =
             serde_json::to_string(&status).map_err(TineError::Serialization)?;
-        sqlx::query(
-            "UPDATE executions SET status = ?, finished_at = COALESCE(finished_at, ?) WHERE id = ?",
+        // Conditional on finished_at IS NULL so a phase update racing a
+        // finalizer cannot resurrect a record that just became terminal.
+        let result = sqlx::query(
+            "UPDATE executions SET status = ?, finished_at = COALESCE(finished_at, ?) WHERE id = ? AND finished_at IS NULL",
         )
         .bind(&updated_status_json)
         .bind(status.finished_at.map(|timestamp| timestamp.to_rfc3339()))
@@ -1076,7 +1158,7 @@ impl Workspace {
         .execute(pool)
         .await
         .map_err(|e| TineError::Database(e.to_string()))?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     fn reconcile_abandoned_execution_status(mut status: ExecutionStatus) -> ExecutionStatus {
@@ -1202,20 +1284,6 @@ impl Workspace {
         (status, node_logs)
     }
 
-    fn execution_nodes_finished(status: &ExecutionStatus) -> bool {
-        !status.node_statuses.is_empty()
-            && status.node_statuses.values().all(|node_status| {
-                matches!(
-                    node_status,
-                    NodeStatus::Completed
-                        | NodeStatus::Failed
-                        | NodeStatus::CacheHit
-                        | NodeStatus::Skipped
-                        | NodeStatus::Interrupted
-                )
-            })
-    }
-
     async fn reconcile_unfinished_executions(pool: &SqlitePool) -> TineResult<()> {
         let rows: Vec<(String, String)> =
             sqlx::query_as("SELECT id, status FROM executions WHERE finished_at IS NULL")
@@ -1232,7 +1300,7 @@ impl Workspace {
             let reconciled_json =
                 serde_json::to_string(&reconciled_status).map_err(TineError::Serialization)?;
             sqlx::query(
-                "UPDATE executions SET status = ?, finished_at = datetime('now') WHERE id = ?",
+                "UPDATE executions SET status = ?, finished_at = datetime('now') WHERE id = ? AND finished_at IS NULL",
             )
             .bind(&reconciled_json)
             .bind(&execution_id)
@@ -1284,7 +1352,7 @@ impl Workspace {
             let reconciled_logs_json =
                 serde_json::to_string(&reconciled_logs).map_err(TineError::Serialization)?;
             sqlx::query(
-                "UPDATE executions SET status = ?, node_logs = ?, finished_at = datetime('now') WHERE id = ?",
+                "UPDATE executions SET status = ?, node_logs = ?, finished_at = datetime('now') WHERE id = ? AND finished_at IS NULL",
             )
             .bind(&reconciled_status_json)
             .bind(&reconciled_logs_json)
@@ -1358,7 +1426,7 @@ impl Workspace {
             let reconciled_logs_json =
                 serde_json::to_string(&reconciled_logs).map_err(TineError::Serialization)?;
             sqlx::query(
-                "UPDATE executions SET status = ?, node_logs = ?, finished_at = datetime('now') WHERE id = ?",
+                "UPDATE executions SET status = ?, node_logs = ?, finished_at = datetime('now') WHERE id = ? AND finished_at IS NULL",
             )
             .bind(&reconciled_status_json)
             .bind(&reconciled_logs_json)
@@ -1451,6 +1519,9 @@ impl Workspace {
         target: ExecutionTargetRef,
         cache: HashMap<NodeCacheKey, HashMap<SlotName, ArtifactKey>>,
         working_dir: PathBuf,
+        // True when the caller already holds the scheduler's per-tree
+        // execution lock (run-all holds it across the isolation session).
+        tree_lock_held: bool,
     ) -> bool {
         eprintln!(
             "[workspace] branch execution start execution={} tree={} branch={} cwd={}",
@@ -1459,16 +1530,29 @@ impl Workspace {
             branch_id.as_str(),
             working_dir.display()
         );
-        let execution_result = scheduler
-            .execute_executable_branch_for_target(
-                &execution_id,
-                &executable_branch,
-                &target,
-                &cache,
-                Some(&pool),
-                Some(&working_dir),
-            )
-            .await;
+        let execution_result = if tree_lock_held {
+            scheduler
+                .execute_executable_branch_for_target_prelocked(
+                    &execution_id,
+                    &executable_branch,
+                    &target,
+                    &cache,
+                    Some(&pool),
+                    Some(&working_dir),
+                )
+                .await
+        } else {
+            scheduler
+                .execute_executable_branch_for_target(
+                    &execution_id,
+                    &executable_branch,
+                    &target,
+                    &cache,
+                    Some(&pool),
+                    Some(&working_dir),
+                )
+                .await
+        };
         match execution_result {
             Ok(outcome) => {
                 let succeeded = outcome.failed_nodes.is_empty();
@@ -1559,7 +1643,7 @@ impl Workspace {
             return Ok(def);
         }
 
-        Err(TineError::Internal(format!(
+        Err(TineError::NotFound(format!(
             "experiment tree '{}' not found",
             tree_id
         )))
@@ -1844,44 +1928,72 @@ impl Workspace {
             None => None,
         };
 
-        let row: Option<(String, Option<String>)> =
-            sqlx::query_as("SELECT status, node_logs FROM executions WHERE id = ?")
-                .bind(execution_id.as_str())
-                .fetch_optional(pool)
-                .await
-                .map_err(|e| TineError::Database(e.to_string()))?;
-        let Some((status_json, node_logs_json)) = row else {
-            return Ok(());
-        };
+        // Optimistic-concurrency loop: the inline finalizers (which write the
+        // authoritative node_logs, including rich outputs) do NOT hold this
+        // lock. If one flips `finished_at` between our read and our write,
+        // writing our stale copy would silently erase the finalized outputs —
+        // the conditional UPDATE below detects that and we re-apply the event
+        // against the finalized row instead.
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let row: Option<(String, Option<String>, i64)> = sqlx::query_as(
+                "SELECT status, node_logs, (finished_at IS NULL) FROM executions WHERE id = ?",
+            )
+            .bind(execution_id.as_str())
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| TineError::Database(e.to_string()))?;
+            let Some((status_json, node_logs_json, row_unfinished)) = row else {
+                return Ok(());
+            };
 
-        let mut status: ExecutionStatus =
-            Self::normalize_execution_status(serde_json::from_str(&status_json)?);
-        let row_already_finished = status.finished_at.is_some();
-        let mut node_logs: HashMap<NodeId, NodeLogs> = node_logs_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok())
-            .unwrap_or_default();
-        // Fold any buffered stream chunks into the canonical blob before
-        // applying this event so a subsequent NodeCompleted/Failed/etc. sees
-        // the full log.
-        let drained_streaming_chunks =
-            Self::drain_streaming_buffer_into(streaming, execution_id, &mut node_logs);
+            let mut status: ExecutionStatus =
+                Self::normalize_execution_status(serde_json::from_str(&status_json)?);
+            let row_already_finished = row_unfinished == 0 || status.finished_at.is_some();
+            let mut node_logs: HashMap<NodeId, NodeLogs> = node_logs_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .unwrap_or_default();
+            // Fold any buffered stream chunks into the canonical blob before
+            // applying this event so a subsequent NodeCompleted/Failed/etc. sees
+            // the full log.
+            let drained_streaming_chunks =
+                Self::drain_streaming_buffer_into(streaming, execution_id, &mut node_logs);
 
-        let cancellation_pending = status.cancellation_requested_at.is_some();
+            let cancellation_pending = status.cancellation_requested_at.is_some();
 
-        match event {
-            ExecutionEvent::ExecutionStarted { .. } => {
-                if !row_already_finished {
-                    Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+            match event {
+                ExecutionEvent::ExecutionStarted { .. } => {
+                    if !row_already_finished {
+                        Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+                    }
                 }
-            }
-            ExecutionEvent::NodeStarted { node_id, .. } => {
-                if !row_already_finished {
-                    Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
-                    status
-                        .node_statuses
-                        .insert(node_id.clone(), NodeStatus::Running);
-                    node_logs
+                ExecutionEvent::NodeStarted { node_id, .. } => {
+                    if !row_already_finished {
+                        Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+                        status
+                            .node_statuses
+                            .insert(node_id.clone(), NodeStatus::Running);
+                        node_logs
+                            .entry(node_id.clone())
+                            .or_insert_with(|| NodeLogs {
+                                stdout: String::new(),
+                                stderr: String::new(),
+                                outputs: Vec::new(),
+                                error: None,
+                                duration_ms: None,
+                                metrics: HashMap::new(),
+                            });
+                    }
+                }
+                ExecutionEvent::NodeStream {
+                    node_id,
+                    stream,
+                    text,
+                    ..
+                } => {
+                    let logs = node_logs
                         .entry(node_id.clone())
                         .or_insert_with(|| NodeLogs {
                             stdout: String::new(),
@@ -1891,162 +2003,147 @@ impl Workspace {
                             duration_ms: None,
                             metrics: HashMap::new(),
                         });
+                    match stream.as_str() {
+                        "stderr" => logs.stderr.push_str(text),
+                        _ => logs.stdout.push_str(text),
+                    }
                 }
-            }
-            ExecutionEvent::NodeStream {
-                node_id,
-                stream,
-                text,
-                ..
-            } => {
-                let logs = node_logs
-                    .entry(node_id.clone())
-                    .or_insert_with(|| NodeLogs {
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        outputs: Vec::new(),
-                        error: None,
-                        duration_ms: None,
-                        metrics: HashMap::new(),
-                    });
-                match stream.as_str() {
-                    "stderr" => logs.stderr.push_str(text),
-                    _ => logs.stdout.push_str(text),
+                ExecutionEvent::NodeDisplayData {
+                    node_id, output, ..
                 }
-            }
-            ExecutionEvent::NodeDisplayData {
-                node_id, output, ..
-            }
-            | ExecutionEvent::NodeDisplayUpdate {
-                node_id, output, ..
-            } => {
-                let logs = node_logs
-                    .entry(node_id.clone())
-                    .or_insert_with(|| NodeLogs {
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        outputs: Vec::new(),
-                        error: None,
-                        duration_ms: None,
-                        metrics: HashMap::new(),
-                    });
-                logs.outputs.push(output.clone());
-            }
-            ExecutionEvent::NodeCompleted {
-                node_id,
-                duration_ms,
-                ..
-            } => {
-                status
-                    .node_statuses
-                    .insert(node_id.clone(), NodeStatus::Completed);
-                if !row_already_finished {
-                    Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+                | ExecutionEvent::NodeDisplayUpdate {
+                    node_id, output, ..
+                } => {
+                    let logs = node_logs
+                        .entry(node_id.clone())
+                        .or_insert_with(|| NodeLogs {
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            outputs: Vec::new(),
+                            error: None,
+                            duration_ms: None,
+                            metrics: HashMap::new(),
+                        });
+                    logs.outputs.push(output.clone());
                 }
-                let logs = node_logs
-                    .entry(node_id.clone())
-                    .or_insert_with(|| NodeLogs {
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        outputs: Vec::new(),
-                        error: None,
-                        duration_ms: None,
-                        metrics: HashMap::new(),
-                    });
-                logs.duration_ms = Some(*duration_ms);
-            }
-            ExecutionEvent::NodeCacheHit { node_id, .. } => {
-                if !row_already_finished {
-                    Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+                ExecutionEvent::NodeCompleted {
+                    node_id,
+                    duration_ms,
+                    ..
+                } => {
                     status
                         .node_statuses
-                        .insert(node_id.clone(), NodeStatus::CacheHit);
+                        .insert(node_id.clone(), NodeStatus::Completed);
+                    if !row_already_finished {
+                        Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+                    }
+                    let logs = node_logs
+                        .entry(node_id.clone())
+                        .or_insert_with(|| NodeLogs {
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            outputs: Vec::new(),
+                            error: None,
+                            duration_ms: None,
+                            metrics: HashMap::new(),
+                        });
+                    logs.duration_ms = Some(*duration_ms);
                 }
-            }
-            ExecutionEvent::NodeFailed { node_id, error, .. } => {
-                if !row_already_finished && !cancellation_pending {
-                    Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+                ExecutionEvent::NodeCacheHit { node_id, .. } => {
+                    if !row_already_finished {
+                        Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+                        status
+                            .node_statuses
+                            .insert(node_id.clone(), NodeStatus::CacheHit);
+                    }
                 }
-                status.node_statuses.insert(
-                    node_id.clone(),
-                    if cancellation_pending {
-                        NodeStatus::Interrupted
-                    } else {
-                        NodeStatus::Failed
-                    },
-                );
-                let logs = node_logs
-                    .entry(node_id.clone())
-                    .or_insert_with(|| NodeLogs {
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        outputs: Vec::new(),
-                        error: None,
-                        duration_ms: None,
-                        metrics: HashMap::new(),
-                    });
-                logs.error = Some(error.clone());
-            }
-            ExecutionEvent::ExecutionCompleted { .. } => {
-                if !row_already_finished && !cancellation_pending {
-                    status.finished_at = Some(Utc::now());
-                    Self::apply_execution_phase(&mut status, ExecutionPhase::Completed);
+                ExecutionEvent::NodeFailed { node_id, error, .. } => {
+                    if !row_already_finished && !cancellation_pending {
+                        Self::apply_execution_phase(&mut status, ExecutionPhase::Running);
+                    }
+                    status.node_statuses.insert(
+                        node_id.clone(),
+                        if cancellation_pending {
+                            NodeStatus::Interrupted
+                        } else {
+                            NodeStatus::Failed
+                        },
+                    );
+                    let logs = node_logs
+                        .entry(node_id.clone())
+                        .or_insert_with(|| NodeLogs {
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            outputs: Vec::new(),
+                            error: None,
+                            duration_ms: None,
+                            metrics: HashMap::new(),
+                        });
+                    logs.error = Some(error.clone());
                 }
+                // ExecutionCompleted / ExecutionFailed deliberately do NOT
+                // terminalize the row: they only act as triggers to fold the
+                // remaining buffered stream chunks into the canonical blob.
+                // The authoritative finalizer that emitted these events
+                // writes the terminal status together with the full node
+                // logs (including rich outputs the events don't carry).
+                ExecutionEvent::ExecutionCompleted { .. }
+                | ExecutionEvent::ExecutionFailed { .. } => {}
+                _ => {}
             }
-            ExecutionEvent::ExecutionFailed { .. } => {
-                if !row_already_finished && !cancellation_pending {
-                    status.finished_at = Some(Utc::now());
-                    let terminal_status =
-                        Self::terminal_status_from_outcome(&status.node_statuses, &node_logs);
-                    status.status = terminal_status.clone();
-                    status.phase = Self::terminal_phase_from_status(&terminal_status);
-                }
-            }
-            _ => {}
-        }
 
-        if !row_already_finished {
-            if cancellation_pending && status.finished_at.is_none() {
+            if !row_already_finished && cancellation_pending && status.finished_at.is_none() {
                 Self::apply_execution_phase(&mut status, ExecutionPhase::CancellationRequested);
             }
+            // Deliberately NOT terminalizing here even when all nodes look
+            // finished: the authoritative finalizers own the terminal
+            // transition because only they hold the full outcome (rich
+            // outputs, merged logs). If this event-driven path flips
+            // `finished_at` first, the real finalizer backs off as the
+            // "loser" of the atomic-finalize guard and the outputs are lost —
+            // that was a 70%-reproducible bug, not a theoretical race.
 
-            if !cancellation_pending
-                && status.finished_at.is_none()
-                && Self::execution_nodes_finished(&status)
-            {
-                status.finished_at = Some(Utc::now());
-                let terminal_status =
-                    Self::terminal_status_from_outcome(&status.node_statuses, &node_logs);
-                status.status = terminal_status.clone();
-                status.phase = Self::terminal_phase_from_status(&terminal_status);
+            let updated_status_json = serde_json::to_string(&status).unwrap_or_default();
+            let updated_logs_json = serde_json::to_string(&node_logs).unwrap_or_default();
+            // Conditional on the finished-state we READ: if a finalizer flipped
+            // `finished_at` in between, this no-ops instead of clobbering the
+            // finalized row, and we retry against the fresh row.
+            let update_result = sqlx::query(
+                "UPDATE executions \
+             SET status = ?, node_logs = ?, finished_at = COALESCE(finished_at, ?) \
+             WHERE id = ? AND (finished_at IS NULL) = ?",
+            )
+            .bind(&updated_status_json)
+            .bind(&updated_logs_json)
+            .bind(status.finished_at.map(|timestamp| timestamp.to_rfc3339()))
+            .bind(execution_id.as_str())
+            .bind(row_unfinished)
+            .execute(pool)
+            .await
+            .map_err(|e| TineError::Database(e.to_string()));
+
+            match update_result {
+                Ok(result) if result.rows_affected() == 0 && attempts < 3 => {
+                    // Lost the race with a finalizer. Re-buffer the drained
+                    // chunks so the retry folds them into the finalized row.
+                    Self::reinsert_drained_chunks_on_flush_failure(
+                        streaming,
+                        execution_id,
+                        drained_streaming_chunks,
+                    );
+                    continue;
+                }
+                Ok(_) => return Ok(()),
+                Err(err) => {
+                    Self::reinsert_drained_chunks_on_flush_failure(
+                        streaming,
+                        execution_id,
+                        drained_streaming_chunks,
+                    );
+                    return Err(err);
+                }
             }
         }
-
-        let updated_status_json = serde_json::to_string(&status).unwrap_or_default();
-        let updated_logs_json = serde_json::to_string(&node_logs).unwrap_or_default();
-        let update_result = sqlx::query(
-            "UPDATE executions \
-             SET status = ?, node_logs = ?, finished_at = COALESCE(finished_at, ?) \
-             WHERE id = ?",
-        )
-        .bind(&updated_status_json)
-        .bind(&updated_logs_json)
-        .bind(status.finished_at.map(|timestamp| timestamp.to_rfc3339()))
-        .bind(execution_id.as_str())
-        .execute(pool)
-        .await
-        .map_err(|e| TineError::Database(e.to_string()));
-
-        if update_result.is_err() {
-            Self::reinsert_drained_chunks_on_flush_failure(
-                streaming,
-                execution_id,
-                drained_streaming_chunks,
-            );
-        }
-        update_result?;
-
-        Ok(())
     }
 
     fn spawn_execution_event_bridge(
@@ -2245,13 +2342,13 @@ impl Workspace {
         execution_id: &ExecutionId,
         drained: &HashMap<NodeId, NodeLogs>,
     ) -> TineResult<()> {
-        let row: Option<(String, Option<String>)> =
-            sqlx::query_as("SELECT status, node_logs FROM executions WHERE id = ?")
+        let row: Option<(Option<String>, i64)> =
+            sqlx::query_as("SELECT node_logs, (finished_at IS NULL) FROM executions WHERE id = ?")
                 .bind(execution_id.as_str())
                 .fetch_optional(pool)
                 .await
                 .map_err(|e| TineError::Database(e.to_string()))?;
-        let Some((_status_json, node_logs_json)) = row else {
+        let Some((node_logs_json, row_unfinished)) = row else {
             // Row vanished (e.g. delete_experiment_tree race). Drained
             // chunks are unrecoverable but the row is gone too, so this
             // is not a data loss vs the user's intent.
@@ -2274,21 +2371,27 @@ impl Workspace {
 
         let updated_logs_json =
             serde_json::to_string(&node_logs).map_err(TineError::Serialization)?;
-        // No `finished_at IS NULL` guard: late stream chunks can legitimately
-        // arrive AFTER a terminal `NodeCompleted` event (the kernel can emit
-        // its last stdout flush between when the executor sends NodeCompleted
-        // and when the iopub stream actually drains).
-        let result = sqlx::query("UPDATE executions SET node_logs = ? WHERE id = ?")
-            .bind(&updated_logs_json)
-            .bind(execution_id.as_str())
-            .execute(pool)
-            .await
-            .map_err(|e| TineError::Database(e.to_string()))?;
+        // Late stream chunks can legitimately arrive AFTER the row turned
+        // terminal, so writes are allowed in both states — but only when the
+        // finished-state still matches what we read. If a finalizer flipped
+        // it in between, writing our stale copy would erase the finalized
+        // node_logs (rich outputs); the conditional turns that into a no-op
+        // and the error below makes the caller re-buffer the chunks so the
+        // next flush retries against the finalized row.
+        let result = sqlx::query(
+            "UPDATE executions SET node_logs = ? WHERE id = ? AND (finished_at IS NULL) = ?",
+        )
+        .bind(&updated_logs_json)
+        .bind(execution_id.as_str())
+        .bind(row_unfinished)
+        .execute(pool)
+        .await
+        .map_err(|e| TineError::Database(e.to_string()))?;
         if result.rows_affected() == 0 {
-            warn!(
-                execution = %execution_id,
-                "flush target row disappeared mid-write; drained stream chunks could not be persisted"
-            );
+            return Err(TineError::Database(format!(
+                "flush for execution {execution_id} conflicted with a concurrent finalizer; \
+                 chunks re-buffered for the next flush"
+            )));
         }
         Ok(())
     }
@@ -2395,6 +2498,61 @@ impl Workspace {
         Ok(tree)
     }
 
+    /// Pre-warm a freshly created experiment's runtime in the background:
+    /// verify the environment and boot the tree kernel while the user is
+    /// still typing their first cell, so the first run pays only for the
+    /// cell itself. Best-effort — failures are logged and the normal
+    /// execution path redoes the work.
+    pub fn spawn_runtime_prewarm(workspace: Arc<Self>, tree: &ExperimentTreeDef) {
+        let tree_id = tree.id.clone();
+        let root_branch_id = tree.root_branch_id.clone();
+        let descriptor = TreeEnvironmentDescriptor::from_tree(tree);
+        let project_id = tree.project_id.clone();
+        tokio::spawn(async move {
+            let working_dir = match workspace.file_base_for_project(project_id.as_ref()).await {
+                Ok(dir) => dir,
+                Err(err) => {
+                    debug!(tree = %tree_id, error = %err, "runtime prewarm skipped: no working dir");
+                    return;
+                }
+            };
+            if let Err(err) = workspace
+                .prewarm_tree_runtime(&tree_id, &root_branch_id, &descriptor, &working_dir)
+                .await
+            {
+                debug!(tree = %tree_id, error = %err, "runtime prewarm skipped");
+            }
+        });
+    }
+
+    async fn prewarm_tree_runtime(
+        &self,
+        tree_id: &ExperimentTreeId,
+        root_branch_id: &BranchId,
+        descriptor: &TreeEnvironmentDescriptor,
+        working_dir: &Path,
+    ) -> TineResult<()> {
+        let venv_dir = self.env_mgr.ensure_tree_environment(descriptor).await?;
+        if self.kernel_mgr.has_tree_kernel(tree_id) {
+            return Ok(());
+        }
+        self.kernel_mgr
+            .start_tree_kernel(tree_id, &venv_dir, working_dir)
+            .await?;
+        // Mark the runtime Ready with an empty materialized path so the
+        // first submission reuses this kernel instead of restarting it.
+        // Only when no state exists yet: if a real execution raced ahead,
+        // its bookkeeping wins (worst case for the rare late overwrite is
+        // one defensive kernel restart, never wrong results).
+        if self.get_tree_runtime_state(tree_id).await.is_none() {
+            let mut state = Self::default_tree_runtime_state(tree_id, root_branch_id);
+            state.kernel_state = TreeKernelState::Ready;
+            self.set_tree_runtime_state(state).await?;
+        }
+        info!(tree = %tree_id, "runtime prewarmed");
+        Ok(())
+    }
+
     pub async fn delete_experiment_tree(&self, tree_id: &ExperimentTreeId) -> TineResult<()> {
         let mut tx = self
             .pool
@@ -2421,7 +2579,7 @@ impl Workspace {
             .map_err(|e| TineError::Database(e.to_string()))?
             .rows_affected();
         if rows == 0 {
-            return Err(TineError::Internal(format!(
+            return Err(TineError::NotFound(format!(
                 "experiment tree '{}' not found",
                 tree_id
             )));
@@ -2593,7 +2751,7 @@ impl Workspace {
             .iter()
             .any(|branch| &branch.id == parent_branch_id)
         {
-            return Err(TineError::Internal(format!(
+            return Err(TineError::NotFound(format!(
                 "parent branch '{}' not found in tree '{}'",
                 parent_branch_id, tree_id
             )));
@@ -2603,7 +2761,7 @@ impl Workspace {
             .iter()
             .any(|cell| &cell.id == branch_point_cell_id)
         {
-            return Err(TineError::Internal(format!(
+            return Err(TineError::NotFound(format!(
                 "branch point cell '{}' not found in tree '{}'",
                 branch_point_cell_id, tree_id
             )));
@@ -2729,10 +2887,45 @@ impl Workspace {
 
     pub async fn restart_tree_kernel(&self, tree_id: &ExperimentTreeId) -> TineResult<()> {
         match self.kernel_mgr.restart_tree_kernel(tree_id).await {
-            Ok(()) => Ok(()),
-            Err(TineError::KernelNotFound { .. }) => Ok(()),
-            Err(err) => Err(err),
+            Ok(()) => {}
+            Err(TineError::KernelNotFound { .. }) => return Ok(()),
+            Err(err) => return Err(err),
         }
+        // The kernel process was replaced with a fresh one: empty namespace,
+        // no replayed context. The persisted runtime state must reflect that,
+        // otherwise it can stay `NeedsReplay` from a prior shutdown while a
+        // live kernel now exists — which the UI reads as
+        // `needs_replay && has_live_kernel` and hard-disables "Run Branch",
+        // forcing "Run All" only. Reset to a clean Ready state with an empty
+        // materialized path so the runtime is runnable again. This mirrors
+        // `prewarm_tree_runtime`: `Ready` + empty `materialized_path_cell_ids`
+        // means "fresh live kernel, no prepared branch context". The next
+        // branch run still prepares from scratch because
+        // `plan_branch_transition` sees an empty materialized path
+        // (`replay_from_idx == 0`), so the entire branch prefix is replayed —
+        // the kernel-reuse fast path only triggers when there is nothing to
+        // replay. Bump `runtime_epoch` and clear `last_prepared_cell_id` so any
+        // stale prepared-branch marker from the previous kernel is discarded.
+        self.reset_runtime_state_after_kernel_restart(tree_id).await
+    }
+
+    /// Reset the persisted tree runtime state to reflect a freshly restarted
+    /// kernel: `Ready` with an empty materialized path and no prepared-branch
+    /// marker. See `restart_tree_kernel` for the rationale (UI runnability +
+    /// guaranteed context replay on the next run). No-op when no runtime state
+    /// exists yet.
+    async fn reset_runtime_state_after_kernel_restart(
+        &self,
+        tree_id: &ExperimentTreeId,
+    ) -> TineResult<()> {
+        if let Some(mut state) = self.get_tree_runtime_state(tree_id).await {
+            state.kernel_state = TreeKernelState::Ready;
+            state.materialized_path_cell_ids.clear();
+            state.last_prepared_cell_id = None;
+            state.runtime_epoch += 1;
+            self.set_tree_runtime_state(state).await?;
+        }
+        Ok(())
     }
 
     pub async fn add_cell_to_experiment_tree_branch(
@@ -2748,7 +2941,7 @@ impl Workspace {
             .iter_mut()
             .find(|branch| &branch.id == branch_id)
             .ok_or_else(|| {
-                TineError::Internal(format!(
+                TineError::NotFound(format!(
                     "branch '{}' not found in tree '{}'",
                     branch_id, tree_id
                 ))
@@ -2800,25 +2993,82 @@ impl Workspace {
         branch_id: &BranchId,
         cell_id: &CellId,
     ) -> TineResult<ExecutionAccepted> {
+        Self::submit_cell_execution_in_experiment_tree_branch_with_options(
+            workspace, tree_id, branch_id, cell_id, None,
+        )
+        .await
+    }
+
+    /// Like [`Self::submit_cell_execution_in_experiment_tree_branch`], with
+    /// an optional client-supplied idempotency key: a retried submission
+    /// carrying the same key returns the original execution instead of
+    /// starting a duplicate run.
+    pub async fn submit_cell_execution_in_experiment_tree_branch_with_options(
+        workspace: Arc<Self>,
+        tree_id: &ExperimentTreeId,
+        branch_id: &BranchId,
+        cell_id: &CellId,
+        idempotency_key: Option<&str>,
+    ) -> TineResult<ExecutionAccepted> {
         let tree = workspace.get_experiment_tree(tree_id).await?;
         Self::validate_branch_membership(&tree, branch_id, cell_id)?;
         let working_dir = workspace
             .file_base_for_project(tree.project_id.as_ref())
             .await?;
         let plan = Self::build_tree_cell_execution_plan(&tree, branch_id, cell_id)?;
+        let idempotency_scope = Self::cell_execution_idempotency_scope(tree_id, branch_id, cell_id);
+        let idempotency_fingerprint =
+            Self::execution_request_fingerprint(&plan.executable_branch, &working_dir);
+        let idempotency = idempotency_key.map(|key| ExecutionIdempotency {
+            key,
+            scope: &idempotency_scope,
+            fingerprint: &idempotency_fingerprint,
+        });
+        if let Some(record) = &idempotency {
+            if let Some(existing) =
+                Self::find_execution_by_idempotency_key(&workspace.pool, record).await?
+            {
+                return Ok(ExecutionAccepted::for_cell(
+                    existing,
+                    tree_id.clone(),
+                    branch_id.clone(),
+                    cell_id.clone(),
+                    Utc::now(),
+                ));
+            }
+        }
         let execution_id = ExecutionId::generate();
         let created_at = Utc::now();
         let topo_order = vec![cell_id.clone()];
 
-        Self::insert_branch_execution_record(
+        if let Err(err) = Self::insert_branch_execution_record_with_key(
             &workspace.pool,
             &execution_id,
             tree_id,
             branch_id,
             &plan.target,
             &topo_order,
+            idempotency.as_ref(),
         )
-        .await?;
+        .await
+        {
+            // Unique-key race: a concurrent retry with the same key won the
+            // insert — return its execution instead of erroring.
+            if let Some(record) = &idempotency {
+                if let Some(existing) =
+                    Self::find_execution_by_idempotency_key(&workspace.pool, record).await?
+                {
+                    return Ok(ExecutionAccepted::for_cell(
+                        existing,
+                        tree_id.clone(),
+                        branch_id.clone(),
+                        cell_id.clone(),
+                        Utc::now(),
+                    ));
+                }
+            }
+            return Err(err);
+        }
         let queue_position = match workspace.enqueue_execution(&execution_id).await {
             Ok(queue_position) => queue_position,
             Err(err) => {
@@ -2871,6 +3121,17 @@ impl Workspace {
                 }
             };
             if !can_run {
+                // Dequeued before getting a slot. Every dequeuer finalizes the
+                // record (cancel → finalize_cancelled_execution, run-all
+                // cleanup → finalize_branch_execution_failure); this defensive
+                // call only fires if a future dequeue path forgets — the
+                // finished_at IS NULL guard makes it a no-op otherwise.
+                let _ = Self::finalize_cancelled_execution(
+                    &pool_for_task,
+                    &execution_id_for_task,
+                    Utc::now(),
+                )
+                .await;
                 return;
             }
 
@@ -3023,7 +3284,15 @@ impl Workspace {
             self.mark_stale_descendants_compat(tree_id, changed_cell_id)
                 .await?;
         }
-        if self.get_tree_runtime_state(tree_id).await.is_some() {
+        if let Some(state) = self.get_tree_runtime_state(tree_id).await {
+            // A ready runtime with nothing materialized cannot be staled by
+            // edits — the namespace is empty. Downgrading it would discard
+            // the prewarmed kernel right as the user types their first cell.
+            if state.kernel_state == TreeKernelState::Ready
+                && state.materialized_path_cell_ids.is_empty()
+            {
+                return Ok(());
+            }
             self.mark_tree_needs_replay(tree_id).await?;
         }
         Ok(())
@@ -3113,7 +3382,7 @@ impl Workspace {
             .iter_mut()
             .find(|cell| &cell.id == cell_id)
             .ok_or_else(|| {
-                TineError::Internal(format!(
+                TineError::NotFound(format!(
                     "cell '{}' not found in tree '{}'",
                     cell_id, tree_id
                 ))
@@ -3152,7 +3421,7 @@ impl Workspace {
             .iter_mut()
             .find(|branch| &branch.id == branch_id)
             .ok_or_else(|| {
-                TineError::Internal(format!(
+                TineError::NotFound(format!(
                     "branch '{}' not found in tree '{}'",
                     branch_id, tree_id
                 ))
@@ -3162,7 +3431,7 @@ impl Workspace {
             .iter()
             .position(|existing| existing == cell_id)
             .ok_or_else(|| {
-                TineError::Internal(format!(
+                TineError::NotFound(format!(
                     "cell '{}' not found in branch '{}' for tree '{}'",
                     cell_id, branch_id, tree_id
                 ))
@@ -3192,7 +3461,7 @@ impl Workspace {
             .iter_mut()
             .find(|branch| &branch.id == branch_id)
             .ok_or_else(|| {
-                TineError::Internal(format!(
+                TineError::NotFound(format!(
                     "branch '{}' not found in tree '{}'",
                     branch_id, tree_id
                 ))
@@ -3200,7 +3469,7 @@ impl Workspace {
         let before = branch.cell_order.len();
         branch.cell_order.retain(|existing| existing != cell_id);
         if branch.cell_order.len() == before {
-            return Err(TineError::Internal(format!(
+            return Err(TineError::NotFound(format!(
                 "cell '{}' not found in branch '{}' for tree '{}'",
                 cell_id, branch_id, tree_id
             )));
@@ -3225,7 +3494,7 @@ impl Workspace {
             ));
         }
         if !tree.branches.iter().any(|branch| &branch.id == branch_id) {
-            return Err(TineError::Internal(format!(
+            return Err(TineError::NotFound(format!(
                 "branch '{}' not found in tree '{}'",
                 branch_id, tree_id
             )));
@@ -3275,39 +3544,6 @@ impl Workspace {
         Ok(())
     }
 
-    pub async fn execute_cell_in_experiment_tree(
-        &self,
-        tree_id: &ExperimentTreeId,
-        cell_id: &CellId,
-    ) -> TineResult<(ExecutionId, NodeLogs)> {
-        let tree = self.get_experiment_tree(tree_id).await?;
-        let branch = tree
-            .branches
-            .iter()
-            .find(|branch| branch.cell_order.iter().any(|existing| existing == cell_id))
-            .ok_or_else(|| {
-                TineError::Internal(format!(
-                    "cell '{}' is not assigned to any branch in tree '{}'",
-                    cell_id, tree_id
-                ))
-            })?;
-        let target = Self::execution_target_for_tree_branch(tree_id, &branch.id);
-        let (execution_id, logs) = self
-            .execute_tree_cell_for_target(&tree, &branch.id, cell_id)
-            .await?;
-        self.persist_single_node_execution(
-            &NodeId::new(cell_id.as_str()),
-            &execution_id,
-            &logs,
-            Some(tree_id),
-            Some(&branch.id),
-            ExecutionTargetKind::ExperimentTreeBranch,
-            target,
-        )
-        .await?;
-        Ok((execution_id, logs))
-    }
-
     pub async fn execute_cell_in_experiment_tree_branch(
         &self,
         tree_id: &ExperimentTreeId,
@@ -3342,19 +3578,61 @@ impl Workspace {
         tree_id: &ExperimentTreeId,
         branch_id: &BranchId,
     ) -> TineResult<ExecutionId> {
+        self.execute_branch_in_experiment_tree_with_options(tree_id, branch_id, None)
+            .await
+    }
+
+    /// Like [`Self::execute_branch_in_experiment_tree`], with an optional
+    /// client-supplied idempotency key: a retried submission carrying the
+    /// same key returns the original execution instead of starting a
+    /// duplicate run.
+    pub async fn execute_branch_in_experiment_tree_with_options(
+        &self,
+        tree_id: &ExperimentTreeId,
+        branch_id: &BranchId,
+        idempotency_key: Option<&str>,
+    ) -> TineResult<ExecutionId> {
         let tree = self.get_experiment_tree(tree_id).await?;
         let working_dir = self.file_base_for_project(tree.project_id.as_ref()).await?;
         let plan = Self::build_tree_branch_execution_plan(&tree, branch_id)?;
+        let idempotency_scope = Self::branch_execution_idempotency_scope(tree_id, branch_id);
+        let idempotency_fingerprint =
+            Self::execution_request_fingerprint(&plan.executable_branch, &working_dir);
+        let idempotency = idempotency_key.map(|key| ExecutionIdempotency {
+            key,
+            scope: &idempotency_scope,
+            fingerprint: &idempotency_fingerprint,
+        });
+        if let Some(record) = &idempotency {
+            if let Some(existing) =
+                Self::find_execution_by_idempotency_key(&self.pool, record).await?
+            {
+                return Ok(existing);
+            }
+        }
         let exec_id = ExecutionId::generate();
-        Self::insert_branch_execution_record(
+        if let Err(err) = Self::insert_branch_execution_record_with_key(
             &self.pool,
             &exec_id,
             tree_id,
             branch_id,
             &plan.target,
             &plan.executable_branch.topo_order,
+            idempotency.as_ref(),
         )
-        .await?;
+        .await
+        {
+            // Unique-key race: a concurrent retry with the same key won the
+            // insert — return its execution instead of erroring.
+            if let Some(record) = &idempotency {
+                if let Some(existing) =
+                    Self::find_execution_by_idempotency_key(&self.pool, record).await?
+                {
+                    return Ok(existing);
+                }
+            }
+            return Err(err);
+        }
         if let Err(err) = self.enqueue_execution(&exec_id).await {
             self.reject_execution(&exec_id).await?;
             return Err(err);
@@ -3395,6 +3673,9 @@ impl Workspace {
                 }
             };
             if !can_run {
+                // Dequeued before getting a slot; the dequeuer finalized the
+                // record. Defensive idempotent backstop (no-op when terminal).
+                let _ = Self::finalize_cancelled_execution(&pool_for_task, &eid, Utc::now()).await;
                 return;
             }
 
@@ -3430,6 +3711,7 @@ impl Workspace {
                 target_for_task,
                 cache,
                 working_dir_for_task,
+                false,
             )
             .await;
             Self::release_execution_slot_with(&queue_state_for_task, &queue_notify_for_task, &eid)
@@ -3518,8 +3800,40 @@ impl Workspace {
                     }
                 };
                 if !can_run {
+                    // Dequeued before getting a slot; the dequeuer finalized
+                    // the record. Defensive idempotent backstop, then move on
+                    // to the next branch in the run-all sequence.
+                    let _ = Self::finalize_cancelled_execution(&pool, &exec_id, Utc::now()).await;
                     continue;
                 }
+
+                // Load the cache fresh per branch (mirrors the single-branch
+                // path) so branch N+1 can hit entries written by branch N
+                // within this same run-all.
+                let cache = match Self::load_cache_from_pool(&pool).await {
+                    Ok(cache) => cache,
+                    Err(err) => {
+                        error!(tree = %tid, branch = %branch_id, execution = %exec_id, error = %err, "failed to load cache for guarded execute-all branch");
+                        Self::finalize_branch_execution_failure(
+                            &pool, &exec_id, &tid, &branch_id, &target,
+                        )
+                        .await;
+                        Self::release_execution_slot_with(
+                            &execution_queue_state,
+                            &execution_queue_notify,
+                            &exec_id,
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+
+                // Hold the per-tree execution lock across the whole guarded
+                // block (session begin → branch execution → session end) so a
+                // queued same-tree execution cannot slip inside the isolation
+                // session window.
+                let tree_exec_lock = scheduler.tree_execution_lock(&tid);
+                let _tree_guard = tree_exec_lock.lock().await;
 
                 let mut restart_after_teardown = false;
                 let branch_id_for_isolation = branch_id.clone();
@@ -3610,8 +3924,9 @@ impl Workspace {
                     exec_id.clone(),
                     executable_branch,
                     target.clone(),
-                    HashMap::new(),
+                    cache,
                     working_dir_for_task.clone(),
+                    true,
                 )
                 .await;
 
@@ -3943,40 +4258,61 @@ impl Workspace {
         };
         self.set_tree_runtime_state(switching_state).await?;
 
-        if !reusing_existing_kernel {
-            if let Some(execution_id) = execution_id {
-                Self::update_execution_status_record(&self.pool, execution_id, |status| {
-                    Self::apply_execution_phase(status, ExecutionPhase::AcquiringRuntime);
-                })
-                .await?;
-            }
-            if has_live_kernel {
-                self.kernel_mgr.shutdown_tree(tree_id).await?;
+        // Everything between the persisted Switching state and the final Ready
+        // state is fallible. A bare `?` here would strand the tree in
+        // Switching forever; on failure, downgrade to NeedsReplay so the next
+        // transition rebuilds from scratch, then surface the original error.
+        let transition_result: TineResult<()> = async {
+            if !reusing_existing_kernel {
+                if let Some(execution_id) = execution_id {
+                    Self::update_execution_status_record(&self.pool, execution_id, |status| {
+                        Self::apply_execution_phase(status, ExecutionPhase::AcquiringRuntime);
+                    })
+                    .await?;
+                }
+                if has_live_kernel {
+                    self.kernel_mgr.shutdown_tree(tree_id).await?;
+                }
+
+                let tree_env = TreeEnvironmentDescriptor::from_tree(&tree);
+                let venv_dir = self.env_mgr.ensure_tree_environment(&tree_env).await?;
+                self.kernel_mgr
+                    .start_tree_kernel(tree_id, &venv_dir, &working_dir)
+                    .await?;
             }
 
-            let tree_env = TreeEnvironmentDescriptor::from_tree(&tree);
-            let venv_dir = self.env_mgr.ensure_tree_environment(&tree_env).await?;
-            self.kernel_mgr
-                .start_tree_kernel(tree_id, &venv_dir, &working_dir)
-                .await?;
-        }
-
-        if !replay_prefix.is_empty() {
-            if let Some(execution_id) = execution_id {
-                Self::update_execution_status_record(&self.pool, execution_id, |status| {
-                    Self::apply_execution_phase(status, ExecutionPhase::ReplayingContext);
-                })
-                .await?;
+            if !replay_prefix.is_empty() {
+                if let Some(execution_id) = execution_id {
+                    Self::update_execution_status_record(&self.pool, execution_id, |status| {
+                        Self::apply_execution_phase(status, ExecutionPhase::ReplayingContext);
+                    })
+                    .await?;
+                }
             }
+            let mut replay_timer = OutcomeTimer::start(METRIC_PREPARE_CONTEXT_REPLAY);
+            metrics::histogram!(METRIC_PREPARE_CONTEXT_REPLAY_CELLS)
+                .record(replay_prefix.len() as f64);
+            for replay_cell_id in &replay_prefix {
+                self.execute_tree_cell_for_target(&tree, branch_id, replay_cell_id)
+                    .await?;
+            }
+            replay_timer.set_outcome("success");
+            drop(replay_timer);
+            Ok(())
         }
-        let mut replay_timer = OutcomeTimer::start(METRIC_PREPARE_CONTEXT_REPLAY);
-        metrics::histogram!(METRIC_PREPARE_CONTEXT_REPLAY_CELLS).record(replay_prefix.len() as f64);
-        for replay_cell_id in &replay_prefix {
-            self.execute_tree_cell_for_target(&tree, branch_id, replay_cell_id)
-                .await?;
+        .await;
+
+        if let Err(err) = transition_result {
+            if let Err(recovery_err) = self.mark_tree_needs_replay(tree_id).await {
+                warn!(
+                    tree = %tree_id,
+                    error = %recovery_err,
+                    "failed to mark tree NeedsReplay after prepare-context failure"
+                );
+            }
+            total_timer.set_outcome("failed");
+            return Err(err);
         }
-        replay_timer.set_outcome("success");
-        drop(replay_timer);
 
         let outcome = if reusing_existing_kernel {
             "reuse"
@@ -4014,6 +4350,315 @@ impl Workspace {
     ) -> TineResult<PreparedContext> {
         self.prepare_context_internal(tree_id, branch_id, cell_id, None)
             .await
+    }
+
+    /// Execution-scoped results: the status record plus every node's logs in
+    /// one call, with live streaming chunks folded in. Saves clients one
+    /// logs round-trip per cell, and serves as the progress feed for
+    /// still-running executions.
+    pub async fn execution_results(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> TineResult<(ExecutionStatus, HashMap<NodeId, NodeLogs>)> {
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT status, node_logs FROM executions WHERE id = ?")
+                .bind(execution_id.as_str())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| TineError::Database(e.to_string()))?;
+        let (status_json, node_logs_json) =
+            row.ok_or_else(|| TineError::ExecutionNotFound(execution_id.clone()))?;
+        let status: ExecutionStatus = serde_json::from_str(&status_json)?;
+        let status = self
+            .enrich_execution_status(Self::normalize_execution_status(status))
+            .await;
+
+        let mut node_logs: HashMap<NodeId, NodeLogs> = node_logs_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default();
+        let buffered_nodes: Vec<NodeId> = self
+            .streaming_log_buffer
+            .get(execution_id)
+            .map(|entry| entry.keys().cloned().collect())
+            .unwrap_or_default();
+        let known_nodes: Vec<NodeId> = status
+            .node_statuses
+            .keys()
+            .cloned()
+            .chain(buffered_nodes)
+            .collect();
+        for node_id in known_nodes {
+            let logs = node_logs.entry(node_id.clone()).or_default();
+            Self::overlay_streaming_buffer(
+                &self.streaming_log_buffer,
+                execution_id,
+                &node_id,
+                logs,
+            );
+        }
+        node_logs.retain(|_, logs| {
+            !logs.stdout.is_empty()
+                || !logs.stderr.is_empty()
+                || logs.error.is_some()
+                || !logs.outputs.is_empty()
+                || logs.duration_ms.is_some()
+                || !logs.metrics.is_empty()
+        });
+        Ok((status, node_logs))
+    }
+
+    /// Dry-run a branch execution against the current cache: which cells
+    /// would run vs cache-hit, and why. Advisory — uses the cache and
+    /// lockfile state as of now, without preparing the environment.
+    pub async fn preview_branch_execution_plan(
+        &self,
+        tree_id: &ExperimentTreeId,
+        branch_id: &BranchId,
+    ) -> TineResult<Vec<BranchPlanPreviewCell>> {
+        let tree = self.get_experiment_tree(tree_id).await?;
+        let plan = Self::build_tree_branch_execution_plan(&tree, branch_id)?;
+        let branch = plan.executable_branch;
+        let cache = Self::load_cache_from_pool(&self.pool).await?;
+        let lockfile_hash = self
+            .env_mgr
+            .lockfile_hash_for_tree(&TreeEnvironmentDescriptor::from_tree(&tree))
+            .await?;
+        let graph = tine_graph::ExecutableTreeGraph::from_branch(&branch)?;
+        let (_to_execute, to_skip) = graph.plan_execution(&branch, &cache, lockfile_hash);
+        let skipped: HashSet<String> = to_skip
+            .iter()
+            .map(|(node, _)| node.as_str().to_string())
+            .collect();
+
+        let mut will_run: HashSet<String> = HashSet::new();
+        let mut preview = Vec::with_capacity(branch.topo_order.len());
+        for cell_id in &branch.topo_order {
+            let cell = branch
+                .cells
+                .iter()
+                .find(|cell| &cell.cell_id == cell_id)
+                .expect("projected branch contains all path cells");
+            if skipped.contains(cell_id.as_str()) {
+                preview.push(BranchPlanPreviewCell {
+                    cell_id: cell_id.as_str().to_string(),
+                    action: "cache_hit",
+                    reason: "cached",
+                });
+                continue;
+            }
+            will_run.insert(cell_id.as_str().to_string());
+            let reason = if !cell.cache {
+                "cache_disabled"
+            } else if cell
+                .inputs
+                .values()
+                .any(|input| will_run.contains(input.source_cell_id.as_str()))
+            {
+                "upstream_will_run"
+            } else {
+                let scope = NodeCacheKey::scope_for(branch.tree_id.as_str(), cell.cell_id.as_str());
+                let code_hash = NodeCacheKey::hash_code(&cell.code.source);
+                let mut saw_scope = false;
+                let mut saw_code = false;
+                for key in cache.keys() {
+                    if key.scope_hash != scope {
+                        continue;
+                    }
+                    saw_scope = true;
+                    if key.code_hash == code_hash {
+                        saw_code = true;
+                        break;
+                    }
+                }
+                if !saw_scope {
+                    "no_prior_run"
+                } else if !saw_code {
+                    "code_changed"
+                } else {
+                    "inputs_or_environment_changed"
+                }
+            };
+            preview.push(BranchPlanPreviewCell {
+                cell_id: cell_id.as_str().to_string(),
+                action: "run",
+                reason,
+            });
+        }
+        Ok(preview)
+    }
+
+    /// Idempotency keys are scoped to their execute target so a reused key
+    /// on another tree/branch/cell never attaches to an unrelated run.
+    fn branch_execution_idempotency_scope(
+        tree_id: &ExperimentTreeId,
+        branch_id: &BranchId,
+    ) -> String {
+        format!("branch:{}:{}", tree_id.as_str(), branch_id.as_str())
+    }
+
+    fn cell_execution_idempotency_scope(
+        tree_id: &ExperimentTreeId,
+        branch_id: &BranchId,
+        cell_id: &CellId,
+    ) -> String {
+        format!(
+            "cell:{}:{}:{}",
+            tree_id.as_str(),
+            branch_id.as_str(),
+            cell_id.as_str()
+        )
+    }
+
+    /// Canonical fingerprint of the execution-relevant request state. A
+    /// retried submission only reattaches to the original execution when
+    /// this matches — a reused key whose underlying plan changed is a
+    /// different request, not a retry.
+    ///
+    /// Covers everything that changes what a run produces: cell order
+    /// (path and topo), each cell's code, resolved inputs, declared
+    /// outputs, cache/map settings, plus the tree environment, execution
+    /// mode, budget, and the project context (project id and resolved
+    /// working directory) that relative file access runs against.
+    /// Deliberately excludes metadata that doesn't (names, tags) and
+    /// revision ids, which advance on no-op saves and would turn genuine
+    /// retries into false conflicts.
+    fn execution_request_fingerprint(
+        executable_branch: &ExecutableTreeBranch,
+        working_dir: &Path,
+    ) -> String {
+        fn field(hasher: &mut blake3::Hasher, value: &str) {
+            hasher.update(value.as_bytes());
+            hasher.update(&[0]);
+        }
+        // Separates variable-length sections so adjacent lists can't
+        // produce the same byte stream.
+        fn section(hasher: &mut blake3::Hasher) {
+            hasher.update(&[1]);
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        field(
+            &mut hasher,
+            executable_branch
+                .project_id
+                .as_ref()
+                .map_or("", |project_id| project_id.as_str()),
+        );
+        field(&mut hasher, &working_dir.to_string_lossy());
+        field(
+            &mut hasher,
+            &serde_json::to_string(&executable_branch.execution_mode).unwrap_or_default(),
+        );
+        field(
+            &mut hasher,
+            &serde_json::to_string(&executable_branch.budget).unwrap_or_default(),
+        );
+        field(
+            &mut hasher,
+            &serde_json::to_string(&executable_branch.environment).unwrap_or_default(),
+        );
+        for cell_id in &executable_branch.path_cell_order {
+            field(&mut hasher, cell_id.as_str());
+        }
+        section(&mut hasher);
+        for cell_id in &executable_branch.topo_order {
+            field(&mut hasher, cell_id.as_str());
+        }
+        section(&mut hasher);
+        for cell in &executable_branch.cells {
+            field(&mut hasher, cell.cell_id.as_str());
+            field(&mut hasher, &cell.code.language);
+            field(&mut hasher, &cell.code.source);
+            let mut inputs: Vec<_> = cell.inputs.iter().collect();
+            inputs.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+            for (slot, input) in inputs {
+                field(&mut hasher, slot.as_str());
+                field(&mut hasher, input.source_cell_id.as_str());
+                field(&mut hasher, input.source_output.as_str());
+            }
+            section(&mut hasher);
+            for output in &cell.outputs {
+                field(&mut hasher, output.as_str());
+            }
+            section(&mut hasher);
+            field(&mut hasher, if cell.cache { "1" } else { "0" });
+            field(
+                &mut hasher,
+                cell.map_over.as_ref().map_or("", |slot| slot.as_str()),
+            );
+            field(
+                &mut hasher,
+                &cell.map_concurrency.map(|n| n.to_string()).unwrap_or_default(),
+            );
+            section(&mut hasher);
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+
+    /// Resolve an idempotency reservation to its execution: `Ok(Some)` when
+    /// the key exists with a matching fingerprint, `Ok(None)` when the key
+    /// is unused, and `Err(IdempotencyConflict)` when the key is bound to a
+    /// request whose execution-relevant state differs.
+    async fn find_execution_by_idempotency_key(
+        pool: &SqlitePool,
+        idempotency: &ExecutionIdempotency<'_>,
+    ) -> TineResult<Option<ExecutionId>> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, idempotency_fingerprint FROM executions WHERE idempotency_key = ? AND idempotency_scope = ?",
+        )
+        .bind(idempotency.key)
+        .bind(idempotency.scope)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| TineError::Database(e.to_string()))?;
+        match row {
+            None => Ok(None),
+            Some((id, fingerprint)) if fingerprint.as_deref() == Some(idempotency.fingerprint) => {
+                Ok(Some(ExecutionId::new(id)))
+            }
+            Some(_) => Err(TineError::IdempotencyConflict(format!(
+                "key '{}' was already used on this target for a request with different code or environment; use a new key to run the current state",
+                idempotency.key
+            ))),
+        }
+    }
+
+    /// How long a terminal execution's idempotency reservation is retained.
+    /// Keys exist to make near-term retries (timeouts, client crashes,
+    /// reconnects) safe; past this window a resubmission with the same key
+    /// is treated as a new request rather than a reattach, which lets the
+    /// keyed rows be reclaimed so the table and its unique index stay bounded.
+    const IDEMPOTENCY_RETENTION_DAYS: i64 = 7;
+
+    /// Null out the idempotency columns of terminal executions whose retry
+    /// window has elapsed, removing them from the partial unique index.
+    /// Best-effort: a failure here only forgoes cleanup, never correctness.
+    async fn prune_stale_idempotency_reservations(pool: &SqlitePool) {
+        let cutoff = format!("-{} days", Self::IDEMPOTENCY_RETENTION_DAYS);
+        let result = sqlx::query(
+            "UPDATE executions \
+             SET idempotency_key = NULL, idempotency_scope = NULL, idempotency_fingerprint = NULL \
+             WHERE idempotency_key IS NOT NULL \
+               AND finished_at IS NOT NULL \
+               AND finished_at < datetime('now', ?)",
+        )
+        .bind(&cutoff)
+        .execute(pool)
+        .await;
+        match result {
+            Ok(outcome) if outcome.rows_affected() > 0 => {
+                info!(
+                    released = outcome.rows_affected(),
+                    retention_days = Self::IDEMPOTENCY_RETENTION_DAYS,
+                    "released stale idempotency reservations"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "failed to prune stale idempotency reservations");
+            }
+        }
     }
 
     async fn run_additive_migration(pool: &SqlitePool, sql: &str) {
@@ -4171,6 +4816,48 @@ impl Workspace {
         Ok(())
     }
 
+    /// Run migration 010 idempotently.
+    /// Guard: skip if node_id is already part of the cache primary key.
+    async fn run_migration_010(pool: &SqlitePool) -> TineResult<()> {
+        let scope_hash_in_pk: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('cache') WHERE name = 'scope_hash' AND pk > 0",
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(|e| TineError::Database(format!("migration 010: inspect failed: {e}")))?;
+        if scope_hash_in_pk {
+            return Ok(());
+        }
+
+        let raw = include_str!("../../../migrations/010_cache_cell_scope.sql");
+        let sql: String = raw
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| TineError::Database(format!("migration 010: begin failed: {e}")))?;
+
+        for statement in sql.split(';') {
+            let stmt = statement.trim();
+            if stmt.is_empty() {
+                continue;
+            }
+            sqlx::query(stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| TineError::Database(format!("migration 010 failed: {e}")))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| TineError::Database(format!("migration 010: commit failed: {e}")))?;
+        Ok(())
+    }
+
     /// Create a new workspace, initializing the database.
     pub async fn open(
         workspace_root: PathBuf,
@@ -4242,6 +4929,20 @@ impl Workspace {
 
         // Run migration 009 — rename legacy cache provenance to runtime naming.
         Self::run_migration_009(&pool).await?;
+
+        // Run migration 010 — scope cache entries to their owning cell.
+        Self::run_migration_010(&pool).await?;
+
+        // Run migration 011 — idempotency keys for execute submissions
+        // (additive: duplicate-column errors on rerun are ignored).
+        let migration_011 = include_str!("../../../migrations/011_execution_idempotency.sql");
+        Self::run_additive_migration(&pool, migration_011).await;
+
+        // Release idempotency reservations whose retry window has elapsed, so
+        // the keyed rows (and their unique index) don't accumulate without
+        // bound across long-lived workspaces. A retry older than the window
+        // is no longer a near-term retry and may safely start a fresh run.
+        Self::prune_stale_idempotency_reservations(&pool).await;
 
         let kernel_mgr = Arc::new(KernelManager::new(&workspace_root, max_kernels));
         let lifecycle_rx = kernel_mgr.subscribe_lifecycle();
@@ -4419,14 +5120,32 @@ impl Workspace {
     async fn load_cache_from_pool(
         pool: &SqlitePool,
     ) -> TineResult<HashMap<NodeCacheKey, HashMap<SlotName, ArtifactKey>>> {
-        let rows: Vec<(String, String, String, String)> =
-            sqlx::query_as("SELECT code_hash, input_hashes, lockfile_hash, artifacts FROM cache")
-                .fetch_all(pool)
-                .await
-                .map_err(|e| TineError::Database(e.to_string()))?;
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+        )> = sqlx::query_as(
+            "SELECT code_hash, input_hashes, lockfile_hash, artifacts, source_runtime_id, node_id, scope_hash FROM cache",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| TineError::Database(e.to_string()))?;
 
         let mut cache = HashMap::new();
-        for (code_hash_hex, input_hashes_json, lockfile_hash_hex, artifacts_json) in rows {
+        for (
+            code_hash_hex,
+            input_hashes_json,
+            lockfile_hash_hex,
+            artifacts_json,
+            source_runtime_id,
+            node_id,
+            scope_hash_hex,
+        ) in rows
+        {
             // Parse code_hash
             let code_hash = match hex::decode(&code_hash_hex) {
                 Ok(bytes) if bytes.len() == 32 => {
@@ -4447,6 +5166,35 @@ impl Workspace {
                 _ => continue,
             };
 
+            // New rows persist their scope directly; migrated legacy rows
+            // (empty scope_hash) derive it from the provenance columns
+            // (source_runtime_id is "tree::branch"). Entries without either
+            // cannot be attributed to a cell, so they are unreachable by
+            // design — reuse must stay top-to-bottom (same cell of the same
+            // tree), never sideways across branches or trees.
+            let scope_hash = if !scope_hash_hex.is_empty() {
+                match hex::decode(&scope_hash_hex) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        arr
+                    }
+                    _ => continue,
+                }
+            } else {
+                let Some(node_id) = node_id.filter(|id| !id.is_empty()) else {
+                    continue;
+                };
+                let Some(tree_part) = source_runtime_id
+                    .as_deref()
+                    .and_then(|runtime_id| runtime_id.split_once("::"))
+                    .map(|(tree_part, _)| tree_part)
+                else {
+                    continue;
+                };
+                NodeCacheKey::scope_for(tree_part, &node_id)
+            };
+
             // Parse input_hashes
             let input_hashes: HashMap<SlotName, [u8; 32]> =
                 serde_json::from_str(&input_hashes_json).unwrap_or_default();
@@ -4459,6 +5207,7 @@ impl Workspace {
                 code_hash,
                 input_hashes,
                 lockfile_hash,
+                scope_hash,
             };
             cache.insert(key, artifacts);
         }
@@ -4840,17 +5589,30 @@ impl WorkspaceApi for Workspace {
             return Ok(());
         }
 
-        Self::update_execution_status_record(&self.pool, execution_id, |status| {
+        let marked = Self::update_execution_status_record(&self.pool, execution_id, |status| {
             status.cancellation_requested_at = Some(cancellation_requested_at);
             status.queue_position = None;
             Self::apply_execution_phase(status, ExecutionPhase::CancellationRequested);
         })
         .await?;
+        if !marked {
+            // The execution terminalized between our status read and the
+            // cancellation marker: there is nothing left to cancel, and the
+            // tree's kernel may already be running a *different* execution
+            // — interrupting it now would kill the wrong run.
+            return Ok(());
+        }
 
         let tree_id = status.tree_id.clone().ok_or_else(|| {
             TineError::Internal(format!("execution '{}' is missing tree_id", execution_id))
         })?;
-        self.kernel_mgr.interrupt_tree(&tree_id).await?;
+        // Interrupt only if this execution still occupies the tree kernel: it
+        // may finish in the window after the marker commits, and the kernel is
+        // shared, so an unconditional interrupt could hit a different
+        // same-tree execution that started in the meantime.
+        self.kernel_mgr
+            .interrupt_tree_if_current(&tree_id, execution_id.as_str())
+            .await?;
 
         let pool = self.pool.clone();
         let execution_id = execution_id.clone();
@@ -5517,6 +6279,695 @@ mod tests {
             .expect("failed to shut down workspace");
     }
 
+    /// Cancel marks `CancellationRequested` via this helper and then
+    /// interrupts the tree's kernel — but only when the marker actually
+    /// committed. If the execution terminalizes between cancel's status
+    /// read and the marker write, the helper must report "not applied" so
+    /// cancel does not interrupt a kernel that may already be running a
+    /// different same-tree execution.
+    #[tokio::test]
+    async fn update_execution_status_record_reports_whether_a_live_row_was_updated() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store: Arc<dyn ArtifactStore> = Arc::new(NoopArtifactStore);
+        let workspace = Workspace::open(tmp.path().to_path_buf(), store, 1)
+            .await
+            .expect("failed to open workspace");
+
+        let tree_id = ExperimentTreeId::new("tree");
+        let branch_id = BranchId::new("main");
+        let target = Workspace::execution_target_for_tree_branch(&tree_id, &branch_id);
+        let execution_id = ExecutionId::generate();
+        Workspace::insert_branch_execution_record(
+            &workspace.pool,
+            &execution_id,
+            &tree_id,
+            &branch_id,
+            &target,
+            &[CellId::new("cell_1")],
+        )
+        .await
+        .expect("failed to insert execution record");
+
+        let marked = Workspace::update_execution_status_record(
+            &workspace.pool,
+            &execution_id,
+            |status| {
+                status.cancellation_requested_at = Some(Utc::now());
+                Workspace::apply_execution_phase(status, ExecutionPhase::CancellationRequested);
+            },
+        )
+        .await
+        .expect("status update failed");
+        assert!(marked, "a live execution must accept the update");
+
+        // A concurrent finalizer wins the race: the execution is terminal.
+        Workspace::update_execution_status_record(&workspace.pool, &execution_id, |status| {
+            status.finished_at = Some(Utc::now());
+            Workspace::apply_execution_phase(status, ExecutionPhase::Completed);
+        })
+        .await
+        .expect("finalize failed");
+
+        let marked = Workspace::update_execution_status_record(
+            &workspace.pool,
+            &execution_id,
+            |status| {
+                status.cancellation_requested_at = Some(Utc::now());
+                Workspace::apply_execution_phase(status, ExecutionPhase::CancellationRequested);
+            },
+        )
+        .await
+        .expect("status update failed");
+        assert!(
+            !marked,
+            "a terminal execution must reject the update so cancel skips the kernel interrupt"
+        );
+
+        let marked = Workspace::update_execution_status_record(
+            &workspace.pool,
+            &ExecutionId::generate(),
+            |_| {},
+        )
+        .await
+        .expect("status update failed");
+        assert!(!marked, "a missing execution must report not-applied");
+
+        workspace
+            .shutdown()
+            .await
+            .expect("failed to shut down workspace");
+    }
+
+    /// Idempotency reservations are reclaimed once a terminal execution
+    /// ages past the retention window — bounding table/index growth — while
+    /// recent terminal reservations and still-running ones are preserved so
+    /// near-term retries remain safe.
+    #[tokio::test]
+    async fn prune_stale_idempotency_reservations_releases_only_aged_terminal_rows() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store: Arc<dyn ArtifactStore> = Arc::new(NoopArtifactStore);
+        let workspace = Workspace::open(tmp.path().to_path_buf(), store, 1)
+            .await
+            .expect("failed to open workspace");
+
+        let tree_id = ExperimentTreeId::new("tree");
+        let branch_id = BranchId::new("main");
+        let target = Workspace::execution_target_for_tree_branch(&tree_id, &branch_id);
+        let topo = [CellId::new("cell_1")];
+        let scope = Workspace::branch_execution_idempotency_scope(&tree_id, &branch_id);
+
+        let insert_keyed = |key: &'static str| {
+            let exec_id = ExecutionId::generate();
+            let scope = scope.clone();
+            let target = target.clone();
+            let topo = topo.clone();
+            let pool = workspace.pool.clone();
+            let tree_id = tree_id.clone();
+            let branch_id = branch_id.clone();
+            async move {
+                let idem = ExecutionIdempotency {
+                    key,
+                    scope: &scope,
+                    fingerprint: "fp",
+                };
+                Workspace::insert_branch_execution_record_with_key(
+                    &pool, &exec_id, &tree_id, &branch_id, &target, &topo, Some(&idem),
+                )
+                .await
+                .expect("insert keyed execution");
+                exec_id
+            }
+        };
+
+        let aged = insert_keyed("aged-key").await;
+        let recent = insert_keyed("recent-key").await;
+        let running = insert_keyed("running-key").await;
+
+        // Terminalize aged (well past retention) and recent (just now).
+        sqlx::query("UPDATE executions SET finished_at = datetime('now', '-30 days') WHERE id = ?")
+            .bind(aged.as_str())
+            .execute(&workspace.pool)
+            .await
+            .expect("age the terminal execution");
+        sqlx::query("UPDATE executions SET finished_at = datetime('now') WHERE id = ?")
+            .bind(recent.as_str())
+            .execute(&workspace.pool)
+            .await
+            .expect("finalize the recent execution");
+        // `running` keeps finished_at NULL.
+
+        Workspace::prune_stale_idempotency_reservations(&workspace.pool).await;
+
+        let key_present = |exec: ExecutionId| {
+            let pool = workspace.pool.clone();
+            async move {
+                let (key,): (Option<String>,) =
+                    sqlx::query_as("SELECT idempotency_key FROM executions WHERE id = ?")
+                        .bind(exec.as_str())
+                        .fetch_one(&pool)
+                        .await
+                        .expect("read row");
+                key.is_some()
+            }
+        };
+
+        assert!(
+            !key_present(aged).await,
+            "an aged terminal reservation must be released"
+        );
+        assert!(
+            key_present(recent).await,
+            "a recently terminal reservation must be retained for near-term retries"
+        );
+        assert!(
+            key_present(running).await,
+            "a running execution's reservation must never be pruned"
+        );
+
+        workspace
+            .shutdown()
+            .await
+            .expect("failed to shut down workspace");
+    }
+
+    /// A pre-acceptance rejection (e.g. enqueue failure under queue
+    /// backpressure) must release the submission's idempotency reservation:
+    /// a retry with the same key has to start a fresh execution instead of
+    /// reattaching to the rejected one forever.
+    #[tokio::test]
+    async fn reject_execution_releases_idempotency_reservation_for_retry() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store: Arc<dyn ArtifactStore> = Arc::new(NoopArtifactStore);
+        let workspace = Workspace::open(tmp.path().to_path_buf(), store, 1)
+            .await
+            .expect("failed to open workspace");
+
+        let tree_id = ExperimentTreeId::new("tree");
+        let branch_id = BranchId::new("main");
+        let target = Workspace::execution_target_for_tree_branch(&tree_id, &branch_id);
+        let topo_order = vec![CellId::new("cell_1")];
+        let scope = Workspace::branch_execution_idempotency_scope(&tree_id, &branch_id);
+        let idempotency = ExecutionIdempotency {
+            key: "retry-key-1",
+            scope: &scope,
+            fingerprint: "fingerprint-1",
+        };
+
+        let rejected_execution = ExecutionId::generate();
+        Workspace::insert_branch_execution_record_with_key(
+            &workspace.pool,
+            &rejected_execution,
+            &tree_id,
+            &branch_id,
+            &target,
+            &topo_order,
+            Some(&idempotency),
+        )
+        .await
+        .expect("failed to insert keyed execution record");
+        assert_eq!(
+            Workspace::find_execution_by_idempotency_key(&workspace.pool, &idempotency)
+                .await
+                .expect("failed to look up idempotency key"),
+            Some(rejected_execution.clone())
+        );
+
+        // The same key with a different fingerprint is a conflict, not a
+        // silent reattach.
+        let changed_request = ExecutionIdempotency {
+            key: "retry-key-1",
+            scope: &scope,
+            fingerprint: "fingerprint-2",
+        };
+        let err = Workspace::find_execution_by_idempotency_key(&workspace.pool, &changed_request)
+            .await
+            .expect_err("key reuse with changed state must conflict");
+        assert!(matches!(err, TineError::IdempotencyConflict(_)));
+
+        workspace
+            .reject_execution(&rejected_execution)
+            .await
+            .expect("failed to reject execution");
+
+        assert_eq!(
+            Workspace::find_execution_by_idempotency_key(&workspace.pool, &idempotency)
+                .await
+                .expect("failed to look up idempotency key after rejection"),
+            None,
+            "a rejected submission must not hold its idempotency key"
+        );
+
+        // The retry reuses the key: the unique (key, scope) index must not
+        // block it, and the lookup must resolve to the fresh execution.
+        let retried_execution = ExecutionId::generate();
+        Workspace::insert_branch_execution_record_with_key(
+            &workspace.pool,
+            &retried_execution,
+            &tree_id,
+            &branch_id,
+            &target,
+            &topo_order,
+            Some(&idempotency),
+        )
+        .await
+        .expect("retry with the same key must insert a fresh execution");
+        assert_eq!(
+            Workspace::find_execution_by_idempotency_key(&workspace.pool, &idempotency)
+                .await
+                .expect("failed to look up idempotency key after retry"),
+            Some(retried_execution)
+        );
+
+        workspace
+            .shutdown()
+            .await
+            .expect("failed to shut down workspace");
+    }
+
+    fn fingerprint_sample_branch() -> ExecutableTreeBranch {
+        serde_json::from_value(serde_json::json!({
+            "tree_id": "tree-1",
+            "branch_id": "main",
+            "name": "tree-1 [main]",
+            "lineage": ["main"],
+            "path_cell_order": ["cell-1", "cell-2"],
+            "topo_order": ["cell-1", "cell-2"],
+            "cells": [
+                {
+                    "tree_id": "tree-1",
+                    "branch_id": "main",
+                    "cell_id": "cell-1",
+                    "name": "cell-1",
+                    "code": { "source": "x = 1", "language": "python" },
+                    "inputs": {},
+                    "outputs": ["result"],
+                    "cache": true,
+                    "map_over": null,
+                    "map_concurrency": null,
+                    "tags": {},
+                    "revision_id": null
+                },
+                {
+                    "tree_id": "tree-1",
+                    "branch_id": "main",
+                    "cell_id": "cell-2",
+                    "name": "cell-2",
+                    "code": { "source": "print(result)", "language": "python" },
+                    "inputs": {
+                        "input": {
+                            "source_cell_id": "cell-1",
+                            "source_output": "result"
+                        }
+                    },
+                    "outputs": ["output"],
+                    "cache": false,
+                    "map_over": null,
+                    "map_concurrency": null,
+                    "tags": {},
+                    "revision_id": null
+                }
+            ],
+            "environment": { "dependencies": ["pandas"] },
+            "execution_mode": "parallel",
+            "budget": null,
+            "created_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("sample branch must deserialize")
+    }
+
+    /// The idempotency fingerprint must cover every execution-relevant part
+    /// of the request — a same-key retry after any of these mutations is a
+    /// different request and must not match — while staying stable across
+    /// pure-metadata changes, which would otherwise turn genuine retries
+    /// into false conflicts.
+    #[test]
+    fn execution_request_fingerprint_tracks_plan_state_not_metadata() {
+        let fingerprint = |branch: &ExecutableTreeBranch| {
+            Workspace::execution_request_fingerprint(branch, Path::new("/ws"))
+        };
+        let base = fingerprint_sample_branch();
+        let baseline = fingerprint(&base);
+        assert_eq!(
+            baseline,
+            fingerprint(&fingerprint_sample_branch()),
+            "identical plans must fingerprint identically"
+        );
+
+        let mut reordered = fingerprint_sample_branch();
+        reordered.path_cell_order.reverse();
+        reordered.topo_order.reverse();
+        assert_ne!(
+            baseline,
+            fingerprint(&reordered),
+            "cell reordering changes the execution graph"
+        );
+
+        let mut rewired = fingerprint_sample_branch();
+        rewired.cells[1]
+            .inputs
+            .get_mut(&SlotName::new("input"))
+            .expect("sample input")
+            .source_output = SlotName::new("aux");
+        assert_ne!(
+            baseline,
+            fingerprint(&rewired),
+            "input rewiring changes what the cell consumes"
+        );
+
+        let mut outputs_changed = fingerprint_sample_branch();
+        outputs_changed.cells[0].outputs.push(SlotName::new("aux"));
+        assert_ne!(
+            baseline,
+            fingerprint(&outputs_changed)
+        );
+
+        let mut cache_changed = fingerprint_sample_branch();
+        cache_changed.cells[0].cache = false;
+        assert_ne!(
+            baseline,
+            fingerprint(&cache_changed)
+        );
+
+        let mut map_changed = fingerprint_sample_branch();
+        map_changed.cells[1].map_over = Some(SlotName::new("input"));
+        map_changed.cells[1].map_concurrency = Some(4);
+        assert_ne!(
+            baseline,
+            fingerprint(&map_changed)
+        );
+
+        let mut mode_changed = fingerprint_sample_branch();
+        mode_changed.execution_mode = ExecutionMode::Sequential;
+        assert_ne!(
+            baseline,
+            fingerprint(&mode_changed)
+        );
+
+        let mut budget_changed = fingerprint_sample_branch();
+        budget_changed.budget = Some(tine_core::WorkspaceBudget {
+            max_kernels: Some(1),
+            max_kernel_rss_bytes: None,
+            max_artifact_storage_bytes: None,
+        });
+        assert_ne!(
+            baseline,
+            fingerprint(&budget_changed)
+        );
+
+        let mut project_changed = fingerprint_sample_branch();
+        project_changed.project_id = Some(ProjectId::new("project-2"));
+        assert_ne!(
+            baseline,
+            fingerprint(&project_changed),
+            "a different project is a different execution context"
+        );
+
+        assert_ne!(
+            baseline,
+            Workspace::execution_request_fingerprint(&base, Path::new("/other-ws")),
+            "a different working directory is a different execution context"
+        );
+
+        // Metadata-only mutations are not execution-relevant: a retry after
+        // a rename, retag, or no-op save revision must still reattach.
+        let mut metadata_changed = fingerprint_sample_branch();
+        metadata_changed.cells[0].name = "renamed".to_string();
+        metadata_changed.cells[0]
+            .tags
+            .insert("stage".to_string(), "eval".to_string());
+        metadata_changed.cells[0].revision_id = Some(tine_core::RevisionId::new("rev-2"));
+        assert_eq!(
+            baseline,
+            fingerprint(&metadata_changed),
+            "metadata changes must not poison retries"
+        );
+    }
+
+    /// Full upgrade path: a populated database written by the PREVIOUS
+    /// release (cache keyed on node_id without scope_hash; executions without
+    /// idempotency columns) must open cleanly through `Workspace::open`, with
+    /// the cache rows migrated (data-moving rebuild) and the executions rows
+    /// preserved (additive columns) — the one path the fresh-open and the
+    /// isolated migration unit tests don't jointly cover.
+    #[tokio::test]
+    async fn open_upgrades_a_populated_pre_release_database() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let tine_dir = tmp.path().join(".tine");
+        std::fs::create_dir_all(&tine_dir).expect("create .tine");
+        let db_path = tine_dir.join("tine.db");
+        let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+        let code_hash_hex = hex::encode(NodeCacheKey::hash_code("x = 1"));
+        let lockfile_hex = hex::encode([7u8; 32]);
+
+        // Build the pre-release on-disk schema and populate it.
+        {
+            let pool = SqlitePool::connect(&db_url)
+                .await
+                .expect("open fixture db");
+            // Pre-release cache: node_id in the PK, NO scope_hash column.
+            sqlx::query(
+                "CREATE TABLE cache (
+                    code_hash       BLOB NOT NULL,
+                    input_hashes    TEXT NOT NULL,
+                    lockfile_hash   BLOB NOT NULL,
+                    artifacts       TEXT NOT NULL,
+                    source_runtime_id TEXT,
+                    node_id         TEXT NOT NULL DEFAULT '',
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                    last_accessed   TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (code_hash, input_hashes, lockfile_hash, node_id)
+                )",
+            )
+            .execute(&pool)
+            .await
+            .expect("create old cache");
+            sqlx::query(
+                "INSERT INTO cache (code_hash, input_hashes, lockfile_hash, artifacts, source_runtime_id, node_id) \
+                 VALUES (?, '{}', ?, '{\"out\": \"artifact-old\"}', 'tree-old::main', 'cell_1')",
+            )
+            .bind(&code_hash_hex)
+            .bind(&lockfile_hex)
+            .execute(&pool)
+            .await
+            .expect("seed old cache row");
+
+            // Pre-release executions: the 001 shape, NO idempotency columns.
+            // finished_at is set so startup reconciliation skips the row
+            // (and never parses its status).
+            sqlx::query(
+                "CREATE TABLE executions (
+                    id              TEXT PRIMARY KEY,
+                    tree_id         TEXT NOT NULL,
+                    branch_id       TEXT,
+                    target_kind     TEXT,
+                    status          TEXT NOT NULL,
+                    started_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                    finished_at     TEXT,
+                    node_logs       TEXT
+                )",
+            )
+            .execute(&pool)
+            .await
+            .expect("create old executions");
+            sqlx::query(
+                "INSERT INTO executions (id, tree_id, branch_id, target_kind, status, finished_at) \
+                 VALUES ('exec-old', 'tree-old', 'main', 'experiment_tree_branch', '{}', datetime('now'))",
+            )
+            .execute(&pool)
+            .await
+            .expect("seed old execution row");
+            pool.close().await;
+        }
+
+        // Open the workspace: runs the full migration chain against the
+        // populated old database.
+        let store: Arc<dyn ArtifactStore> = Arc::new(NoopArtifactStore);
+        let workspace = Workspace::open(tmp.path().to_path_buf(), store, 1)
+            .await
+            .expect("opening a populated pre-release database must succeed");
+
+        // Cache: rebuilt with scope_hash in the key, old row preserved and
+        // still reconstructable via its provenance.
+        let scope_hash_in_pk: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('cache') WHERE name = 'scope_hash' AND pk > 0",
+        )
+        .fetch_one(&workspace.pool)
+        .await
+        .expect("inspect cache pk");
+        assert!(scope_hash_in_pk, "cache must be rebuilt with scope_hash in the key");
+
+        let cache = Workspace::load_cache_from_pool(&workspace.pool)
+            .await
+            .expect("load migrated cache");
+        let key = NodeCacheKey {
+            code_hash: NodeCacheKey::hash_code("x = 1"),
+            input_hashes: HashMap::new(),
+            lockfile_hash: [7u8; 32],
+            scope_hash: NodeCacheKey::scope_for("tree-old", "cell_1"),
+        };
+        assert_eq!(
+            cache.get(&key).and_then(|a| a.get(&SlotName::new("out"))),
+            Some(&ArtifactKey::new("artifact-old")),
+            "the migrated cache row must survive and stay reachable by its provenance scope"
+        );
+
+        // Executions: idempotency columns added, old row preserved.
+        let has_idempotency: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) = 3 FROM pragma_table_info('executions') \
+             WHERE name IN ('idempotency_key', 'idempotency_scope', 'idempotency_fingerprint')",
+        )
+        .fetch_one(&workspace.pool)
+        .await
+        .expect("inspect executions columns");
+        assert!(has_idempotency, "executions must gain the idempotency columns");
+        let old_execution_survived: bool =
+            sqlx::query_scalar("SELECT COUNT(*) > 0 FROM executions WHERE id = 'exec-old'")
+                .fetch_one(&workspace.pool)
+                .await
+                .expect("count old execution");
+        assert!(old_execution_survived, "the pre-release execution row must survive the upgrade");
+
+        workspace.shutdown().await.expect("shutdown");
+    }
+
+    /// Migration 010 must upgrade a cache table from the previous schema
+    /// (node_id-scoped primary key, no scope_hash) in place: rows survive
+    /// with an empty scope_hash, and the rebuilt key accepts new scoped
+    /// rows alongside them.
+    #[tokio::test]
+    async fn migration_010_rebuilds_old_cache_schema_with_scope_hash() {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("failed to open in-memory sqlite");
+        sqlx::query(
+            "CREATE TABLE cache (
+                code_hash       BLOB NOT NULL,
+                input_hashes    TEXT NOT NULL,
+                lockfile_hash   BLOB NOT NULL,
+                artifacts       TEXT NOT NULL,
+                source_runtime_id TEXT,
+                node_id         TEXT NOT NULL DEFAULT '',
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                last_accessed   TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (code_hash, input_hashes, lockfile_hash, node_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("failed to create old-schema cache table");
+        sqlx::query(
+            "INSERT INTO cache (code_hash, input_hashes, lockfile_hash, artifacts, source_runtime_id, node_id) \
+             VALUES ('aa', '{}', 'bb', '{}', 'tree-1::main', 'cell_1')",
+        )
+        .execute(&pool)
+        .await
+        .expect("failed to insert old-schema row");
+
+        Workspace::run_migration_010(&pool)
+            .await
+            .expect("migration 010 must rebuild the old schema");
+
+        let (node_id, scope_hash): (String, String) =
+            sqlx::query_as("SELECT node_id, scope_hash FROM cache")
+                .fetch_one(&pool)
+                .await
+                .expect("migrated row must survive");
+        assert_eq!(node_id, "cell_1");
+        assert_eq!(scope_hash, "");
+
+        // Same content from a different scope now coexists instead of
+        // replacing the migrated row.
+        sqlx::query(
+            "INSERT OR REPLACE INTO cache (code_hash, input_hashes, lockfile_hash, artifacts, source_runtime_id, node_id, scope_hash) \
+             VALUES ('aa', '{}', 'bb', '{}', 'tree-2::main', 'cell_1', 'scope-2')",
+        )
+        .execute(&pool)
+        .await
+        .expect("failed to insert scoped row");
+        let row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cache")
+            .fetch_one(&pool)
+            .await
+            .expect("failed to count cache rows");
+        assert_eq!(row_count, 2);
+
+        // Re-running the migration is a no-op once scope_hash is in the key.
+        Workspace::run_migration_010(&pool)
+            .await
+            .expect("migration 010 must be idempotent");
+    }
+
+    /// The persisted cache must keep one row per (tree, cell) scope and
+    /// reconstruct distinct in-memory keys for them: two trees sharing a
+    /// cell id, code, inputs, and lockfile are different scopes, and legacy
+    /// rows without a stored scope still derive theirs from provenance.
+    #[tokio::test]
+    async fn load_cache_keeps_same_content_entries_from_different_trees_distinct() {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store: Arc<dyn ArtifactStore> = Arc::new(NoopArtifactStore);
+        let workspace = Workspace::open(tmp.path().to_path_buf(), store, 1)
+            .await
+            .expect("failed to open workspace");
+
+        let code_hash_hex = hex::encode(NodeCacheKey::hash_code("x = 1"));
+        let lockfile_hash_hex = hex::encode([7u8; 32]);
+        for tree_id in ["tree-a", "tree-b"] {
+            let scope_hash_hex = hex::encode(NodeCacheKey::scope_for(tree_id, "cell_1"));
+            sqlx::query(
+                "INSERT INTO cache (code_hash, input_hashes, lockfile_hash, artifacts, source_runtime_id, node_id, scope_hash) \
+                 VALUES (?, '{}', ?, ?, ?, 'cell_1', ?)",
+            )
+            .bind(&code_hash_hex)
+            .bind(&lockfile_hash_hex)
+            .bind(format!("{{\"out\": \"artifact-{tree_id}\"}}"))
+            .bind(format!("{tree_id}::main"))
+            .bind(&scope_hash_hex)
+            .execute(&workspace.pool)
+            .await
+            .expect("failed to insert scoped cache row");
+        }
+        // Legacy row migrated without a stored scope: same content again,
+        // attributed via source_runtime_id at load time.
+        sqlx::query(
+            "INSERT INTO cache (code_hash, input_hashes, lockfile_hash, artifacts, source_runtime_id, node_id, scope_hash) \
+             VALUES (?, '{}', ?, '{\"out\": \"artifact-tree-legacy\"}', 'tree-legacy::main', 'cell_1', '')",
+        )
+        .bind(&code_hash_hex)
+        .bind(&lockfile_hash_hex)
+        .execute(&workspace.pool)
+        .await
+        .expect("failed to insert legacy cache row");
+
+        let cache = Workspace::load_cache_from_pool(&workspace.pool)
+            .await
+            .expect("failed to load cache");
+        assert_eq!(
+            cache.len(),
+            3,
+            "same-content entries from different trees must stay distinct"
+        );
+        for tree_id in ["tree-a", "tree-b", "tree-legacy"] {
+            let key = NodeCacheKey {
+                code_hash: NodeCacheKey::hash_code("x = 1"),
+                input_hashes: HashMap::new(),
+                lockfile_hash: [7u8; 32],
+                scope_hash: NodeCacheKey::scope_for(tree_id, "cell_1"),
+            };
+            let artifacts = cache
+                .get(&key)
+                .unwrap_or_else(|| panic!("missing cache entry for {tree_id}"));
+            assert_eq!(
+                artifacts.get(&SlotName::new("out")),
+                Some(&ArtifactKey::new(format!("artifact-{tree_id}")))
+            );
+        }
+
+        workspace
+            .shutdown()
+            .await
+            .expect("failed to shut down workspace");
+    }
+
     /// Replicates the server-side root cause of MCP "failed to tool call"
     /// cascades during long-running cells: every NodeStream event reads,
     /// deserializes, mutates, serializes, and writes the entire node_logs
@@ -6163,6 +7614,31 @@ mod tests {
         .await
         .unwrap();
 
+        // Terminalize via the authoritative finalizer — event persistence
+        // deliberately never sets `finished_at` (only the finalizer holds
+        // the complete outcome, including rich outputs).
+        let mut node_statuses = HashMap::new();
+        node_statuses.insert(NodeId::new(cell_id.as_str()), NodeStatus::Completed);
+        Workspace::finalize_branch_execution_success(
+            &workspace.pool,
+            &execution_id,
+            &tree_id,
+            &branch_id,
+            &target,
+            tine_core::ExecutionOutcome {
+                execution_id: execution_id.clone(),
+                tree_id: Some(tree_id.clone()),
+                branch_id: Some(branch_id.clone()),
+                target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+                target: Some(target.clone()),
+                node_logs: HashMap::new(),
+                node_statuses,
+                failed_nodes: Vec::new(),
+                duration_ms: 50,
+            },
+        )
+        .await;
+
         // Sanity: the row is now finished.
         let finished_row: (String, Option<String>) =
             sqlx::query_as("SELECT status, node_logs FROM executions WHERE id = ?")
@@ -6173,7 +7649,7 @@ mod tests {
         let finished_status: ExecutionStatus = serde_json::from_str(&finished_row.0).unwrap();
         assert!(
             finished_status.finished_at.is_some(),
-            "test prerequisite: row should be marked finished by NodeCompleted",
+            "test prerequisite: row should be marked finished by the finalizer",
         );
 
         // Now buffer a late stream chunk that arrived after the terminal
@@ -6338,8 +7814,10 @@ mod tests {
             SENTINEL,
         );
 
+        // A schema-level (non-TEMP) trigger: TEMP triggers are per-connection
+        // and the pool may serve the next UPDATE from a different connection.
         sqlx::query(
-            "CREATE TEMP TRIGGER fail_execution_update \
+            "CREATE TRIGGER fail_execution_update \
              BEFORE UPDATE ON executions \
              BEGIN SELECT RAISE(ABORT, 'synthetic execution update failure'); END",
         )
@@ -6382,6 +7860,439 @@ mod tests {
             logs.stdout.contains(SENTINEL),
             "persist failure did not re-buffer streamed stdout; stdout = {:?}",
             logs.stdout
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Finalization atomicity
+    // -----------------------------------------------------------------------
+
+    async fn open_bare_workspace() -> (TempDir, Workspace) {
+        let tmp = TempDir::new().expect("failed to create temp dir");
+        let store: Arc<dyn ArtifactStore> = Arc::new(NoopArtifactStore);
+        let workspace = Workspace::open(tmp.path().to_path_buf(), store, 1)
+            .await
+            .expect("failed to open workspace");
+        (tmp, workspace)
+    }
+
+    async fn insert_queued_execution(
+        workspace: &Workspace,
+    ) -> (ExecutionId, ExperimentTreeId, BranchId, ExecutionTargetRef) {
+        let execution_id = ExecutionId::generate();
+        let tree_id = ExperimentTreeId::new("tree");
+        let branch_id = BranchId::new("main");
+        let target = Workspace::execution_target_for_tree_branch(&tree_id, &branch_id);
+        Workspace::insert_branch_execution_record(
+            &workspace.pool,
+            &execution_id,
+            &tree_id,
+            &branch_id,
+            &target,
+            &[CellId::new("cell_1")],
+        )
+        .await
+        .expect("failed to insert execution record");
+        (execution_id, tree_id, branch_id, target)
+    }
+
+    fn completed_outcome(
+        execution_id: &ExecutionId,
+        tree_id: &ExperimentTreeId,
+        branch_id: &BranchId,
+        target: &ExecutionTargetRef,
+    ) -> tine_core::ExecutionOutcome {
+        let node_id = NodeId::new("cell_1");
+        let mut node_statuses = HashMap::new();
+        node_statuses.insert(node_id.clone(), NodeStatus::Completed);
+        let mut node_logs = HashMap::new();
+        node_logs.insert(
+            node_id,
+            NodeLogs {
+                stdout: String::new(),
+                stderr: String::new(),
+                outputs: Vec::new(),
+                error: None,
+                duration_ms: Some(5),
+                metrics: HashMap::from([("score".to_string(), 1.0)]),
+            },
+        );
+        tine_core::ExecutionOutcome {
+            execution_id: execution_id.clone(),
+            tree_id: Some(tree_id.clone()),
+            branch_id: Some(branch_id.clone()),
+            target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+            target: Some(target.clone()),
+            node_logs,
+            node_statuses,
+            failed_nodes: Vec::new(),
+            duration_ms: 5,
+        }
+    }
+
+    async fn metrics_row_count(workspace: &Workspace, execution_id: &ExecutionId) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM metrics WHERE execution_id = ?")
+            .bind(execution_id.as_str())
+            .fetch_one(&workspace.pool)
+            .await
+            .expect("failed to count metrics")
+    }
+
+    #[tokio::test]
+    async fn finalize_failure_after_success_keeps_terminal_status() {
+        let (_tmp, workspace) = open_bare_workspace().await;
+        let (execution_id, tree_id, branch_id, target) = insert_queued_execution(&workspace).await;
+
+        Workspace::finalize_branch_execution_success(
+            &workspace.pool,
+            &execution_id,
+            &tree_id,
+            &branch_id,
+            &target,
+            completed_outcome(&execution_id, &tree_id, &branch_id, &target),
+        )
+        .await;
+        Workspace::finalize_branch_execution_failure(
+            &workspace.pool,
+            &execution_id,
+            &tree_id,
+            &branch_id,
+            &target,
+        )
+        .await;
+
+        let status = WorkspaceApi::status(&workspace, &execution_id)
+            .await
+            .expect("failed to load status");
+        assert_eq!(status.status, ExecutionLifecycleStatus::Completed);
+        assert!(status.finished_at.is_some());
+        assert_eq!(metrics_row_count(&workspace, &execution_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn double_success_finalize_writes_metrics_once() {
+        let (_tmp, workspace) = open_bare_workspace().await;
+        let (execution_id, tree_id, branch_id, target) = insert_queued_execution(&workspace).await;
+        let outcome = completed_outcome(&execution_id, &tree_id, &branch_id, &target);
+
+        Workspace::finalize_branch_execution_success(
+            &workspace.pool,
+            &execution_id,
+            &tree_id,
+            &branch_id,
+            &target,
+            outcome.clone(),
+        )
+        .await;
+        Workspace::finalize_branch_execution_success(
+            &workspace.pool,
+            &execution_id,
+            &tree_id,
+            &branch_id,
+            &target,
+            outcome,
+        )
+        .await;
+
+        assert_eq!(metrics_row_count(&workspace, &execution_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_finalize_does_not_overwrite_completed_record() {
+        let (_tmp, workspace) = open_bare_workspace().await;
+        let (execution_id, tree_id, branch_id, target) = insert_queued_execution(&workspace).await;
+
+        Workspace::finalize_branch_execution_success(
+            &workspace.pool,
+            &execution_id,
+            &tree_id,
+            &branch_id,
+            &target,
+            completed_outcome(&execution_id, &tree_id, &branch_id, &target),
+        )
+        .await;
+        Workspace::finalize_cancelled_execution(&workspace.pool, &execution_id, Utc::now())
+            .await
+            .expect("cancel finalize should be a no-op, not an error");
+
+        let status = WorkspaceApi::status(&workspace, &execution_id)
+            .await
+            .expect("failed to load status");
+        assert_eq!(status.status, ExecutionLifecycleStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn concurrent_success_and_cancel_finalize_have_single_winner() {
+        let (_tmp, workspace) = open_bare_workspace().await;
+        let (execution_id, tree_id, branch_id, target) = insert_queued_execution(&workspace).await;
+
+        let success = Workspace::finalize_branch_execution_success(
+            &workspace.pool,
+            &execution_id,
+            &tree_id,
+            &branch_id,
+            &target,
+            completed_outcome(&execution_id, &tree_id, &branch_id, &target),
+        );
+        let cancel =
+            Workspace::finalize_cancelled_execution(&workspace.pool, &execution_id, Utc::now());
+        let (_, cancel_result) = tokio::join!(success, cancel);
+        let _ = cancel_result;
+
+        let status = WorkspaceApi::status(&workspace, &execution_id)
+            .await
+            .expect("failed to load status");
+        assert!(status.finished_at.is_some());
+        match status.status {
+            ExecutionLifecycleStatus::Completed => {
+                assert_eq!(metrics_row_count(&workspace, &execution_id).await, 1);
+            }
+            ExecutionLifecycleStatus::Cancelled => {
+                assert_eq!(
+                    metrics_row_count(&workspace, &execution_id).await,
+                    0,
+                    "losing success finalizer must not write metrics"
+                );
+            }
+            other => panic!("expected Completed or Cancelled, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn phase_update_cannot_resurrect_terminal_record() {
+        let (_tmp, workspace) = open_bare_workspace().await;
+        let (execution_id, tree_id, branch_id, target) = insert_queued_execution(&workspace).await;
+
+        Workspace::finalize_branch_execution_failure(
+            &workspace.pool,
+            &execution_id,
+            &tree_id,
+            &branch_id,
+            &target,
+        )
+        .await;
+        Workspace::update_execution_status_record(&workspace.pool, &execution_id, |status| {
+            Workspace::apply_execution_phase(status, ExecutionPhase::Running);
+        })
+        .await
+        .expect("phase update should silently no-op on terminal records");
+
+        let status = WorkspaceApi::status(&workspace, &execution_id)
+            .await
+            .expect("failed to load status");
+        assert_eq!(status.status, ExecutionLifecycleStatus::Failed);
+        assert!(status.finished_at.is_some());
+    }
+
+    /// Regression for the rich-output loss race: the event bridge used to
+    /// terminalize the row itself on ExecutionCompleted/NodeCompleted, beating
+    /// the authoritative finalizer — whose subsequent write (the only one
+    /// carrying `outputs`) then backed off as the "loser" of the atomic
+    /// finalize guard. Event persistence must never terminalize, and event
+    /// writes landing after finalize must preserve the finalized outputs.
+    #[tokio::test]
+    async fn event_persistence_never_terminalizes_and_preserves_finalized_outputs() {
+        let (_tmp, workspace) = open_bare_workspace().await;
+        let (execution_id, tree_id, branch_id, target) = insert_queued_execution(&workspace).await;
+        let node_id = NodeId::new("cell_1");
+
+        let node_completed = ExecutionEvent::NodeCompleted {
+            execution_id: execution_id.clone(),
+            node_id: node_id.clone(),
+            tree_id: Some(tree_id.clone()),
+            branch_id: Some(branch_id.clone()),
+            target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+            target: Some(target.clone()),
+            artifacts: HashMap::new(),
+            duration_ms: 5,
+        };
+        let execution_completed = ExecutionEvent::ExecutionCompleted {
+            execution_id: execution_id.clone(),
+            tree_id: Some(tree_id.clone()),
+            branch_id: Some(branch_id.clone()),
+            target_kind: Some(ExecutionTargetKind::ExperimentTreeBranch),
+            target: Some(target.clone()),
+            duration_ms: 5,
+        };
+
+        // Events arriving BEFORE the finalizer must not terminalize the row.
+        for event in [&node_completed, &execution_completed] {
+            Workspace::persist_execution_event_snapshot_locked(
+                &workspace.pool,
+                &workspace.streaming_log_buffer,
+                Some(&workspace.execution_persist_locks),
+                event,
+            )
+            .await
+            .unwrap();
+        }
+        let status = WorkspaceApi::status(&workspace, &execution_id)
+            .await
+            .unwrap();
+        assert!(
+            status.finished_at.is_none(),
+            "event persistence must leave terminal transitions to the finalizer"
+        );
+
+        // The finalizer lands the outcome with rich outputs.
+        let mut outcome = completed_outcome(&execution_id, &tree_id, &branch_id, &target);
+        outcome
+            .node_logs
+            .get_mut(&node_id)
+            .unwrap()
+            .outputs
+            .push(tine_core::NodeOutput {
+                data: HashMap::from([("text/plain".to_string(), "2".to_string())]),
+                metadata: HashMap::new(),
+            });
+        Workspace::finalize_branch_execution_success(
+            &workspace.pool,
+            &execution_id,
+            &tree_id,
+            &branch_id,
+            &target,
+            outcome,
+        )
+        .await;
+
+        // Late event writes (the bridge is always slightly behind) must not
+        // clobber the finalized outputs.
+        for event in [&node_completed, &execution_completed] {
+            Workspace::persist_execution_event_snapshot_locked(
+                &workspace.pool,
+                &workspace.streaming_log_buffer,
+                Some(&workspace.execution_persist_locks),
+                event,
+            )
+            .await
+            .unwrap();
+        }
+
+        let (results_status, node_logs) = workspace
+            .execution_results(&execution_id)
+            .await
+            .expect("results should load");
+        assert_eq!(results_status.status, ExecutionLifecycleStatus::Completed);
+        let logs = node_logs.get(&node_id).expect("node logs present");
+        assert!(
+            logs.outputs
+                .iter()
+                .any(|output| output.data.get("text/plain") == Some(&"2".to_string())),
+            "finalized rich outputs were clobbered by late event persistence: {:?}",
+            logs.outputs
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_context_failure_marks_tree_needs_replay() {
+        let (tmp, workspace) = open_bare_workspace().await;
+        let tree = test_tree();
+        let tree_id = workspace
+            .save_experiment_tree(&tree)
+            .await
+            .expect("failed to save tree")
+            .id;
+
+        // Force ensure_tree_environment to fail deterministically (no kernel
+        // or network needed): the venv path exists as a regular file, so venv
+        // recreation cannot proceed.
+        let venv_path = tmp.path().join(".tine").join("venv");
+        std::fs::create_dir_all(venv_path.parent().unwrap()).unwrap();
+        std::fs::write(&venv_path, b"not a directory").unwrap();
+
+        let result = workspace
+            .prepare_context(&tree_id, &BranchId::new("main"), &CellId::new("a"))
+            .await;
+        assert!(result.is_err(), "prepare_context should fail");
+
+        let state = workspace
+            .get_tree_runtime_state(&tree_id)
+            .await
+            .expect("runtime state should exist after failed prepare");
+        assert_eq!(
+            state.kernel_state,
+            TreeKernelState::NeedsReplay,
+            "failed prepare must downgrade Switching to NeedsReplay"
+        );
+        assert!(state.materialized_path_cell_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_resets_needs_replay_to_runnable_ready() {
+        // Reproduces the reported bug: after a shutdown leaves the tree in
+        // `NeedsReplay`, restarting the kernel must reset the persisted runtime
+        // state so the UI no longer treats it as `needs_replay`-with-live-kernel
+        // (which hard-disables "Run Branch"). We test the state-reset helper
+        // directly so no real kernel is spun.
+        let (_tmp, workspace) = open_bare_workspace().await;
+        let tree = test_tree();
+        let tree_id = workspace
+            .save_experiment_tree(&tree)
+            .await
+            .expect("failed to save tree")
+            .id;
+        let branch_id = BranchId::new("main");
+
+        // Seed a post-shutdown state: NeedsReplay, with a stale prepared marker
+        // and materialized path, exactly as `mark_tree_needs_replay`/prior runs
+        // would leave behind.
+        let mut seeded = Workspace::default_tree_runtime_state(&tree_id, &branch_id);
+        seeded.kernel_state = TreeKernelState::NeedsReplay;
+        seeded.materialized_path_cell_ids = vec![CellId::new("a")];
+        seeded.last_prepared_cell_id = Some(CellId::new("a"));
+        seeded.runtime_epoch = 5;
+        workspace
+            .set_tree_runtime_state(seeded)
+            .await
+            .expect("seed runtime state");
+
+        workspace
+            .reset_runtime_state_after_kernel_restart(&tree_id)
+            .await
+            .expect("reset should succeed");
+
+        let state = workspace
+            .get_tree_runtime_state(&tree_id)
+            .await
+            .expect("runtime state should exist after restart");
+
+        // Ready + empty materialized path: the UI's `branchRequiresReplay`
+        // treats this as runnable (not needs_replay-with-live-kernel), so
+        // "Run Branch" is enabled again.
+        assert_eq!(state.kernel_state, TreeKernelState::Ready);
+        assert!(
+            state.materialized_path_cell_ids.is_empty(),
+            "restart must clear the materialized path so the next run replays from scratch"
+        );
+        assert_eq!(
+            state.last_prepared_cell_id, None,
+            "restart must clear the stale prepared-branch marker"
+        );
+        assert!(
+            state.runtime_epoch > 5,
+            "restart must bump the runtime epoch to invalidate the prior kernel's bookkeeping"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_with_no_runtime_state_is_noop() {
+        // KernelNotFound / no-prior-state must not fabricate state.
+        let (_tmp, workspace) = open_bare_workspace().await;
+        let tree = test_tree();
+        let tree_id = workspace
+            .save_experiment_tree(&tree)
+            .await
+            .expect("failed to save tree")
+            .id;
+
+        workspace
+            .reset_runtime_state_after_kernel_restart(&tree_id)
+            .await
+            .expect("reset should succeed");
+
+        assert!(
+            workspace.get_tree_runtime_state(&tree_id).await.is_none(),
+            "reset must not create runtime state when none exists"
         );
     }
 }

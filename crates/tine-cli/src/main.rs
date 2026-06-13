@@ -15,11 +15,13 @@ use serde::{Deserialize, Serialize};
 use tine_env::{EnvironmentManager, DEFAULT_PYTHON_VERSION};
 use tracing::{info, warn};
 
-use tine_api::{export_branch_as_ipynb, export_branch_as_python, Workspace};
+mod client;
+
+use client::TineClient;
+use tine_api::Workspace;
 use tine_core::{
     ArtifactKey, ArtifactMetadata, ArtifactStore, BranchId, CellDef, CellId, CellRuntimeState,
-    ExecutionId, ExperimentTreeId, NodeCode, ProjectDef, ProjectId, SlotName, TineResult,
-    WorkspaceApi,
+    ExperimentTreeId, NodeCode, SlotName, TineResult,
 };
 use tine_observe::{init_logging, init_metrics};
 
@@ -175,9 +177,27 @@ pub enum BranchCommands {
     /// Delete a branch
     Delete { tree_id: String, branch_id: String },
     /// Execute one branch
-    Execute { tree_id: String, branch_id: String },
+    Execute {
+        tree_id: String,
+        branch_id: String,
+        /// Return immediately after submission instead of waiting for the
+        /// execution to finish (the server keeps running it).
+        #[arg(long)]
+        no_wait: bool,
+        /// Idempotency key for the submission (auto-generated when omitted
+        /// and echoed in the output). Resubmitting with the same key
+        /// reattaches to the original run instead of starting a duplicate.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
     /// Execute all branches in a tree
-    ExecuteAll { tree_id: String },
+    ExecuteAll {
+        tree_id: String,
+        /// Return immediately after submission instead of waiting for the
+        /// executions to finish (the server keeps running them).
+        #[arg(long)]
+        no_wait: bool,
+    },
     /// Export a branch as Python
     ExportPy {
         tree_id: String,
@@ -234,6 +254,15 @@ pub enum CellCommands {
         tree_id: String,
         branch_id: String,
         cell_id: String,
+        /// Return immediately after submission instead of waiting for the
+        /// execution to finish (the server keeps running it).
+        #[arg(long)]
+        no_wait: bool,
+        /// Idempotency key for the submission (auto-generated when omitted
+        /// and echoed in the output). Resubmitting with the same key
+        /// reattaches to the original run instead of starting a duplicate.
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// Fetch logs for a cell
     Logs {
@@ -389,34 +418,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Initialized tine workspace in .tine/");
             }
 
+            // Data-plane commands are thin HTTP front doors over the running
+            // server (see SURFACE_CONSOLIDATION_PLAN.md). Opening the
+            // workspace in-process here would race a running server: two
+            // queues, two kernel managers, and a startup reconciliation that
+            // marks the server's live executions as failed.
             InternalCommands::Experiments { command } => {
-                let ws = open_workspace(&config).await?;
-                handle_experiment_command(&ws, command).await?;
+                let client = TineClient::from_bind(&config.bind)?;
+                handle_experiment_command(&client, command).await?;
             }
 
             InternalCommands::Branches { command } => {
-                let ws = open_workspace(&config).await?;
-                handle_branch_command(&ws, command).await?;
+                let client = TineClient::from_bind(&config.bind)?;
+                handle_branch_command(&client, command).await?;
             }
 
             InternalCommands::Cells { command } => {
-                let ws = open_workspace(&config).await?;
-                handle_cell_command(&ws, command).await?;
+                let client = TineClient::from_bind(&config.bind)?;
+                handle_cell_command(&client, command).await?;
             }
 
             InternalCommands::Executions { command } => {
-                let ws = open_workspace(&config).await?;
-                handle_execution_command(&ws, command).await?;
+                let client = TineClient::from_bind(&config.bind)?;
+                handle_execution_command(&client, command).await?;
             }
 
             InternalCommands::Files { command } => {
-                let ws = open_workspace(&config).await?;
-                handle_file_command(&ws, command).await?;
+                let client = TineClient::from_bind(&config.bind)?;
+                handle_file_command(&client, command).await?;
             }
 
             InternalCommands::Projects { command } => {
-                let ws = open_workspace(&config).await?;
-                handle_project_command(&ws, command.unwrap_or(ProjectCommands::List)).await?;
+                let client = TineClient::from_bind(&config.bind)?;
+                handle_project_command(&client, command.unwrap_or(ProjectCommands::List)).await?;
             }
 
             InternalCommands::Config => {
@@ -429,49 +463,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn handle_experiment_command(
-    ws: &Workspace,
+    client: &TineClient,
     command: ExperimentCommands,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         ExperimentCommands::List => {
-            let trees = ws.list_experiment_trees().await?;
-            print_json_pretty(&trees)?;
+            print_json_pretty(&client.list_experiment_trees().await?)?;
         }
         ExperimentCommands::Get { tree_id } => {
-            let tree = ws
-                .get_experiment_tree(&ExperimentTreeId::new(tree_id))
-                .await?;
-            print_json_pretty(&tree)?;
+            print_json_pretty(&client.get_experiment_tree(&tree_id).await?)?;
         }
         ExperimentCommands::Create { name, project } => {
-            let project_id = project.as_deref().map(ProjectId::new);
-            let tree = ws
-                .create_experiment_tree(&name, project_id.as_ref())
+            let tree = client
+                .create_experiment_tree(&name, project.as_deref())
                 .await?;
             print_json_pretty(&tree)?;
         }
         ExperimentCommands::Delete { tree_id } => {
-            ws.delete_experiment_tree(&ExperimentTreeId::new(&tree_id))
-                .await?;
+            client.delete_experiment_tree(&tree_id).await?;
             println!("Deleted {}", tree_id);
         }
         ExperimentCommands::Rename { tree_id, name } => {
-            ws.rename_experiment_tree(&ExperimentTreeId::new(&tree_id), &name)
-                .await?;
+            client.rename_experiment_tree(&tree_id, &name).await?;
             println!("Renamed {} to {}", tree_id, name);
         }
         ExperimentCommands::RuntimeState { tree_id } => {
-            let runtime_state = ws
-                .get_tree_runtime_state(&ExperimentTreeId::new(tree_id))
-                .await;
-            print_json_pretty(&runtime_state)?;
+            print_json_pretty(&client.tree_runtime_state(&tree_id).await?)?;
         }
     }
     Ok(())
 }
 
 async fn handle_branch_command(
-    ws: &Workspace,
+    client: &TineClient,
     command: BranchCommands,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
@@ -482,53 +506,82 @@ async fn handle_branch_command(
             branch_point_cell_id,
             cell,
         } => {
-            let tree_id = ExperimentTreeId::new(tree_id);
-            let first_cell =
-                load_or_build_cell_def(&cell, tree_id.clone(), BranchId::new("pending-branch"))?;
-            let branch_id = ws
-                .create_branch_in_experiment_tree(
+            let first_cell = load_or_build_cell_def(
+                &cell,
+                ExperimentTreeId::new(&tree_id),
+                BranchId::new("pending-branch"),
+            )?;
+            let branch_id = client
+                .create_branch(
                     &tree_id,
-                    &BranchId::new(parent_branch_id),
-                    branch_name,
-                    &CellId::new(branch_point_cell_id),
-                    first_cell,
+                    &parent_branch_id,
+                    &branch_name,
+                    &branch_point_cell_id,
+                    serde_json::to_value(&first_cell)?,
                 )
                 .await?;
-            print_json_pretty(&serde_json::json!({ "branch_id": branch_id.as_str() }))?;
+            print_json_pretty(&serde_json::json!({ "branch_id": branch_id }))?;
         }
         BranchCommands::Delete { tree_id, branch_id } => {
-            ws.delete_experiment_tree_branch(
-                &ExperimentTreeId::new(tree_id),
-                &BranchId::new(branch_id.clone()),
-            )
-            .await?;
+            client.delete_branch(&tree_id, &branch_id).await?;
             println!("Deleted branch {}", branch_id);
         }
-        BranchCommands::Execute { tree_id, branch_id } => {
-            let execution_id = ws
-                .execute_branch_in_experiment_tree(
-                    &ExperimentTreeId::new(tree_id),
-                    &BranchId::new(branch_id.clone()),
-                )
+        BranchCommands::Execute {
+            tree_id,
+            branch_id,
+            no_wait,
+            idempotency_key,
+        } => {
+            let idempotency_key = idempotency_key.unwrap_or_else(generate_idempotency_key);
+            let accepted = client
+                .execute_branch(&tree_id, &branch_id, &idempotency_key)
                 .await?;
-            print_json_pretty(&serde_json::json!({
-                "branch_id": branch_id,
-                "execution_id": execution_id.as_str(),
-            }))?;
+            let execution_id = required_str(&accepted, "execution_id")?;
+            if no_wait {
+                print_json_pretty(&serde_json::json!({
+                    "branch_id": branch_id,
+                    "execution_id": execution_id,
+                    "idempotency_key": idempotency_key,
+                }))?;
+            } else {
+                let status = client.wait_for_terminal(&execution_id).await?;
+                print_json_pretty(&serde_json::json!({
+                    "branch_id": branch_id,
+                    "execution_id": execution_id,
+                    "idempotency_key": idempotency_key,
+                    "status": status,
+                }))?;
+            }
         }
-        BranchCommands::ExecuteAll { tree_id } => {
-            let executions = ws
-                .execute_all_branches_in_experiment_tree(&ExperimentTreeId::new(tree_id))
-                .await?;
-            let payload = executions
-                .into_iter()
-                .map(|(branch_id, execution_id)| {
-                    serde_json::json!({
-                        "branch_id": branch_id.as_str(),
-                        "execution_id": execution_id.as_str(),
-                    })
-                })
-                .collect::<Vec<_>>();
+        BranchCommands::ExecuteAll { tree_id, no_wait } => {
+            let response = client.execute_all_branches(&tree_id).await?;
+            let accepted = response
+                .get("executions")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut payload = Vec::with_capacity(accepted.len());
+            for execution in accepted {
+                let execution_id = required_str(&execution, "execution_id")?;
+                let branch_id = execution
+                    .pointer("/target/branch_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if no_wait {
+                    payload.push(serde_json::json!({
+                        "branch_id": branch_id,
+                        "execution_id": execution_id,
+                    }));
+                } else {
+                    let status = client.wait_for_terminal(&execution_id).await?;
+                    payload.push(serde_json::json!({
+                        "branch_id": branch_id,
+                        "execution_id": execution_id,
+                        "status": status,
+                    }));
+                }
+            }
             print_json_pretty(&serde_json::json!({ "executions": payload }))?;
         }
         BranchCommands::ExportPy {
@@ -536,10 +589,7 @@ async fn handle_branch_command(
             branch_id,
             output,
         } => {
-            let tree = ws
-                .get_experiment_tree(&ExperimentTreeId::new(tree_id))
-                .await?;
-            let exported = export_branch_as_python(&tree, &BranchId::new(branch_id))?;
+            let exported = client.export_branch(&tree_id, &branch_id, "py").await?;
             write_or_print_text(output.as_ref(), &exported)?;
         }
         BranchCommands::ExportIpynb {
@@ -547,19 +597,33 @@ async fn handle_branch_command(
             branch_id,
             output,
         } => {
-            let tree = ws
-                .get_experiment_tree(&ExperimentTreeId::new(tree_id))
-                .await?;
-            let exported = export_branch_as_ipynb(&tree, &BranchId::new(branch_id))?;
-            let text = serde_json::to_string_pretty(&exported)?;
-            write_or_print_text(output.as_ref(), &text)?;
+            let exported = client.export_branch(&tree_id, &branch_id, "ipynb").await?;
+            write_or_print_text(output.as_ref(), &exported)?;
         }
     }
     Ok(())
 }
 
+/// Execute submissions are idempotent by default: when the user omits
+/// `--idempotency-key`, the CLI generates one and echoes it in the output
+/// (and in timeout errors) so a timed-out submission can be retried safely.
+fn generate_idempotency_key() -> String {
+    format!("cli-{}", tine_core::ExecutionId::generate().as_str())
+}
+
+fn required_str(
+    value: &serde_json::Value,
+    key: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("server response missing '{key}': {value}").into())
+}
+
 async fn handle_cell_command(
-    ws: &Workspace,
+    client: &TineClient,
     command: CellCommands,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
@@ -569,13 +633,20 @@ async fn handle_cell_command(
             after_cell_id,
             cell,
         } => {
-            let tree_id = ExperimentTreeId::new(tree_id);
-            let branch_id = BranchId::new(branch_id);
-            let cell = load_or_build_cell_def(&cell, tree_id.clone(), branch_id.clone())?;
-            let after = after_cell_id.as_deref().map(CellId::new);
-            ws.add_cell_to_experiment_tree_branch(&tree_id, &branch_id, cell, after.as_ref())
+            let cell = load_or_build_cell_def(
+                &cell,
+                ExperimentTreeId::new(&tree_id),
+                BranchId::new(&branch_id),
+            )?;
+            client
+                .add_cell(
+                    &tree_id,
+                    &branch_id,
+                    serde_json::to_value(&cell)?,
+                    after_cell_id.as_deref(),
+                )
                 .await?;
-            println!("Added cell to branch {}", branch_id.as_str());
+            println!("Added cell to branch {}", branch_id);
         }
         CellCommands::UpdateCode {
             tree_id,
@@ -585,13 +656,9 @@ async fn handle_cell_command(
             source_file,
         } => {
             let source = load_text_input(source, source_file)?;
-            ws.update_cell_code_in_experiment_tree_branch(
-                &ExperimentTreeId::new(tree_id),
-                &BranchId::new(branch_id),
-                &CellId::new(cell_id.clone()),
-                &source,
-            )
-            .await?;
+            client
+                .update_cell_code(&tree_id, &branch_id, &cell_id, &source)
+                .await?;
             println!("Updated code for cell {}", cell_id);
         }
         CellCommands::Move {
@@ -600,13 +667,9 @@ async fn handle_cell_command(
             cell_id,
             direction,
         } => {
-            ws.move_cell_in_experiment_tree_branch(
-                &ExperimentTreeId::new(tree_id),
-                &BranchId::new(branch_id),
-                &CellId::new(cell_id.clone()),
-                &direction,
-            )
-            .await?;
+            client
+                .move_cell(&tree_id, &branch_id, &cell_id, &direction)
+                .await?;
             println!("Moved cell {} {}", cell_id, direction);
         }
         CellCommands::Delete {
@@ -614,61 +677,60 @@ async fn handle_cell_command(
             branch_id,
             cell_id,
         } => {
-            ws.delete_cell_from_experiment_tree_branch(
-                &ExperimentTreeId::new(tree_id),
-                &BranchId::new(branch_id),
-                &CellId::new(cell_id.clone()),
-            )
-            .await?;
+            client.delete_cell(&tree_id, &branch_id, &cell_id).await?;
             println!("Deleted cell {}", cell_id);
         }
         CellCommands::Execute {
             tree_id,
             branch_id,
             cell_id,
+            no_wait,
+            idempotency_key,
         } => {
-            let (execution_id, logs) = ws
-                .execute_cell_in_experiment_tree_branch(
-                    &ExperimentTreeId::new(tree_id),
-                    &BranchId::new(branch_id),
-                    &CellId::new(cell_id.clone()),
-                )
+            let idempotency_key = idempotency_key.unwrap_or_else(generate_idempotency_key);
+            let accepted = client
+                .execute_cell(&tree_id, &branch_id, &cell_id, &idempotency_key)
                 .await?;
-            print_json_pretty(&serde_json::json!({
-                "execution_id": execution_id.as_str(),
-                "cell_id": cell_id,
-                "logs": logs,
-            }))?;
+            let execution_id = required_str(&accepted, "execution_id")?;
+            if no_wait {
+                print_json_pretty(&serde_json::json!({
+                    "execution_id": execution_id,
+                    "cell_id": cell_id,
+                    "idempotency_key": idempotency_key,
+                }))?;
+            } else {
+                let status = client.wait_for_terminal(&execution_id).await?;
+                let logs = client.cell_logs(&tree_id, &branch_id, &cell_id).await?;
+                print_json_pretty(&serde_json::json!({
+                    "execution_id": execution_id,
+                    "cell_id": cell_id,
+                    "idempotency_key": idempotency_key,
+                    "status": status.get("status"),
+                    "logs": logs,
+                }))?;
+            }
         }
         CellCommands::Logs {
             tree_id,
             branch_id,
             cell_id,
         } => {
-            let logs = ws
-                .logs_for_tree_cell(
-                    &ExperimentTreeId::new(tree_id),
-                    &BranchId::new(branch_id),
-                    &CellId::new(cell_id),
-                )
-                .await?;
-            print_json_pretty(&logs)?;
+            print_json_pretty(&client.cell_logs(&tree_id, &branch_id, &cell_id).await?)?;
         }
     }
     Ok(())
 }
 
 async fn handle_execution_command(
-    ws: &Workspace,
+    client: &TineClient,
     command: ExecutionCommands,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         ExecutionCommands::Status { execution_id } => {
-            let status = ws.status(&ExecutionId::new(execution_id)).await?;
-            print_json_pretty(&status)?;
+            print_json_pretty(&client.execution_status(&execution_id).await?)?;
         }
         ExecutionCommands::Cancel { execution_id } => {
-            ws.cancel(&ExecutionId::new(&execution_id)).await?;
+            client.cancel_execution(&execution_id).await?;
             println!("Canceled {}", execution_id);
         }
     }
@@ -676,51 +738,41 @@ async fn handle_execution_command(
 }
 
 async fn handle_project_command(
-    ws: &Workspace,
+    client: &TineClient,
     command: ProjectCommands,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         ProjectCommands::List => {
-            let projects = ws.list_projects().await?;
-            print_json_pretty(&projects)?;
+            print_json_pretty(&client.list_projects().await?)?;
         }
         ProjectCommands::Create {
             name,
             workspace_dir,
             description,
         } => {
-            let project = ProjectDef {
-                id: ProjectId::generate(),
-                name,
-                description,
-                workspace_dir,
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
-            };
-            let id = ws.create_project(project).await?;
-            print_json_pretty(&serde_json::json!({ "id": id.as_str() }))?;
-        }
-        ProjectCommands::Get { project_id } => {
-            let project = ws.get_project(&ProjectId::new(project_id)).await?;
+            let project = client
+                .create_project(&name, &workspace_dir, description.as_deref())
+                .await?;
             print_json_pretty(&project)?;
         }
+        ProjectCommands::Get { project_id } => {
+            print_json_pretty(&client.get_project(&project_id).await?)?;
+        }
         ProjectCommands::Experiments { project_id } => {
-            let experiments = ws.list_experiments(&ProjectId::new(project_id)).await?;
-            print_json_pretty(&experiments)?;
+            print_json_pretty(&client.list_project_experiments(&project_id).await?)?;
         }
     }
     Ok(())
 }
 
 async fn handle_file_command(
-    ws: &Workspace,
+    client: &TineClient,
     command: FileCommands,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         FileCommands::List { path, project } => {
-            let project_id = project.as_deref().map(ProjectId::new);
-            let entries = ws
-                .list_project_files(project_id.as_ref(), path.as_deref().unwrap_or_default())
+            let entries = client
+                .list_files(path.as_deref().unwrap_or_default(), project.as_deref())
                 .await?;
             print_json_pretty(&entries)?;
         }
@@ -729,10 +781,7 @@ async fn handle_file_command(
             project,
             output,
         } => {
-            let project_id = project.as_deref().map(ProjectId::new);
-            let bytes = ws
-                .read_project_file_bytes(project_id.as_ref(), &path)
-                .await?;
+            let bytes = client.read_file(&path, project.as_deref()).await?;
             if let Some(output) = output {
                 std::fs::write(output, &bytes)?;
             } else if let Ok(text) = String::from_utf8(bytes.clone()) {
@@ -747,9 +796,9 @@ async fn handle_file_command(
             content_file,
             project,
         } => {
-            let project_id = project.as_deref().map(ProjectId::new);
             let content = load_text_input(content, content_file)?;
-            ws.write_project_file(project_id.as_ref(), &path, &content)
+            client
+                .write_file(&path, &content, project.as_deref())
                 .await?;
             println!("Wrote {}", path);
         }
@@ -906,18 +955,11 @@ async fn run_doctor(config: &TineConfig) -> Result<(), Box<dyn std::error::Error
     }
 
     let env_manager = EnvironmentManager::new(config.workspace_dir.clone());
-    match env_manager.ensure_uv().await {
-        Ok(()) => {
-            print_doctor_check("uv (optional)", true, "available".to_string());
-        }
-        Err(error) => {
-            print_doctor_check(
-                "uv (optional)",
-                true,
-                format!("not installed; using stdlib venv/pip ({error})"),
-            );
-        }
-    };
+    print_doctor_check(
+        "package installer",
+        true,
+        env_manager.installer_description().await,
+    );
 
     match env_manager
         .ensure_python_version_available(DEFAULT_PYTHON_VERSION)

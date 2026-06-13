@@ -336,27 +336,14 @@ export function markReplayRequiredCellStatuses(
   return changed ? nextStatuses : cellStatuses;
 }
 
-export function resolvePollWindowExpiry({ currentStatus, wsConnected }) {
-  const normalizedStatus = currentStatus == null
-    ? null
-    : String(currentStatus).trim().toLowerCase();
-  if (wsConnected) {
-    return {
-      nextStatus: normalizedStatus,
-      shouldUpdateStatus: false,
-      shouldInjectSyntheticError: false,
-      logLevel: "info",
-      logMessage: "poll window ended; waiting for WebSocket updates",
-    };
-  }
-
-  return {
-    nextStatus: normalizedStatus,
-    shouldUpdateStatus: false,
-    shouldInjectSyntheticError: false,
-    logLevel: "warn",
-    logMessage: "poll window ended while disconnected; preserving current state until resync",
-  };
+// Backoff schedule for execution status polling. Polling has no iteration
+// cap — a long-running execution with a dropped WebSocket must keep
+// converging — so the interval grows to bound load: 1s at first for snappy
+// short executions, settling at 5s for long ones.
+export function nextPollDelay(prevDelayMs) {
+  const base =
+    Number.isFinite(prevDelayMs) && prevDelayMs > 0 ? prevDelayMs : 1000;
+  return Math.min(Math.round(base * 1.5), 5000);
 }
 
 export function reconnectResyncTargets({

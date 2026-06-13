@@ -83,11 +83,86 @@ fn configure_bundled_runtime(app: &tauri::App) {
     if python_bin.exists() {
         std::env::set_var("TINE_BUNDLED_PYTHON", &python_bin);
         tracing::info!(path = %python_bin.display(), "using bundled python");
+        // Export the install-stage architecture pin so the engine refuses to
+        // build a venv with a mismatched interpreter. Best-effort: a missing
+        // or unreadable descriptor simply leaves enforcement off.
+        if let Some(platform) = pinned_platform_from_python_bin(&python_bin) {
+            std::env::set_var("TINE_PYTHON_PLATFORM", &platform);
+            tracing::info!(platform = %platform, "pinned bundled python architecture");
+        }
     } else {
         tracing::warn!(
             path = %python_bin.display(),
             "runtime dir exists but bundled python binary is missing"
         );
+    }
+}
+
+/// Read the install-stage architecture descriptor that ships next to the
+/// bundled interpreter (`<python_root>/.tine-platform.json`) and return its
+/// `machine` value (e.g. "arm64"). The python root is the directory holding
+/// the interpreter: `<root>/bin/python3` on unix, `<root>/python.exe` on
+/// Windows. Returns `None` when the descriptor is absent or malformed.
+fn pinned_platform_from_python_bin(python_bin: &Path) -> Option<String> {
+    let python_root = if cfg!(windows) {
+        python_bin.parent()?
+    } else {
+        python_bin.parent()?.parent()?
+    };
+    let descriptor = python_root.join(".tine-platform.json");
+    let contents = std::fs::read_to_string(&descriptor).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    let machine = parsed.get("machine")?.as_str()?.trim();
+    (!machine.is_empty()).then(|| machine.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pinned_platform_from_python_bin;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn python_bin_in(root: &std::path::Path) -> PathBuf {
+        if cfg!(windows) {
+            root.join("python").join("python.exe")
+        } else {
+            root.join("python").join("bin").join("python3")
+        }
+    }
+
+    #[test]
+    fn reads_machine_from_platform_descriptor() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let python_root = tmp.path().join("python");
+        fs::create_dir_all(&python_root).unwrap();
+        fs::write(
+            python_root.join(".tine-platform.json"),
+            r#"{"machine":"arm64","platform_tag":"macosx-11.0-arm64","python_version":"3.12.7"}"#,
+        )
+        .unwrap();
+        let python_bin = python_bin_in(tmp.path());
+        assert_eq!(
+            pinned_platform_from_python_bin(&python_bin),
+            Some("arm64".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_when_descriptor_absent() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        fs::create_dir_all(tmp.path().join("python").join("bin")).ok();
+        let python_bin = python_bin_in(tmp.path());
+        assert_eq!(pinned_platform_from_python_bin(&python_bin), None);
+    }
+
+    #[test]
+    fn returns_none_when_machine_missing_or_blank() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let python_root = tmp.path().join("python");
+        fs::create_dir_all(&python_root).unwrap();
+        fs::write(python_root.join(".tine-platform.json"), r#"{"machine":"  "}"#).unwrap();
+        let python_bin = python_bin_in(tmp.path());
+        assert_eq!(pinned_platform_from_python_bin(&python_bin), None);
     }
 }
 

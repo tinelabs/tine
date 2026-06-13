@@ -14,6 +14,7 @@ from standalone_python import (
     seed_baseline_packages,
     stage_python_runtime_from_checksum_file,
     upgrade_pip,
+    write_platform_descriptor,
 )
 
 
@@ -85,6 +86,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         upgrade_pip(python_root)
         seed_baseline_packages(python_root)
+        # Ship the bundled interpreter's architecture descriptor so the pip
+        # wrapper can export TINE_PYTHON_PLATFORM at first run.
+        write_platform_descriptor(python_root)
 
         archive_path.parent.mkdir(parents=True, exist_ok=True)
         build_archive(staging_dir, archive_path)

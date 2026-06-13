@@ -135,7 +135,7 @@ pub fn branch_lineage(
 
     loop {
         let branch = branches_by_id.get(&current_branch_id).ok_or_else(|| {
-            TineError::Internal(format!(
+            TineError::NotFound(format!(
                 "branch '{}' not found in tree '{}'",
                 current_branch_id, tree.id
             ))
@@ -162,7 +162,7 @@ pub fn path_cell_order(tree: &ExperimentTreeDef, lineage: &[BranchId]) -> TineRe
 
     for (index, branch_id) in lineage.iter().enumerate() {
         let branch = branches_by_id.get(branch_id).ok_or_else(|| {
-            TineError::Internal(format!(
+            TineError::NotFound(format!(
                 "branch '{}' not found in tree '{}'",
                 branch_id, tree.id
             ))
@@ -172,7 +172,7 @@ pub fn path_cell_order(tree: &ExperimentTreeDef, lineage: &[BranchId]) -> TineRe
             .get(index + 1)
             .map(|next_branch_id| {
                 branches_by_id.get(next_branch_id).ok_or_else(|| {
-                    TineError::Internal(format!(
+                    TineError::NotFound(format!(
                         "branch '{}' not found in tree '{}'",
                         next_branch_id, tree.id
                     ))
@@ -236,7 +236,7 @@ fn projected_topo_order(
 
     for (index, cell_id) in path_cell_order.iter().enumerate() {
         let cell = cell_lookup.get(cell_id).ok_or_else(|| {
-            TineError::Internal(format!(
+            TineError::NotFound(format!(
                 "cell '{}' not found in tree '{}'",
                 cell_id, tree.id
             ))
@@ -328,7 +328,7 @@ fn projected_tree_branch(
 
     for (index, cell_id) in path_cell_order.iter().enumerate() {
         let cell = cell_lookup.get(cell_id).ok_or_else(|| {
-            TineError::Internal(format!(
+            TineError::NotFound(format!(
                 "cell '{}' not found in tree '{}'",
                 cell_id, tree.id
             ))
@@ -375,7 +375,7 @@ fn executable_cell_from_cell(
         }
 
         let upstream_cell = cell_lookup.get(upstream_cell_id).ok_or_else(|| {
-            TineError::Internal(format!(
+            TineError::NotFound(format!(
                 "upstream cell '{}' not found while projecting '{}'",
                 upstream_cell_id, cell.id
             ))
@@ -392,7 +392,7 @@ fn executable_cell_from_cell(
 
     if let Some(previous_cell_id) = previous_cell_id.filter(|id| *id != &cell.id) {
         let previous_cell = cell_lookup.get(previous_cell_id).ok_or_else(|| {
-            TineError::Internal(format!(
+            TineError::NotFound(format!(
                 "previous path cell '{}' not found while projecting '{}'",
                 previous_cell_id, cell.id
             ))

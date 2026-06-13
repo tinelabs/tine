@@ -20,7 +20,7 @@ import {
   pickActiveBranchId,
   registerPendingFileTreeRefresh,
   reconnectResyncTargets,
-  resolvePollWindowExpiry,
+  nextPollDelay,
   resolveApiBaseUrl,
   resolveApiUrl,
   resolveWebSocketUrl,
@@ -263,6 +263,22 @@ test("branchRequiresReplay still blocks replay-required live kernels", () => {
       executionStatuses: {},
     }),
     true,
+  );
+});
+
+test("branchRequiresReplay allows a fresh branch run after kernel restart", () => {
+  // After restart_tree_kernel resets the persisted state to Ready, a live
+  // kernel exists but the state is no longer needs_replay, so Run Branch must
+  // be runnable again (the reported bug: it stayed disabled post-restart).
+  assert.equal(
+    branchRequiresReplay({
+      treeId: "tree_1",
+      branchId: "main",
+      runtimeState: { kernel_state: "ready" },
+      runtimeHealth: { has_live_kernel: true },
+      executionStatuses: {},
+    }),
+    false,
   );
 });
 
@@ -810,30 +826,23 @@ test("markReplayRequiredCellStatuses only marks completed and cached branch cell
   );
 });
 
-test("resolvePollWindowExpiry preserves running state without synthetic timeout when disconnected", () => {
-  assert.deepEqual(
-    resolvePollWindowExpiry({ currentStatus: "running", wsConnected: false }),
-    {
-      nextStatus: "running",
-      shouldUpdateStatus: false,
-      shouldInjectSyntheticError: false,
-      logLevel: "warn",
-      logMessage: "poll window ended while disconnected; preserving current state until resync",
-    },
-  );
+test("nextPollDelay backs off monotonically and caps at five seconds", () => {
+  let delay = 1000;
+  const observed = [];
+  for (let i = 0; i < 10; i++) {
+    const next = nextPollDelay(delay);
+    assert.ok(next >= delay, `delay must not shrink: ${delay} -> ${next}`);
+    assert.ok(next <= 5000, `delay must cap at 5000, got ${next}`);
+    observed.push(next);
+    delay = next;
+  }
+  assert.equal(observed[observed.length - 1], 5000);
 });
 
-test("resolvePollWindowExpiry keeps websocket-connected polling non-terminal", () => {
-  assert.deepEqual(
-    resolvePollWindowExpiry({ currentStatus: "running", wsConnected: true }),
-    {
-      nextStatus: "running",
-      shouldUpdateStatus: false,
-      shouldInjectSyntheticError: false,
-      logLevel: "info",
-      logMessage: "poll window ended; waiting for WebSocket updates",
-    },
-  );
+test("nextPollDelay recovers from invalid previous delays", () => {
+  assert.equal(nextPollDelay(undefined), 1500);
+  assert.equal(nextPollDelay(0), 1500);
+  assert.equal(nextPollDelay(-50), 1500);
 });
 
 test("reconnectResyncTargets returns only actively tracked executions with targets", () => {

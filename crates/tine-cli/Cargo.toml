@@ -16,6 +16,7 @@ tine-server.workspace = true
 tine-observe.workspace = true
 clap.workspace = true
 figment.workspace = true
+reqwest.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 serde.workspace = true
@@ -23,3 +24,8 @@ serde_json.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 chrono.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+dashmap.workspace = true
+tempfile = "3"

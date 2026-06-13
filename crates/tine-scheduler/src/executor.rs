@@ -10,8 +10,8 @@ use tracing::{debug, error, info, warn};
 use tine_catalog::DataCatalog;
 use tine_core::{
     ArtifactKey, ExecutableTreeBranch, ExecutableTreeCell, ExecutionEvent, ExecutionId,
-    ExecutionMode, ExecutionOutcome, ExecutionTargetKind, ExecutionTargetRef, ExperimentTreeId,
-    NodeCacheKey, NodeError, NodeId, NodeLogs, NodeStatus, SlotName, TineError, TineResult,
+    ExecutionOutcome, ExecutionTargetKind, ExecutionTargetRef, ExperimentTreeId, NodeCacheKey,
+    NodeError, NodeId, NodeLogs, NodeStatus, SlotName, TineError, TineResult,
 };
 use tine_env::{EnvironmentManager, TreeEnvironmentDescriptor};
 use tine_graph::ExecutableTreeGraph;
@@ -44,9 +44,40 @@ pub struct Scheduler {
     workspace_root: PathBuf,
     /// Event broadcaster for streaming execution events.
     event_tx: broadcast::Sender<ExecutionEvent>,
-    /// Exclusive lock for sequential-mode tree executions.
-    /// Parallel executions read-lock; sequential executions write-lock.
-    exec_lock: Arc<tokio::sync::RwLock<()>>,
+    /// Per-tree execution locks. A tree owns exactly one kernel and one
+    /// namespace, so executions targeting the same tree must serialize —
+    /// concurrent same-tree execution means cross-branch contamination.
+    /// Executions on different trees never contend.
+    tree_locks: dashmap::DashMap<ExperimentTreeId, Arc<tokio::sync::Mutex<()>>>,
+}
+
+/// Marks an execution as the current occupant of its tree's kernel for as
+/// long as it is alive, clearing the marker on drop. Drop runs before the
+/// surrounding tree execution lock is released (reverse declaration order),
+/// so no later same-tree execution can become the occupant while this one's
+/// marker is still set.
+struct CurrentExecutionGuard {
+    kernel_mgr: Arc<KernelManager>,
+    tree_id: ExperimentTreeId,
+    execution_id: String,
+}
+
+impl CurrentExecutionGuard {
+    fn new(kernel_mgr: Arc<KernelManager>, tree_id: ExperimentTreeId, execution_id: String) -> Self {
+        kernel_mgr.set_tree_current_execution(&tree_id, &execution_id);
+        Self {
+            kernel_mgr,
+            tree_id,
+            execution_id,
+        }
+    }
+}
+
+impl Drop for CurrentExecutionGuard {
+    fn drop(&mut self) {
+        self.kernel_mgr
+            .clear_tree_current_execution(&self.tree_id, &self.execution_id);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -80,8 +111,26 @@ impl Scheduler {
             catalog,
             workspace_root,
             event_tx,
-            exec_lock: Arc::new(tokio::sync::RwLock::new(())),
+            tree_locks: dashmap::DashMap::new(),
         }
+    }
+
+    /// Lock handle serializing all executions that target `tree_id`.
+    fn tree_lock(&self, tree_id: &ExperimentTreeId) -> Arc<tokio::sync::Mutex<()>> {
+        self.tree_locks
+            .entry(tree_id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Public handle to the per-tree execution lock, for callers that must
+    /// hold the lock across more than one operation (e.g. run-all wraps
+    /// isolation-session begin → branch execution → session end in one
+    /// critical section). Pair with
+    /// [`Self::execute_executable_branch_for_target_prelocked`] — the regular
+    /// entry points acquire this lock themselves and would deadlock.
+    pub fn tree_execution_lock(&self, tree_id: &ExperimentTreeId) -> Arc<tokio::sync::Mutex<()>> {
+        self.tree_lock(tree_id)
     }
 
     /// Subscribe to execution events.
@@ -151,6 +200,29 @@ impl Scheduler {
         pool: Option<&SqlitePool>,
         working_dir: Option<&Path>,
     ) -> TineResult<ExecutionOutcome> {
+        // Same-tree executions always serialize (shared kernel + namespace);
+        // executions on other trees proceed concurrently. `execution_mode` no
+        // longer selects locking — it is tree metadata governing ordering only.
+        let tree_lock = self.tree_lock(&branch.tree_id);
+        let _tree_guard = tree_lock.lock().await;
+        self.execute_branch_for_target(execution_id, branch, target, cache, pool, working_dir)
+            .await
+    }
+
+    /// Like [`Self::execute_executable_branch_for_target`], but the caller
+    /// already holds the guard from [`Self::tree_execution_lock`] for this
+    /// branch's tree and keeps it held across surrounding work (such as an
+    /// isolation session). Calling this without holding that lock forfeits
+    /// same-tree serialization.
+    pub async fn execute_executable_branch_for_target_prelocked(
+        &self,
+        execution_id: &ExecutionId,
+        branch: &ExecutableTreeBranch,
+        target: &ExecutionTargetRef,
+        cache: &HashMap<NodeCacheKey, HashMap<SlotName, ArtifactKey>>,
+        pool: Option<&SqlitePool>,
+        working_dir: Option<&Path>,
+    ) -> TineResult<ExecutionOutcome> {
         self.execute_branch_for_target(execution_id, branch, target, cache, pool, working_dir)
             .await
     }
@@ -170,6 +242,11 @@ impl Scheduler {
         target: &ExecutionTargetRef,
         working_dir: Option<&Path>,
     ) -> TineResult<(ExecutionId, NodeLogs)> {
+        // Serialize against branch executions on the same tree: a single cell
+        // mutates the same kernel namespace a branch run depends on.
+        let tree_lock = self.tree_lock(&branch.tree_id);
+        let _tree_guard = tree_lock.lock().await;
+
         let execution_id = ExecutionId::generate();
         let effective_working_dir = working_dir.unwrap_or(self.workspace_root.as_path());
 
@@ -271,25 +348,20 @@ impl Scheduler {
         pool: Option<&SqlitePool>,
         working_dir: Option<&Path>,
     ) -> TineResult<ExecutionOutcome> {
-        // Acquire execution lock based on mode:
-        // - Parallel: read lock (multiple can run concurrently)
-        // - Sequential: write lock (exclusive, waits for all others to finish)
-        let _read_guard;
-        let _write_guard;
-        match branch.execution_mode {
-            ExecutionMode::Parallel => {
-                _read_guard = Some(self.exec_lock.read().await);
-                _write_guard = None;
-            }
-            ExecutionMode::Sequential => {
-                _read_guard = None;
-                _write_guard = Some(self.exec_lock.write().await);
-            }
-        }
-
-        let start = Instant::now();
         let runtime_target = Self::scheduler_target(target);
         let tree_id = runtime_target.tree_id.clone();
+        let start = Instant::now();
+
+        // Mark this execution as the kernel's current occupant for the
+        // duration of the run. Callers reach here holding the tree's
+        // execution lock, so the marker is set before any code runs and
+        // cleared (on drop) before the lock is released — keeping a
+        // targeted cancel from interrupting a later same-tree execution.
+        let _current_execution_guard = CurrentExecutionGuard::new(
+            self.kernel_mgr.clone(),
+            tree_id.clone(),
+            execution_id.as_str().to_string(),
+        );
 
         info!(
             execution = %execution_id,
@@ -311,6 +383,17 @@ impl Scheduler {
         let graph = ExecutableTreeGraph::from_branch(branch)?;
         graph.validate(&Self::branch_runtime_id(branch))?;
 
+        // Ensure environment is ready before hashing the lockfile, so cache
+        // keys reflect the environment cells actually run against. Hashing
+        // first would key first-run entries by the pre-sync state and they
+        // could never match again once the lockfile materializes.
+        eprintln!("[scheduler] ensuring environment...");
+        let venv_dir = self
+            .env_mgr
+            .ensure_tree_environment(&Self::tree_environment(branch))
+            .await?;
+        eprintln!("[scheduler] environment ready at {}", venv_dir.display());
+
         // Compute lockfile hash
         let lockfile_hash = self
             .env_mgr
@@ -326,14 +409,6 @@ impl Scheduler {
             skip = to_skip.len(),
             "execution plan ready"
         );
-
-        // Ensure environment is ready
-        eprintln!("[scheduler] ensuring environment...");
-        let venv_dir = self
-            .env_mgr
-            .ensure_tree_environment(&Self::tree_environment(branch))
-            .await?;
-        eprintln!("[scheduler] environment ready at {}", venv_dir.display());
 
         // Start kernel if needed
         if !self.kernel_mgr.has_tree_kernel(&tree_id) {
@@ -355,91 +430,85 @@ impl Scheduler {
         let mut node_artifacts: HashMap<NodeId, HashMap<SlotName, ArtifactKey>> = HashMap::new();
         let mut usable_cache_hits = Vec::new();
 
-        // Inject cached artifacts for skipped (cache-hit) nodes
-        for node_id in &to_skip {
+        // Inject cached artifacts for skipped (cache-hit) nodes, using the
+        // artifacts of the exact cache entry the planner matched. Re-resolving
+        // entries here (e.g. by code hash) could pick a different entry whose
+        // inputs or environment do not match this branch.
+        for (node_id, artifacts) in &to_skip {
             let cell = Self::cell_by_node_id(branch, node_id);
             let mut cache_ready = true;
 
-            // Find the matching cache entry for this node
-            let code_hash = NodeCacheKey::hash_code(&cell.code.source);
-            let matching_entry = cache.iter().find(|(k, _)| k.code_hash == code_hash);
+            // Inject each output artifact into the kernel namespace via _pf_load_artifact
+            for slot in &cell.outputs {
+                let Some(artifact_key) = artifacts.get(slot) else {
+                    cache_ready = false;
+                    warn!(node = %node_id, slot = %slot, "cache entry missing declared output slot");
+                    break;
+                };
+                let Some(path) = self.catalog.get_path(artifact_key) else {
+                    cache_ready = false;
+                    warn!(
+                        node = %node_id,
+                        slot = %slot,
+                        artifact = %artifact_key,
+                        "cached artifact missing on disk; falling back to execution"
+                    );
+                    break;
+                };
 
-            if let Some((_, artifacts)) = matching_entry {
-                // Inject each output artifact into the kernel namespace via _pf_load_artifact
-                for slot in &cell.outputs {
-                    let Some(artifact_key) = artifacts.get(slot) else {
+                let inject_code = format!(
+                    "{} = _pf_load_artifact('{}')",
+                    slot.as_str(),
+                    path.display()
+                );
+                debug!(
+                    node = %node_id,
+                    slot = %slot,
+                    artifact = %artifact_key,
+                    "injecting cached artifact"
+                );
+                match self
+                    .kernel_mgr
+                    .execute_tree_code(&tree_id, &inject_code)
+                    .await
+                {
+                    Ok(result) if result.error.is_none() => {}
+                    Ok(result) => {
                         cache_ready = false;
-                        warn!(node = %node_id, slot = %slot, "cache entry missing declared output slot");
+                        let error = result
+                            .error
+                            .map(|err| format!("{}: {}", err.ename, err.evalue))
+                            .unwrap_or_else(|| "unknown python error".to_string());
+                        warn!(
+                            node = %node_id,
+                            slot = %slot,
+                            artifact = %artifact_key,
+                            error = %error,
+                            "cached artifact injection raised python error; falling back to execution"
+                        );
                         break;
-                    };
-                    let Some(path) = self.catalog.get_path(artifact_key) else {
+                    }
+                    Err(err) => {
                         cache_ready = false;
                         warn!(
                             node = %node_id,
                             slot = %slot,
                             artifact = %artifact_key,
-                            "cached artifact missing on disk; falling back to execution"
+                            error = %err,
+                            "cached artifact injection failed; falling back to execution"
                         );
                         break;
-                    };
-
-                    let inject_code = format!(
-                        "{} = _pf_load_artifact('{}')",
-                        slot.as_str(),
-                        path.display()
-                    );
-                    debug!(
-                        node = %node_id,
-                        slot = %slot,
-                        artifact = %artifact_key,
-                        "injecting cached artifact"
-                    );
-                    match self
-                        .kernel_mgr
-                        .execute_tree_code(&tree_id, &inject_code)
-                        .await
-                    {
-                        Ok(result) if result.error.is_none() => {}
-                        Ok(result) => {
-                            cache_ready = false;
-                            let error = result
-                                .error
-                                .map(|err| format!("{}: {}", err.ename, err.evalue))
-                                .unwrap_or_else(|| "unknown python error".to_string());
-                            warn!(
-                                node = %node_id,
-                                slot = %slot,
-                                artifact = %artifact_key,
-                                error = %error,
-                                "cached artifact injection raised python error; falling back to execution"
-                            );
-                            break;
-                        }
-                        Err(err) => {
-                            cache_ready = false;
-                            warn!(
-                                node = %node_id,
-                                slot = %slot,
-                                artifact = %artifact_key,
-                                error = %err,
-                                "cached artifact injection failed; falling back to execution"
-                            );
-                            break;
-                        }
                     }
                 }
-                if cache_ready {
-                    node_artifacts.insert(node_id.clone(), artifacts.clone());
-                    usable_cache_hits.push(node_id.clone());
-                }
-            } else {
-                cache_ready = false;
             }
 
             if !cache_ready {
                 to_execute.push(node_id.clone());
                 continue;
             }
+
+            node_artifacts.insert(node_id.clone(), artifacts.clone());
+            usable_cache_hits.push(node_id.clone());
 
             metrics::counter!(M_NODES_CACHE_HIT).increment(1);
             self.emit(ExecutionEvent::NodeCacheHit {
@@ -475,8 +544,12 @@ impl Scheduler {
                 break;
             }
 
-            // Execute ready nodes (in parallel via tokio::spawn)
-            let mut handles = Vec::new();
+            // Execute ready nodes one at a time. All cells of a branch share
+            // one kernel, which serializes execution anyway — spawning them
+            // concurrently only allowed another cell's code to run between a
+            // cell's execution and its artifact serialization, corrupting what
+            // got cached. Running execute+persist as one unit closes that race;
+            // it also stops scheduling further cells after the first failure.
             for node_id in &ready {
                 let cell = Self::cell_by_node_id(branch, node_id).clone();
 
@@ -522,37 +595,24 @@ impl Scheduler {
                             error!(node = %node_id, error = %e, "map node failed");
                             node_statuses.insert(node_id.clone(), NodeStatus::Failed);
                             failed_nodes.push(node_id.clone());
+                            break;
                         }
                     }
                     continue;
                 }
 
-                let exec_id = execution_id.clone();
-                let kernel_mgr = self.kernel_mgr.clone();
-                let branch_def = branch.clone();
-                let cell_def = cell.clone();
-                let event_tx = self.event_tx.clone();
-                let catalog = self.catalog.clone();
-                let node_target = target.clone();
-                handles.push(tokio::spawn(async move {
-                    execute_cell(
-                        &kernel_mgr,
-                        &branch_def,
-                        &exec_id,
-                        &cell_def,
-                        &node_target,
-                        &event_tx,
-                        &catalog,
-                    )
-                    .await
-                }));
-            }
-
-            // Collect results
-            for (i, handle) in handles.into_iter().enumerate() {
-                let node_id = &ready[i];
-                match handle.await {
-                    Ok(Ok((result, artifacts, extracted_metrics))) => {
+                match execute_cell(
+                    &self.kernel_mgr,
+                    branch,
+                    execution_id,
+                    &cell,
+                    target,
+                    &self.event_tx,
+                    &self.catalog,
+                )
+                .await
+                {
+                    Ok((result, artifacts, extracted_metrics)) => {
                         let has_error = result.error.is_some();
 
                         node_logs.insert(
@@ -591,30 +651,36 @@ impl Scheduler {
 
                             node_statuses.insert(node_id.clone(), NodeStatus::Failed);
                             failed_nodes.push(node_id.clone());
+                            break;
                         } else {
                             // Store artifacts in tracker
                             if !artifacts.is_empty() {
                                 node_artifacts.insert(node_id.clone(), artifacts.clone());
                             }
 
-                            // Write cache entry if pool is available
+                            // Write cache entry if the cell opted into caching
+                            // and a pool is available. Non-cache cells must not
+                            // produce entries: their keys are never consulted by
+                            // the planner and would only pollute the table.
                             if let Some(pool) = pool {
-                                let _ = write_cache_entry(
-                                    pool,
-                                    Self::cell_by_node_id(branch, node_id),
-                                    &Self::branch_runtime_id(branch),
-                                    lockfile_hash,
-                                    &node_artifacts,
-                                    &artifacts,
-                                )
-                                .await;
+                                if Self::cell_by_node_id(branch, node_id).cache {
+                                    let _ = write_cache_entry(
+                                        pool,
+                                        branch,
+                                        Self::cell_by_node_id(branch, node_id),
+                                        lockfile_hash,
+                                        &node_artifacts,
+                                        &artifacts,
+                                    )
+                                    .await;
+                                }
                             }
 
                             node_statuses.insert(node_id.clone(), NodeStatus::Completed);
                             completed.insert(node_id.clone());
                         }
                     }
-                    Ok(Err(e)) => {
+                    Err(e) => {
                         error!(node = %node_id, error = %e, "node execution failed");
                         metrics::counter!(M_NODES_FAILED).increment(1);
                         let node_error = Self::node_error_from_tine_error(&e);
@@ -640,11 +706,7 @@ impl Scheduler {
                             },
                         );
                         failed_nodes.push(node_id.clone());
-                    }
-                    Err(e) => {
-                        error!(node = %node_id, error = %e, "task panicked");
-                        node_statuses.insert(node_id.clone(), NodeStatus::Failed);
-                        failed_nodes.push(node_id.clone());
+                        break;
                     }
                 }
             }
@@ -994,7 +1056,13 @@ except Exception as _pf_err:
                             let key = ArtifactKey::new(hex::encode(hash.as_bytes()));
 
                             let _ = catalog.store(&key, &data).await;
-                            let _ = catalog.register(key.clone(), artifact_path.clone()).await;
+                            // Register the immutable content-addressed copy,
+                            // not `artifact_path`: the per-slot file is reused
+                            // and overwritten by every later execution, which
+                            // would leave this key mapped to foreign data.
+                            let _ = catalog
+                                .register(key.clone(), catalog.artifact_dir().join(key.as_str()))
+                                .await;
 
                             artifacts.insert(slot.clone(), key.clone());
 
@@ -1116,10 +1184,14 @@ async fn introspect_error_context(
 
 #[cfg(test)]
 mod tests {
-    use super::Scheduler;
+    use std::collections::HashMap;
+
+    use sqlx::sqlite::SqlitePool;
+
+    use super::{write_cache_entry, Scheduler};
     use tine_core::{
-        BranchId, ExecutableTreeBranch, ExecutionTargetKind, ExecutionTargetRef, ExperimentTreeId,
-        SlotName,
+        ArtifactKey, BranchId, ExecutableTreeBranch, ExecutionTargetKind, ExecutionTargetRef,
+        ExperimentTreeId, NodeId, SlotName,
     };
 
     #[test]
@@ -1148,6 +1220,172 @@ mod tests {
         let input = second.inputs.get(&SlotName::new("input")).unwrap();
         assert_eq!(input.source_cell_id.as_str(), "cell-1");
         assert_eq!(input.source_output.as_str(), "result");
+    }
+
+    async fn memory_pool_with_cache_schema() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("failed to open in-memory sqlite");
+        sqlx::query(
+            "CREATE TABLE cache (
+                code_hash       BLOB NOT NULL,
+                input_hashes    TEXT NOT NULL,
+                lockfile_hash   BLOB NOT NULL,
+                artifacts       TEXT NOT NULL,
+                source_runtime_id TEXT,
+                node_id         TEXT NOT NULL DEFAULT '',
+                scope_hash      TEXT NOT NULL DEFAULT '',
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                last_accessed   TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (code_hash, input_hashes, lockfile_hash, scope_hash, node_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE artifact_refs (
+                artifact_key    TEXT PRIMARY KEY,
+                ref_count       INTEGER NOT NULL DEFAULT 1,
+                size_bytes      INTEGER NOT NULL,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                last_accessed   TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    fn slot_artifacts(pairs: &[(&str, &str)]) -> HashMap<SlotName, ArtifactKey> {
+        pairs
+            .iter()
+            .map(|(slot, key)| (SlotName::new(*slot), ArtifactKey::new(*key)))
+            .collect()
+    }
+
+    /// Like `sample_branch`, but the upstream cell declares two output slots.
+    fn multi_output_branch() -> ExecutableTreeBranch {
+        let mut branch = sample_branch();
+        branch.cells[0].outputs = vec![SlotName::new("result"), SlotName::new("aux")];
+        branch
+    }
+
+    #[tokio::test]
+    async fn write_cache_entry_keys_match_planner_input_hashes() {
+        let pool = memory_pool_with_cache_schema().await;
+        let branch = multi_output_branch();
+        let cell = branch.cells[1].clone();
+
+        let mut all_node_artifacts = HashMap::new();
+        all_node_artifacts.insert(
+            NodeId::new("cell-1"),
+            slot_artifacts(&[("result", "k-result"), ("aux", "k-aux")]),
+        );
+        let produced = slot_artifacts(&[("output", "k-out")]);
+
+        write_cache_entry(
+            &pool,
+            &branch,
+            &cell,
+            [7; 32],
+            &all_node_artifacts,
+            &produced,
+        )
+        .await
+        .expect("cache write failed");
+
+        let (input_hashes_json, runtime_id): (String, String) =
+            sqlx::query_as("SELECT input_hashes, source_runtime_id FROM cache")
+                .fetch_one(&pool)
+                .await
+                .expect("expected one cache row");
+        let written: HashMap<SlotName, [u8; 32]> =
+            serde_json::from_str(&input_hashes_json).unwrap();
+        let expected = tine_graph::cache_input_hashes(&branch, &cell, &all_node_artifacts)
+            .expect("inputs should be hashable");
+        assert_eq!(
+            written, expected,
+            "written keys must be exactly what the planner will compute on lookup"
+        );
+        assert!(!written.is_empty());
+        assert_eq!(runtime_id, "tree-1::branch-1");
+    }
+
+    /// Two trees that share a cell id (e.g. the default `cell_1`), code,
+    /// inputs, and lockfile must keep independent cache rows: without the
+    /// scope in the row identity, INSERT OR REPLACE lets the later tree
+    /// evict the earlier tree's entry, silently destroying its cache hits.
+    #[tokio::test]
+    async fn write_cache_entry_preserves_entries_across_trees_sharing_cell_ids() {
+        let pool = memory_pool_with_cache_schema().await;
+        let branch_tree_1 = multi_output_branch();
+        let mut branch_tree_2 = multi_output_branch();
+        branch_tree_2.tree_id = ExperimentTreeId::new("tree-2");
+
+        let mut all_node_artifacts = HashMap::new();
+        all_node_artifacts.insert(
+            NodeId::new("cell-1"),
+            slot_artifacts(&[("result", "k-result"), ("aux", "k-aux")]),
+        );
+        let produced = slot_artifacts(&[("output", "k-out")]);
+
+        for branch in [&branch_tree_1, &branch_tree_2] {
+            write_cache_entry(
+                &pool,
+                branch,
+                &branch.cells[1].clone(),
+                [7; 32],
+                &all_node_artifacts,
+                &produced,
+            )
+            .await
+            .expect("cache write failed");
+        }
+
+        let scope_hashes: Vec<(String,)> =
+            sqlx::query_as("SELECT scope_hash FROM cache ORDER BY scope_hash")
+                .fetch_all(&pool)
+                .await
+                .expect("failed to read cache rows");
+        assert_eq!(
+            scope_hashes.len(),
+            2,
+            "each tree must retain its own cache entry"
+        );
+        assert_ne!(scope_hashes[0].0, scope_hashes[1].0);
+        assert!(scope_hashes.iter().all(|(scope,)| !scope.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn write_cache_entry_skips_when_upstream_artifacts_incomplete() {
+        let pool = memory_pool_with_cache_schema().await;
+        let branch = multi_output_branch();
+        let cell = branch.cells[1].clone();
+
+        // The upstream's "result" artifact is missing, so no reliable key
+        // exists for this cell — nothing should be written.
+        let mut all_node_artifacts = HashMap::new();
+        all_node_artifacts.insert(NodeId::new("cell-1"), slot_artifacts(&[("aux", "k-aux")]));
+        let produced = slot_artifacts(&[("output", "k-out")]);
+
+        write_cache_entry(
+            &pool,
+            &branch,
+            &cell,
+            [7; 32],
+            &all_node_artifacts,
+            &produced,
+        )
+        .await
+        .expect("skipped cache write should not error");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cache")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "incomplete upstream artifacts must not be cached");
     }
 
     fn sample_branch() -> ExecutableTreeBranch {
@@ -1230,41 +1468,52 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Write a cache entry to SQLite after successful node execution.
+///
+/// Input hashes are computed by the same `cache_input_hashes` the planner
+/// uses, so written keys are exactly the keys later lookups will compute.
 async fn write_cache_entry(
     pool: &SqlitePool,
+    branch: &ExecutableTreeBranch,
     cell: &ExecutableTreeCell,
-    runtime_id: &str,
     lockfile_hash: [u8; 32],
     all_node_artifacts: &HashMap<NodeId, HashMap<SlotName, ArtifactKey>>,
     produced_artifacts: &HashMap<SlotName, ArtifactKey>,
 ) -> TineResult<()> {
-    // Build input hashes from upstream artifact keys
-    let mut input_hashes: HashMap<SlotName, [u8; 32]> = HashMap::new();
-    for (slot, input) in &cell.inputs {
-        let source_node_id = NodeId::new(input.source_cell_id.as_str());
-        if let Some(src_artifacts) = all_node_artifacts.get(&source_node_id) {
-            for (_, artifact_key) in src_artifacts {
-                input_hashes.insert(slot.clone(), NodeCacheKey::hash_code(artifact_key.as_str()));
-            }
-        }
-    }
+    let runtime_id = Scheduler::branch_runtime_id(branch);
+    let Some(input_hashes) = tine_graph::cache_input_hashes(branch, cell, all_node_artifacts)
+    else {
+        debug!(
+            node = %cell.cell_id,
+            "skipping cache write: upstream artifacts incomplete, entry key would be unreliable"
+        );
+        return Ok(());
+    };
 
     let code_hash = NodeCacheKey::hash_code(&cell.code.source);
     let code_hash_hex = hex::encode(code_hash);
     let input_hashes_json = serde_json::to_string(&input_hashes).unwrap_or_default();
     let lockfile_hash_hex = hex::encode(lockfile_hash);
     let artifacts_json = serde_json::to_string(produced_artifacts).unwrap_or_default();
+    // The persisted scope must match the planner's in-memory key exactly,
+    // and it must be part of the row identity: without it, INSERT OR
+    // REPLACE lets a different tree with the same cell id, code, inputs,
+    // and lockfile evict this tree's entry.
+    let scope_hash_hex = hex::encode(NodeCacheKey::scope_for(
+        branch.tree_id.as_str(),
+        cell.cell_id.as_str(),
+    ));
 
     sqlx::query(
-        "INSERT OR REPLACE INTO cache (code_hash, input_hashes, lockfile_hash, artifacts, source_runtime_id, node_id, created_at, last_accessed) \
-         VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))"
+        "INSERT OR REPLACE INTO cache (code_hash, input_hashes, lockfile_hash, artifacts, source_runtime_id, node_id, scope_hash, created_at, last_accessed) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))"
     )
     .bind(&code_hash_hex)
     .bind(&input_hashes_json)
     .bind(&lockfile_hash_hex)
     .bind(&artifacts_json)
-    .bind(runtime_id)
+    .bind(runtime_id.as_str())
     .bind(cell.cell_id.as_str())
+    .bind(&scope_hash_hex)
     .execute(pool)
     .await
     .map_err(|e| TineError::Database(format!("cache write failed: {}", e)))?;

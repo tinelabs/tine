@@ -13,6 +13,7 @@ from standalone_python import (
     repo_root,
     seed_baseline_packages,
     stage_python_runtime as stage_bundled_python_runtime,
+    write_platform_descriptor,
 )
 
 
@@ -22,6 +23,28 @@ SUPPORTED_TARGETS = {
     "linux-x86_64",
     "windows-x86_64",
 }
+
+# The architectures a staged interpreter may legitimately report
+# (`platform.machine()`) for each desktop target. Used to fail the build if a
+# fetched tarball's actual arch disagrees with the requested target — e.g. a
+# mis-pinned URL — rather than shipping a mismatched bundled runtime.
+TARGET_EXPECTED_MACHINE = {
+    "macos-aarch64": {"arm64", "aarch64"},
+    "macos-x86_64": {"x86_64"},
+    "linux-x86_64": {"x86_64"},
+    "windows-x86_64": {"AMD64", "x86_64"},
+}
+
+
+def assert_descriptor_matches_target(target: str, payload: dict) -> None:
+    expected = TARGET_EXPECTED_MACHINE.get(target)
+    machine = str(payload.get("machine") or "")
+    if expected is not None and machine not in expected:
+        raise RuntimeError(
+            f"staged runtime architecture '{machine}' does not match requested "
+            f"target '{target}' (expected one of {sorted(expected)}); the pinned "
+            f"tarball for this target is likely wrong"
+        )
 
 def runtime_dir() -> Path:
     return repo_root() / "crates" / "tine-app" / "resources" / "runtime"
@@ -69,6 +92,13 @@ def stage_desktop_runtime(target: str, artifact: dict) -> None:
     output_root.mkdir(parents=True, exist_ok=True)
     destination = stage_bundled_python_runtime(output_root, artifact["url"], artifact["sha256"])
     seed_baseline_packages(destination)
+    # Record the bundled interpreter's architecture so the engine can refuse a
+    # venv built with a mismatched interpreter at runtime (see tine-env's
+    # TINE_PYTHON_PLATFORM enforcement). Written into the python root so it
+    # ships inside the bundled runtime. Fail the build if the staged arch does
+    # not match the requested target — a mis-pinned tarball must not ship.
+    descriptor = write_platform_descriptor(destination)
+    assert_descriptor_matches_target(target, descriptor)
     sentinel_path().write_text(
         json.dumps(sentinel_payload(target, artifact, destination), indent=2) + "\n"
     )

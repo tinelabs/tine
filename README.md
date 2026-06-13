@@ -51,7 +51,7 @@ Tine is built around a tree-native notebook model:
 - an experiment contains **branches**
 - branches contain **cells**
 
-Each experiment owns its own kernel and environment, so branches let you explore multiple paths in parallel against the same code without collapsing everything into one linear notebook. The Web UI and any connected agent share that local runtime, so they always see the same state, logs, and outputs.
+Each experiment owns its own kernel and environment, so branches let you explore diverging paths against the same code without collapsing everything into one linear notebook. Executions on the same experiment run in order against that one kernel, while separate experiments run concurrently; "run all branches" additionally isolates sibling branches from each other's namespace changes. Cell results are cached: re-running a branch skips cells whose code, inputs, and environment are unchanged, and a cached result is only ever reused by the same cell along its own lineage — never sideways across branches. The Web UI and any connected agent share that local runtime, so they always see the same state, logs, and outputs.
 
 ## Desktop app
 
