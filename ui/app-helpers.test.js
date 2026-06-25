@@ -6,10 +6,12 @@ import {
   appendTerminalEvent,
   branchRequiresReplay,
   buildExecutionStatusEvent,
+  classifyPythonCompletionContext,
   desktopMcpCommand,
   deriveRuntimeUi,
   describeExecutionProgress,
   executionStatusLevel,
+  filterPythonCompletionOptions,
   fileTreeRefreshKey,
   fileQuery,
   hasHttpOrigin,
@@ -32,6 +34,119 @@ import {
   shouldRenderStderr,
   watchedDirForPath,
 } from "./app-helpers.js";
+
+const PYTHON_COMPLETION_FIXTURES = [
+  { label: "local_df", type: "variable", source: "local" },
+  { label: "import", type: "keyword", detail: "statement", source: "global" },
+  { label: "PendingDeprecationWarning", type: "type", source: "global" },
+  { label: "ImportError", type: "type", source: "global" },
+  { label: "__builtins__", type: "constant", source: "global" },
+  { label: "print", type: "function", source: "global" },
+  { label: "len", type: "function", source: "global" },
+];
+
+test("classifyPythonCompletionContext distinguishes Python completion contexts", () => {
+  assert.deepEqual(classifyPythonCompletionContext("impo"), {
+    kind: "statement-start",
+    prefix: "impo",
+  });
+  assert.deepEqual(classifyPythonCompletionContext("import pan"), {
+    kind: "import-module",
+    prefix: "pan",
+  });
+  assert.deepEqual(classifyPythonCompletionContext("import os, pan"), {
+    kind: "import-module",
+    prefix: "pan",
+  });
+  assert.deepEqual(classifyPythonCompletionContext("import pandas as p"), {
+    kind: "import-alias",
+    prefix: "p",
+  });
+  assert.deepEqual(classifyPythonCompletionContext("from pandas import Da"), {
+    kind: "import-name",
+    prefix: "Da",
+  });
+  assert.deepEqual(classifyPythonCompletionContext("from pandas import DataFrame as D"), {
+    kind: "import-name",
+    prefix: "D",
+  });
+  assert.deepEqual(classifyPythonCompletionContext("except Imp"), {
+    kind: "except-type",
+    prefix: "Imp",
+  });
+  assert.deepEqual(classifyPythonCompletionContext("pd.re"), {
+    kind: "member-access",
+    prefix: "re",
+  });
+});
+
+test("filterPythonCompletionOptions keeps snippets at statement start", () => {
+  const labels = filterPythonCompletionOptions(PYTHON_COMPLETION_FIXTURES, {
+    kind: "statement-start",
+    prefix: "impo",
+  }).map((option) => option.label);
+
+  assert(labels.includes("import"));
+  assert(labels.includes("local_df"));
+  assert(!labels.includes("PendingDeprecationWarning"));
+  assert(!labels.includes("__builtins__"));
+});
+
+test("filterPythonCompletionOptions suppresses globals in import contexts", () => {
+  assert.deepEqual(
+    filterPythonCompletionOptions(PYTHON_COMPLETION_FIXTURES, {
+      kind: "import-module",
+      prefix: "pan",
+    }),
+    [],
+  );
+});
+
+test("filterPythonCompletionOptions keeps exception types only in exception contexts", () => {
+  const exceptLabels = filterPythonCompletionOptions(PYTHON_COMPLETION_FIXTURES, {
+    kind: "except-type",
+    prefix: "Imp",
+  }).map((option) => option.label);
+  const genericLabels = filterPythonCompletionOptions(PYTHON_COMPLETION_FIXTURES, {
+    kind: "generic-identifier",
+    prefix: "Imp",
+  }).map((option) => option.label);
+
+  assert(exceptLabels.includes("ImportError"));
+  assert(!exceptLabels.includes("print"));
+  assert(!genericLabels.includes("ImportError"));
+});
+
+test("filterPythonCompletionOptions hides private globals until underscore prefix", () => {
+  assert.equal(
+    filterPythonCompletionOptions(PYTHON_COMPLETION_FIXTURES, {
+      kind: "generic-identifier",
+      prefix: "",
+    }).some((option) => option.label === "__builtins__"),
+    false,
+  );
+  assert.equal(
+    filterPythonCompletionOptions(PYTHON_COMPLETION_FIXTURES, {
+      kind: "generic-identifier",
+      prefix: "__",
+    }).some((option) => option.label === "__builtins__"),
+    true,
+  );
+});
+
+test("filterPythonCompletionOptions prefers local completions over duplicate globals", () => {
+  const options = filterPythonCompletionOptions(
+    [
+      { label: "print", type: "variable", source: "local" },
+      { label: "print", type: "function", source: "global" },
+    ],
+    { kind: "generic-identifier", prefix: "pri" },
+  );
+
+  assert.deepEqual(options.map((option) => [option.label, option.type, option.source]), [
+    ["print", "variable", "local"],
+  ]);
+});
 
 test("fileQuery includes project scope when present", () => {
   assert.equal(fileQuery("nested/file.txt", "project-1"), "path=nested%2Ffile.txt&project_id=project-1");

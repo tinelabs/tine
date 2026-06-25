@@ -5987,7 +5987,7 @@ dependencies = [
 
 [[package]]
 name = "tine-api"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "blake3",
@@ -6016,7 +6016,7 @@ dependencies = [
 
 [[package]]
 name = "tine-app"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "axum 0.8.8",
@@ -6041,7 +6041,7 @@ dependencies = [
 
 [[package]]
 name = "tine-catalog"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "arrow-ipc",
  "arrow-schema",
@@ -6058,7 +6058,7 @@ dependencies = [
 
 [[package]]
 name = "tine-cli"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "axum 0.8.8",
@@ -6082,7 +6082,7 @@ dependencies = [
 
 [[package]]
 name = "tine-core"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -6097,7 +6097,7 @@ dependencies = [
 
 [[package]]
 name = "tine-env"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "blake3",
  "metrics",
@@ -6114,7 +6114,7 @@ dependencies = [
 
 [[package]]
 name = "tine-graph"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "chrono",
  "petgraph",
@@ -6124,7 +6124,7 @@ dependencies = [
 
 [[package]]
 name = "tine-kernel"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "bytes",
  "dashmap",
@@ -6147,7 +6147,7 @@ dependencies = [
 
 [[package]]
 name = "tine-observe"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
@@ -6157,7 +6157,7 @@ dependencies = [
 
 [[package]]
 name = "tine-python"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "blake3",
@@ -6178,7 +6178,7 @@ dependencies = [
 
 [[package]]
 name = "tine-scheduler"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "blake3",
  "dashmap",
@@ -6200,7 +6200,7 @@ dependencies = [
 
 [[package]]
 name = "tine-server"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "axum 0.8.8",

@@ -82,6 +82,216 @@ export function desktopMcpCommand(serverInfo) {
   return `tine-mcp --api-url http://127.0.0.1:${serverInfo.port}`;
 }
 
+const PYTHON_IDENTIFIER_RE = /[A-Za-z_][A-Za-z0-9_]*$/;
+
+const PYTHON_COMMON_GLOBALS = new Set([
+  "False",
+  "None",
+  "True",
+  "abs",
+  "all",
+  "any",
+  "bool",
+  "breakpoint",
+  "bytes",
+  "callable",
+  "chr",
+  "dict",
+  "dir",
+  "enumerate",
+  "filter",
+  "float",
+  "format",
+  "frozenset",
+  "getattr",
+  "globals",
+  "hasattr",
+  "hash",
+  "help",
+  "hex",
+  "id",
+  "input",
+  "int",
+  "isinstance",
+  "issubclass",
+  "iter",
+  "len",
+  "list",
+  "locals",
+  "map",
+  "max",
+  "min",
+  "next",
+  "object",
+  "open",
+  "ord",
+  "pow",
+  "print",
+  "property",
+  "range",
+  "repr",
+  "reversed",
+  "round",
+  "set",
+  "slice",
+  "sorted",
+  "str",
+  "sum",
+  "super",
+  "tuple",
+  "type",
+  "vars",
+  "zip",
+]);
+
+const PYTHON_EXCEPTION_NAMES = new Set([
+  "BaseException",
+  "Exception",
+  "KeyboardInterrupt",
+  "SystemExit",
+  "GeneratorExit",
+  "StopIteration",
+  "StopAsyncIteration",
+]);
+
+function stripPythonLineComment(line) {
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) quote = null;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (char === "#") return line.slice(0, index);
+  }
+  return line;
+}
+
+export function getPythonCompletionPrefix(textBeforeCursor = "") {
+  return PYTHON_IDENTIFIER_RE.exec(textBeforeCursor)?.[0] || "";
+}
+
+export function classifyPythonCompletionContext(textBeforeCursor = "") {
+  const code = stripPythonLineComment(String(textBeforeCursor || ""));
+  const trimmed = code.trimStart();
+  const prefix = getPythonCompletionPrefix(code);
+  const beforePrefix = prefix ? code.slice(0, -prefix.length) : code;
+  const beforePrefixTrimmed = beforePrefix.trimEnd();
+
+  if (!trimmed) return { kind: "statement-start", prefix };
+  if (/[."'`]\s*$/.test(beforePrefix)) return { kind: "member-access", prefix };
+  if (/\bexcept\s+[\w., ()]*$/.test(code)) return { kind: "except-type", prefix };
+  if (/\braise\s+[\w.]*$/.test(code)) return { kind: "except-type", prefix };
+  if (/^\s*from\s+[\w.]*$/.test(code)) return { kind: "import-module", prefix };
+  if (/^\s*from\s+[\w.]+\s+import\b/.test(code)) return { kind: "import-name", prefix };
+  if (/^\s*import\s+/.test(code) && /\bas\s+\w*$/.test(code)) {
+    return { kind: "import-alias", prefix };
+  }
+  if (/^\s*import\s+/.test(code)) return { kind: "import-module", prefix };
+  if (/^\s*(?:elif|if|while)\s+/.test(code)) return { kind: "expression", prefix };
+  if (/[,(]\s*(?:[\w_]+\s*=)?\w*$/.test(code)) return { kind: "call-argument", prefix };
+  if (!beforePrefixTrimmed || /[:;]\s*$/.test(beforePrefixTrimmed)) {
+    return { kind: "statement-start", prefix };
+  }
+  return { kind: "generic-identifier", prefix };
+}
+
+function isPythonSnippet(option) {
+  return option?.type === "keyword" && typeof option?.detail === "string";
+}
+
+function isPythonPrivateName(label) {
+  return label.startsWith("_");
+}
+
+function isPythonWarningName(label) {
+  return label === "Warning" || label.endsWith("Warning");
+}
+
+function isPythonExceptionName(label) {
+  return (
+    PYTHON_EXCEPTION_NAMES.has(label) ||
+    label.endsWith("Error") ||
+    label.endsWith("Exception") ||
+    label === "EnvironmentError" ||
+    label === "IOError"
+  );
+}
+
+function isPythonImportContext(kind) {
+  return kind === "import-module" || kind === "import-name" || kind === "import-alias";
+}
+
+function shouldKeepPythonCompletionOption(option, context) {
+  const label = String(option?.label || "");
+  if (!label) return false;
+
+  if (isPythonPrivateName(label) && !context.prefix.startsWith("_")) {
+    return false;
+  }
+  if (context.kind === "member-access") return false;
+  if (isPythonImportContext(context.kind)) return false;
+  if (isPythonSnippet(option)) {
+    return context.kind === "statement-start";
+  }
+  if (context.kind === "except-type") {
+    return isPythonExceptionName(label) || isPythonWarningName(label);
+  }
+  if (isPythonWarningName(label) || isPythonExceptionName(label)) {
+    return context.prefix.length >= 4 && label.startsWith(context.prefix);
+  }
+  if (option?.type === "constant") {
+    return !isPythonPrivateName(label) || context.prefix.startsWith("_");
+  }
+  if (PYTHON_COMMON_GLOBALS.has(label)) return true;
+  if (option?.type === "class" || option?.type === "function") return true;
+  return option?.source === "local";
+}
+
+function pythonCompletionBoost(option, context) {
+  const label = String(option?.label || "");
+  if (option?.source === "local") return 8;
+  if (isPythonSnippet(option)) return context.kind === "statement-start" ? 5 : -5;
+  if (context.kind === "except-type" && (isPythonExceptionName(label) || isPythonWarningName(label))) {
+    return 4;
+  }
+  if (PYTHON_COMMON_GLOBALS.has(label)) return 1;
+  return 0;
+}
+
+export function filterPythonCompletionOptions(options, contextLike) {
+  const context = {
+    kind: contextLike?.kind || "generic-identifier",
+    prefix: contextLike?.prefix || "",
+  };
+  const seen = new Set();
+  const filtered = [];
+  for (const option of Array.isArray(options) ? options : []) {
+    const label = String(option?.label || "");
+    const key = label;
+    if (seen.has(key) || !shouldKeepPythonCompletionOption(option, context)) continue;
+    seen.add(key);
+    filtered.push({
+      ...option,
+      boost: (option.boost || 0) + pythonCompletionBoost(option, context),
+    });
+  }
+  return filtered;
+}
+
 function stripAnsiText(text) {
   return String(text || "").replace(/\x1b\[[0-9;]*m/g, "");
 }

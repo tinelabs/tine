@@ -118,7 +118,7 @@ fn pinned_platform_from_python_bin(python_bin: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::pinned_platform_from_python_bin;
+    use super::{nearest_existing_directory, pinned_platform_from_python_bin};
     use std::fs;
     use std::path::PathBuf;
 
@@ -160,9 +160,34 @@ mod tests {
         let tmp = tempfile::tempdir().expect("temp dir");
         let python_root = tmp.path().join("python");
         fs::create_dir_all(&python_root).unwrap();
-        fs::write(python_root.join(".tine-platform.json"), r#"{"machine":"  "}"#).unwrap();
+        fs::write(
+            python_root.join(".tine-platform.json"),
+            r#"{"machine":"  "}"#,
+        )
+        .unwrap();
         let python_bin = python_bin_in(tmp.path());
         assert_eq!(pinned_platform_from_python_bin(&python_bin), None);
+    }
+
+    #[test]
+    fn nearest_existing_directory_returns_existing_path() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+
+        assert_eq!(
+            nearest_existing_directory(temp.path()).as_deref(),
+            Some(temp.path())
+        );
+    }
+
+    #[test]
+    fn nearest_existing_directory_walks_to_existing_parent() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let missing = temp.path().join("Tine").join("custom-project");
+
+        assert_eq!(
+            nearest_existing_directory(&missing).as_deref(),
+            Some(temp.path())
+        );
     }
 }
 
@@ -210,13 +235,31 @@ async fn pick_project_folder(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        dialog = dialog.set_directory(initial_dir);
+        if let Some(existing_dir) = nearest_existing_directory(Path::new(initial_dir)) {
+            dialog = dialog.set_directory(existing_dir);
+        } else {
+            tracing::debug!(
+                initial_dir,
+                "project folder picker initial directory has no existing parent; using system default"
+            );
+        }
     }
     dialog.pick_folder(move |folder| {
         let _ = tx.send(folder.map(file_path_to_string));
     });
     rx.await
         .map_err(|_| "folder picker was cancelled before returning".to_string())
+}
+
+fn nearest_existing_directory(path: &Path) -> Option<PathBuf> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if candidate.is_dir() {
+            return Some(candidate.to_path_buf());
+        }
+        current = candidate.parent();
+    }
+    None
 }
 
 /// IPC: open a native save dialog and write exported text content to disk.

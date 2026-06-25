@@ -32,7 +32,11 @@ import {
   EditorState,
   Compartment,
 } from "https://esm.sh/@codemirror/state@6.5.0";
-import { python } from "https://esm.sh/@codemirror/lang-python@6.1.6?deps=@codemirror/state@6.5.0,@codemirror/view@6.34.1,@codemirror/language@6.10.3";
+import {
+  globalCompletion,
+  localCompletionSource,
+  python,
+} from "https://esm.sh/@codemirror/lang-python@6.1.6?deps=@codemirror/state@6.5.0,@codemirror/view@6.34.1,@codemirror/language@6.10.3";
 import {
   defaultKeymap,
   history,
@@ -77,6 +81,7 @@ import {
   applyExecutionSnapshotToState,
   branchRequiresReplay,
   buildExecutionStatusEvent,
+  classifyPythonCompletionContext,
   desktopMcpCommand,
   deriveRuntimeUi,
   describeExecutionProgress,
@@ -97,6 +102,7 @@ import {
   resolveApiUrl,
   resolveWebSocketUrl,
   shouldApplyScopedRequestResult,
+  filterPythonCompletionOptions,
   shouldHydrateTerminalLogs,
   shouldRequestExecutionResync,
   shouldRenderStderr,
@@ -110,6 +116,29 @@ let terminalEventCounter = 0;
 
 if (!hljs.getLanguage("python")) {
   hljs.registerLanguage("python", pythonLanguage);
+}
+
+async function tinePythonCompletionSource(context) {
+  const line = context.state.doc.lineAt(context.pos);
+  const textBeforeCursor = context.state.sliceDoc(line.from, context.pos);
+  const completionContext = classifyPythonCompletionContext(textBeforeCursor);
+  const [localResult, globalResult] = await Promise.all([
+    Promise.resolve(localCompletionSource(context)),
+    Promise.resolve(globalCompletion(context)),
+  ]);
+
+  const options = [
+    ...(localResult?.options || []).map((option) => ({ ...option, source: "local" })),
+    ...(globalResult?.options || []).map((option) => ({ ...option, source: "global" })),
+  ];
+  const filteredOptions = filterPythonCompletionOptions(options, completionContext);
+  if (!filteredOptions.length) return null;
+
+  return {
+    from: context.pos - completionContext.prefix.length,
+    options: filteredOptions,
+    validFor: /^\w*$/,
+  };
 }
 
 function loadSidebarCollapsed() {
@@ -1937,7 +1966,7 @@ function HighlightEditor({
         indentOnInput(),
         bracketMatching(),
         closeBrackets(),
-        autocompletion(),
+        autocompletion({ override: [tinePythonCompletionSource] }),
         syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
         python(),
         oneDark,
