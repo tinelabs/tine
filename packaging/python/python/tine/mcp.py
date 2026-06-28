@@ -126,8 +126,8 @@ class ToolResult:
 
 
 class McpServer:
-    def __init__(self, api_url: str) -> None:
-        self.api = TineApiClient(api_url)
+    def __init__(self, api_url: str, *, api_key: str | None = None) -> None:
+        self.api = TineApiClient(api_url, api_key=api_key)
 
     def list_tools(self) -> list[ToolDef]:
         return [
@@ -484,7 +484,7 @@ class McpServer:
             ),
             _tool(
                 "create_project",
-                "Create a project container for experiments.",
+                "Create a project container for experiments. In cloud mode, omit `workspace_dir` so Tine manages project storage.",
                 {
                     "type": "object",
                     "properties": {
@@ -492,7 +492,7 @@ class McpServer:
                         "workspace_dir": {"type": "string"},
                         "description": {"type": "string"},
                     },
-                    "required": ["name", "workspace_dir"],
+                    "required": ["name"],
                 },
             ),
             _tool(
@@ -833,7 +833,7 @@ class McpServer:
             if name == "create_project":
                 project_id = self.api.create_project(
                     _required_string(args, "name"),
-                    _required_string(args, "workspace_dir"),
+                    _optional_string(args, "workspace_dir"),
                     _optional_string(args, "description"),
                 )
                 return self._ok(
@@ -1225,8 +1225,13 @@ def main(argv: list[str] | None = None, *, prog: str = "tine-mcp") -> int:
         default=os.environ.get("TINE_API_URL", "http://127.0.0.1:9473"),
         help="Base URL for the running Tine API server.",
     )
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("TINE_API_KEY"),
+        help="Bearer API key for Tine Cloud. Defaults to TINE_API_KEY.",
+    )
     args = parser.parse_args(argv)
-    return run_stdio(McpServer(args.api_url))
+    return run_stdio(McpServer(args.api_url, api_key=args.api_key))
 
 
 def build_config_document(
@@ -1234,12 +1239,17 @@ def build_config_document(
     host: str,
     name: str = "tine",
     api_url: str | None = None,
+    api_key: str | None = None,
     command_path: str | None = None,
 ) -> dict[str, Any]:
     resolved_host = _normalize_host(host)
     command = command_path or "tine"
     server_entry = _build_server_entry(
-        resolved_host, command, _build_command_args(api_url)
+        resolved_host,
+        command,
+        _build_command_args(api_url),
+        api_url=api_url,
+        api_key=api_key,
     )
     return {_mcp_servers_key(resolved_host): {name: server_entry}}
 
@@ -1384,10 +1394,26 @@ def _build_command_args(api_url: str | None) -> list[str]:
     return args
 
 
-def _build_server_entry(host: str, command: str, args: list[str]) -> dict[str, Any]:
+def _build_server_entry(
+    host: str,
+    command: str,
+    args: list[str],
+    *,
+    api_url: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    env: dict[str, str] = {}
+    if api_url:
+        env["TINE_API_URL"] = api_url
+    if api_key:
+        env["TINE_API_KEY"] = api_key
     if host == "vscode":
-        return {"type": "stdio", "command": command, "args": args}
-    return {"command": command, "args": args}
+        entry: dict[str, Any] = {"type": "stdio", "command": command, "args": args}
+    else:
+        entry = {"command": command, "args": args}
+    if env:
+        entry["env"] = env
+    return entry
 
 
 def _required_string(payload: dict[str, Any], key: str) -> str:

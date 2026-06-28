@@ -395,6 +395,30 @@ class WrapperTests(unittest.TestCase):
             prog="tine mcp serve",
         )
 
+    def test_tine_mcp_serve_forwards_api_key(self) -> None:
+        with mock.patch("tine.cli.mcp.main", return_value=0) as mcp_main:
+            exit_code = cli.main(
+                [
+                    "mcp",
+                    "serve",
+                    "--api-url",
+                    "https://cloud.tine.test",
+                    "--api-key",
+                    "tine_sk_test",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        mcp_main.assert_called_once_with(
+            [
+                "--api-url",
+                "https://cloud.tine.test",
+                "--api-key",
+                "tine_sk_test",
+            ],
+            prog="tine mcp serve",
+        )
+
     def test_tine_mcp_print_config_is_handled_in_python(self) -> None:
         with mock.patch("tine.cli.mcp.build_config_document", return_value={"mcpServers": {}}) as build:
             with mock.patch("builtins.print") as print_mock:
@@ -405,6 +429,7 @@ class WrapperTests(unittest.TestCase):
             host="claude",
             name="tine",
             api_url=None,
+            api_key=None,
             command_path=None,
         )
         print_mock.assert_called_once()
@@ -434,6 +459,7 @@ class WrapperTests(unittest.TestCase):
             host="claude",
             name="tine",
             api_url="http://127.0.0.1:9473",
+            api_key=None,
             command_path=None,
         )
         register.assert_called_once_with(

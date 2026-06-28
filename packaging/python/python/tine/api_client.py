@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 from dataclasses import dataclass
 from typing import Any
@@ -54,10 +55,12 @@ class TineApiClient:
         self,
         base_url: str,
         *,
+        api_key: str | None = None,
         default_timeout_secs: float = _DEFAULT_REQUEST_TIMEOUT_SECS,
         long_timeout_secs: float = _LONG_REQUEST_TIMEOUT_SECS,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        self.api_key = (api_key or os.environ.get("TINE_API_KEY") or "").strip() or None
         self._default_timeout = default_timeout_secs
         self._long_timeout = long_timeout_secs
 
@@ -297,10 +300,12 @@ class TineApiClient:
     def create_project(
         self,
         name: str,
-        workspace_dir: str,
+        workspace_dir: str | None = None,
         description: str | None = None,
     ) -> str:
-        body: dict[str, Any] = {"name": name, "workspace_dir": workspace_dir}
+        body: dict[str, Any] = {"name": name}
+        if workspace_dir is not None:
+            body["workspace_dir"] = workspace_dir
         if description is not None:
             body["description"] = description
         response = self._post_json("/api/projects", body, non_idempotent=True)
@@ -375,6 +380,8 @@ class TineApiClient:
     ) -> _Response:
         data = None
         headers = {"Accept": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"

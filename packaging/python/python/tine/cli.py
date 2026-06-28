@@ -79,6 +79,11 @@ def _run_mcp(argv: list[str]) -> int:
         default=None,
         help="Base URL for the running Tine API server. Defaults to the local operator API.",
     )
+    serve.add_argument(
+        "--api-key",
+        default=None,
+        help="Bearer API key for Tine Cloud. Defaults to TINE_API_KEY.",
+    )
     print_config = subparsers.add_parser(
         "print-config",
         prog="tine mcp print-config",
@@ -87,6 +92,7 @@ def _run_mcp(argv: list[str]) -> int:
     print_config.add_argument("--host", default="claude", choices=mcp.SUPPORTED_MCP_HOSTS)
     print_config.add_argument("--name", default="tine")
     print_config.add_argument("--api-url", default=None)
+    print_config.add_argument("--api-key", default=None)
     print_config.add_argument("--command", dest="command_path", default=None)
     register = subparsers.add_parser(
         "register",
@@ -96,6 +102,7 @@ def _run_mcp(argv: list[str]) -> int:
     register.add_argument("--host", default="claude", choices=mcp.SUPPORTED_MCP_HOSTS)
     register.add_argument("--name", default="tine")
     register.add_argument("--api-url", default=None)
+    register.add_argument("--api-key", default=None)
     register.add_argument("--command", dest="command_path", default=None)
     register.add_argument("--config-path", default=None)
     parsed = parser.parse_args(argv)
@@ -103,12 +110,15 @@ def _run_mcp(argv: list[str]) -> int:
         mcp_args: list[str] = []
         if parsed.api_url:
             mcp_args.extend(["--api-url", parsed.api_url])
+        if parsed.api_key:
+            mcp_args.extend(["--api-key", parsed.api_key])
         return mcp.main(mcp_args, prog="tine mcp serve")
     if parsed.command == "print-config":
         document = mcp.build_config_document(
             host=parsed.host,
             name=parsed.name,
             api_url=parsed.api_url,
+            api_key=parsed.api_key,
             command_path=parsed.command_path,
         )
         print(json.dumps(document, indent=2))
@@ -118,6 +128,7 @@ def _run_mcp(argv: list[str]) -> int:
             host=parsed.host,
             name=parsed.name,
             api_url=parsed.api_url,
+            api_key=parsed.api_key,
             command_path=parsed.command_path,
         )
         path = mcp.register_config(

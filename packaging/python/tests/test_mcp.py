@@ -19,6 +19,8 @@ from tine.mcp import (
 
 
 class _Handler(BaseHTTPRequestHandler):
+    last_authorization: str | None = None
+    last_create_project_payload: dict[str, object] | None = None
     last_create_branch_payload: dict[str, object] | None = None
     last_add_cell_payload: dict[str, object] | None = None
     last_update_cell_payload: dict[str, object] | None = None
@@ -234,9 +236,14 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found", "code": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        type(self).last_authorization = self.headers.get("Authorization")
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8") if length else ""
         payload = json.loads(body) if body else {}
+        if self.path == "/api/projects":
+            type(self).last_create_project_payload = payload
+            self._json(201, {"id": "project_1"})
+            return
         if self.path == "/api/experiment-trees":
             self._json(
                 201,
@@ -379,6 +386,8 @@ class McpPythonTests(unittest.TestCase):
         cls.server = McpServer(f"http://{host}:{port}")
 
     def setUp(self) -> None:
+        _Handler.last_authorization = None
+        _Handler.last_create_project_payload = None
         _Handler.last_create_branch_payload = None
         _Handler.last_add_cell_payload = None
         _Handler.last_update_cell_payload = None
@@ -867,6 +876,30 @@ class McpPythonTests(unittest.TestCase):
         tool_names = [tool["name"] for tool in tools["result"]["tools"]]
         self.assertIn("create_project", tool_names)
 
+    def test_create_project_omits_workspace_dir_unless_explicit(self) -> None:
+        cloud_result = self.server.call_tool("create_project", {"name": "cloud project"})
+
+        self.assertFalse(cloud_result.is_error)
+        self.assertEqual(_Handler.last_create_project_payload, {"name": "cloud project"})
+
+        local_result = self.server.call_tool(
+            "create_project",
+            {"name": "local project", "workspace_dir": "/tmp/tine-local"},
+        )
+
+        self.assertFalse(local_result.is_error)
+        self.assertEqual(
+            _Handler.last_create_project_payload,
+            {"name": "local project", "workspace_dir": "/tmp/tine-local"},
+        )
+
+    def test_cloud_api_key_is_sent_as_bearer_auth(self) -> None:
+        server = McpServer(self.server.api.base_url, api_key="tine_sk_test")
+        result = server.call_tool("create_project", {"name": "cloud project"})
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(_Handler.last_authorization, "Bearer tine_sk_test")
+
     def test_create_branch_defaults_to_empty_starter_cell(self) -> None:
         with mock.patch.object(
             self.server.api,
@@ -1103,6 +1136,24 @@ class McpPythonTests(unittest.TestCase):
         self.assertEqual(
             vscode["servers"]["tinemcp"]["args"],
             ["mcp", "serve", "--api-url", "http://127.0.0.1:9473"],
+        )
+        self.assertEqual(
+            vscode["servers"]["tinemcp"]["env"],
+            {"TINE_API_URL": "http://127.0.0.1:9473"},
+        )
+
+        cloud = build_config_document(
+            host="claude",
+            name="tine-cloud",
+            api_url="https://cloud.tine.test",
+            api_key="tine_sk_live",
+        )
+        self.assertEqual(
+            cloud["mcpServers"]["tine-cloud"]["env"],
+            {
+                "TINE_API_URL": "https://cloud.tine.test",
+                "TINE_API_KEY": "tine_sk_live",
+            },
         )
 
     def test_register_config_merges_existing_json(self) -> None:
