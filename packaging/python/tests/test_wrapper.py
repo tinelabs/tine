@@ -402,7 +402,7 @@ class WrapperTests(unittest.TestCase):
                     "mcp",
                     "serve",
                     "--api-url",
-                    "https://tine-staging-web.fly.dev",
+                    "https://cloud.tine.test",
                     "--api-key",
                     "tine_sk_test",
                 ]
@@ -412,7 +412,7 @@ class WrapperTests(unittest.TestCase):
         mcp_main.assert_called_once_with(
             [
                 "--api-url",
-                "https://tine-staging-web.fly.dev",
+                "https://cloud.tine.test",
                 "--api-key",
                 "tine_sk_test",
             ],

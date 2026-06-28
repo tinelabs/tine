@@ -1145,13 +1145,13 @@ class McpPythonTests(unittest.TestCase):
         cloud = build_config_document(
             host="claude",
             name="tine-cloud",
-            api_url="https://staging.tine.sh",
+            api_url="https://cloud.tine.test",
             api_key="tine_sk_live",
         )
         self.assertEqual(
             cloud["mcpServers"]["tine-cloud"]["env"],
             {
-                "TINE_API_URL": "https://staging.tine.sh",
+                "TINE_API_URL": "https://cloud.tine.test",
                 "TINE_API_KEY": "tine_sk_live",
             },
         )
