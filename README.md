@@ -8,15 +8,25 @@
 
 A branching notebook runtime for AI and humans.
 
-Tine is a local-first execution engine where notebooks branch like code. Run work in the browser, connect an agent through MCP, and keep both attached to the same fast local runtime.
+Tine is an execution engine where notebooks branch like code. Run work in the browser, connect an agent through MCP, and keep both attached to the same fast runtime.
 
 <p align="center">
   <strong>Built for agent workflows</strong> · <strong>MCP-native</strong> · <strong>Written in Rust</strong>
 </p>
 
 <p align="center">
+  <a href="https://tally.so/r/Y5gzEz"><strong>Join the Tine Cloud waitlist</strong></a>
+</p>
+
+<p align="center">
   <img src="docs/assets/tine-demo.gif" alt="Tine branching workflow demo" width="920" />
 </p>
+
+## Tine Cloud
+
+Tine Cloud is the hosted version we are designing for teams that want shared projects, managed compute, and the same branching notebook and MCP workflow without managing infrastructure.
+
+[Join the Tine Cloud waitlist](https://tally.so/r/Y5gzEz) to get early access and help shape the hosted experience.
 
 ## Get started
 
@@ -51,7 +61,7 @@ Tine is built around a tree-native notebook model:
 - an experiment contains **branches**
 - branches contain **cells**
 
-Each experiment owns its own kernel and environment, so branches let you explore diverging paths against the same code without collapsing everything into one linear notebook. Executions on the same experiment run in order against that one kernel, while separate experiments run concurrently; "run all branches" additionally isolates sibling branches from each other's namespace changes. Cell results are cached: re-running a branch skips cells whose code, inputs, and environment are unchanged, and a cached result is only ever reused by the same cell along its own lineage — never sideways across branches. The Web UI and any connected agent share that local runtime, so they always see the same state, logs, and outputs.
+Each experiment owns its own kernel and environment, so branches let you explore diverging paths against the same code without collapsing everything into one linear notebook. Executions on the same experiment run in order against that one kernel, while separate experiments run concurrently; "run all branches" additionally isolates sibling branches from each other's namespace changes. Cell results are cached: re-running a branch skips cells whose code, inputs, and environment are unchanged, and a cached result is only ever reused by the same cell along its own lineage — never sideways across branches. The Web UI and any connected agent share the same runtime, so they always see the same state, logs, and outputs.
 
 ## Desktop app
 
@@ -118,7 +128,7 @@ tine serve --open  # or open the Tine desktop app
 tine mcp register --host vscode --api-url http://127.0.0.1:9473
 ```
 
-You now have the Web UI and an agent both talking to the same local runtime.
+You now have the Web UI and an agent both talking to the same runtime.
 
 ## Supported targets
 
