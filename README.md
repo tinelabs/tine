@@ -26,8 +26,6 @@ Tine is an execution engine where notebooks branch like code. Run work in the br
 
 Tine Cloud is the hosted version we are designing for teams that want shared projects, managed compute, and the same branching notebook and MCP workflow without managing infrastructure.
 
-[Join the Tine Cloud waitlist](https://tally.so/r/Y5gzEz) to get early access and help shape the hosted experience.
-
 ## Get started
 
 ```bash
