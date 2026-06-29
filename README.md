@@ -15,16 +15,12 @@ Tine is an execution engine where notebooks branch like code. Run work in the br
 </p>
 
 <p align="center">
-  <a href="https://tally.so/r/Y5gzEz"><strong>Join the Tine Cloud waitlist</strong></a>
-</p>
-
-<p align="center">
   <img src="docs/assets/tine-demo.gif" alt="Tine branching workflow demo" width="920" />
 </p>
 
 ## Tine Cloud
 
-Tine Cloud is the hosted version we are designing for teams that want shared projects, managed compute, and the same branching notebook and MCP workflow without managing infrastructure.
+Tine Cloud is the hosted version we are designing for teams that want shared projects, managed compute, and the same branching notebook and MCP workflow without managing infrastructure. Join the waitlist: <https://tally.so/r/Y5gzEz>
 
 ## Get started
 
